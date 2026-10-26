@@ -22,7 +22,12 @@ if TYPE_CHECKING:
 
 # The parts of a prop in the order a batch goes through them. Every prop of a wave passes one part before any prop
 # starts the next, the multi-view props first.
-PARTS = ("cutout", "camera", "features", "ss", "cond_lr", "lr", "upsample", "cond_hr", "hr", "tex", "finish")
+# Pixal3D's geometry runs cond_lr, lr, upsample and hr; Hi3D's (staged/hi3d.py) the hi3d_* parts in their place. Every
+# other part serves both, and a prop skips the parts of the other geometry (parts.applies).
+PARTS = ("cutout", "camera", "features", "ss", "cond_lr", "lr", "upsample",
+         "hi3d_cond", "hi3d_p1", "hi3d_d1", "hi3d_p2", "hi3d_d2", "hi3d_p3", "hi3d_d3", "hi3d_encode",
+         "cond_hr", "hr", "tex", "finish")
+GEOMETRIES = ("pixal3d", "hi3d")
 
 # Why a prop failed (PropFailed.kind, and the "kind" of a result's error).
 FAILURE_KINDS = ("input", "mv_missing", "oom", "ram", "disk", "missing_file", "error")
@@ -40,6 +45,7 @@ class PropRequest:
     max_num_tokens: int = 49152
     request_hash: str = ""          # the caller's hash of everything that defines the result; "" = never resumed
     payload: Any = None             # the caller's own object, handed back to the hooks untouched
+    geometry: str = "pixal3d"       # GEOMETRIES: whose networks make the shape; the texture is Pixal3D's either way
 
 
 @dataclass
@@ -47,6 +53,8 @@ class Prepared:
     """What hooks.prepare makes of a prop's picture(s)."""
     images: list                    # PIL: single view [RGB, cut out and framed]; multi: framed RGBA views, front first
     meta: dict                      # JSON-able; handed back to hooks.bundle (multi: {"azimuths": [...]})
+    cutout: Any = None              # PIL RGBA of the front picture cut out (Hi3D frames it by its alpha); a multi-view
+    #                                 prop's first view serves where this is None
 
 
 @dataclass
@@ -174,6 +182,8 @@ class EngineOptions:
     spill: bool = False                             # True: a prop-part that does not fit under the cap after the
     #                                                 tight retry runs once more with the cap lifted and may spill
     #                                                 into shared memory (slow). False: it fails with kind "oom"
+    hi3d: Any = None                                # staged.hi3d.Hi3DPaths: where Hi3D's code and networks lie; None:
+    #                                                 a Hi3D prop fails with kind "missing_file"
     paired_finish: bool = True                      # True: each prop is decoded and handed to its finish steps
     #                                                 right after its texture is sampled (the texture network
     #                                                 leaves the card for the decode and is read again for the

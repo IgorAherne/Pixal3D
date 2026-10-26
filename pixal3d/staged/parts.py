@@ -37,6 +37,7 @@ from typing import Any, Callable
 import torch
 
 from ..modules.sparse import SparseTensor
+from . import hi3d
 from .runner import PartContext, PropState
 from .types import PARTS, DecodedMesh, Event, FinishSteps, PropFailed
 
@@ -52,19 +53,22 @@ FINISH_SAFETY_MIB = 500
 # give another cut-out, camera or conditioning without any error. PyTorch counts the failed allocation, so a
 # counter that moved during such a part is treated as an out-of-memory failure of that attempt. Nothing inside
 # such a part may swallow an out-of-memory of its own (see `_steps`), or the count would mean two things.
-CONV_PARTS = frozenset({"cutout", "camera", "features", "cond_lr", "cond_hr", "ss"})
+CONV_PARTS = frozenset({"cutout", "camera", "features", "cond_lr", "cond_hr", "ss", "hi3d_cond"})
 # Parts that draw from the CPU random generator; each starts from the state its predecessor stored.
 DRAWING_PARTS = frozenset({"ss", "lr", "hr", "tex"})
 # Parts after which PyTorch's cache is given back at once: the conditioning passes and the up-sampling decoder
 # leave large freed blocks that the next prop's part does not reuse.
-TRIMMED_PARTS = frozenset({"features", "cond_lr", "upsample", "cond_hr"})
+TRIMMED_PARTS = frozenset({"features", "cond_lr", "upsample", "cond_hr", "hi3d_cond", "hi3d_encode",
+                           *hi3d.DECODE_PARTS})
+# The parts of Pixal3D's own geometry; a Hi3D prop runs hi3d.PARTS in their place.
+PIXAL3D_GEOMETRY = frozenset({"cond_lr", "lr", "upsample", "hr"})
 
 # The networks a group's `enter` loads, in loading order ({kind} = "sv" | "mv"), and those a part loads itself when
 # a prop first needs them.
 ENTER = {
     "cutout": (), "camera": ("moge",), "features": ("dino",), "ss": ("ss_flow.{kind}", "ss_dec"),
     "cond_lr": ("naf",), "lr": ("lr_flow.{kind}",), "upsample": ("shape_dec",), "cond_hr": ("naf",),
-    "hr": ("hr_flow.{kind}",), "tex": ("tex_flow.{kind}",), "finish": (),
+    "hr": ("hr_flow.{kind}",), "tex": ("tex_flow.{kind}",), "finish": (), **hi3d.ENTER,
 }
 LAZY = {"cutout": ("rembg",), "finish": ("shape_dec", "tex_dec")}
 LIGHT = frozenset({"naf"})              # megabytes: reading its file ahead gains nothing
@@ -74,9 +78,9 @@ FIRST_NETWORK = LAZY["cutout"][0]       # what a batch loads first: read ahead w
 # Large store items: what a part takes (the runner asks the store for the next prop's ahead of time), what it puts,
 # and what nobody reads once the part is done.
 WANTS = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr",), "cond_hr": ("dino1024",),
-         "hr": ("cond_hr",), "tex": ("cond_tex",)}
+         "hr": ("cond_hr",), "tex": ("cond_tex",), **hi3d.WANTS}
 PRODUCES = {"features": ("dino512", "dino1024", "cond_ss"), "cond_lr": ("cond_lr",),
-            "cond_hr": ("cond_hr", "cond_tex")}
+            "cond_hr": ("cond_hr", "cond_tex"), **hi3d.PRODUCES}
 SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"),
          "upsample": ("coords_ss", "lr_slat"), "cond_hr": ("dino1024", "prep", "bundle"),
          "hr": ("cond_hr", "rng_lr"), "tex": ("cond_tex", "rng_hr")}
@@ -452,7 +456,15 @@ def networks(part: str, kind: str) -> tuple[str, ...]:
     return tuple(name.format(kind=kind) for name in ENTER[part] + LAZY.get(part, ()))
 
 
+def geometry(prop: PropState) -> str:
+    return getattr(prop.req, "geometry", "pixal3d")
+
+
 def applies(part: str, prop: PropState) -> bool:
+    if part in PIXAL3D_GEOMETRY:
+        return geometry(prop) == "pixal3d"
+    if part in hi3d.PARTS:
+        return geometry(prop) == "hi3d" and hi3d.applies(part, prop.req)
     return part != "camera" or not prop.req.multi
 
 
@@ -465,6 +477,8 @@ def produces(part: str) -> tuple[str, ...]:
 
 
 def discards(part: str, prop: PropState) -> tuple[str, ...]:
+    if part in hi3d.PARTS:
+        return hi3d.spent(part, prop.req)
     keys = tuple(key for key in SPENT.get(part, ()) if key != "bundle" or prop.bundled)
     if part == "cond_hr":
         keys += tuple(f"image_{index}" for index in range(prop.views))
@@ -639,6 +653,11 @@ def cutout(ctx: PartContext, prop: PropState, mode: str) -> None:
         raise PropFailed("The picture could not be prepared.", "input")
     for index, image in enumerate(prepared.images):
         ctx.store.put_small(prop.id, f"image_{index}", image)
+    if geometry(prop) == "hi3d":
+        front = prepared.cutout if prepared.cutout is not None else prepared.images[0]
+        if getattr(front, "mode", "") != "RGBA":
+            raise PropFailed("The picture's cut-out has no transparency for Hi3D to frame it by.", "input")
+        ctx.store.put_small(prop.id, "cutout", front)
     ctx.store.put_small(prop.id, "prep", {"meta": prepared.meta, "camera": None})
     prop.views = len(prepared.images)
 
@@ -663,10 +682,12 @@ def features(ctx: PartContext, prop: PropState, mode: str) -> None:
 
 
 def draw_sparse_structure(ctx: PartContext, prop: PropState, mode: str, cond: dict, resolution: int,
-                          num_samples: int = 1, sampler_params: dict | None = None) -> torch.Tensor:
+                          num_samples: int = 1, sampler_params: dict | None = None,
+                          draws: list | None = None) -> torch.Tensor:
     """One draw of the sparse structure: coords [N0,4] int32 on the card. What engine.sample_sparse_structure
     runs while part `ss` works on `prop`; a guard around that attribute may call it several times, and every
-    call draws new noise from the CPU generator."""
+    call draws new noise from the CPU generator. `draws` collects (the coords returned, the occupancy at the
+    decoder's own grid before the pooling) for a Hi3D prop."""
     args = ctx.args(prop)
     flow = _network(ctx, f"ss_flow.{prop.kind}")
     reso = flow.resolution
@@ -677,23 +698,31 @@ def draw_sparse_structure(ctx: PartContext, prop: PropState, mode: str, cond: di
         step_callback=_steps(ctx, prop, "ss", mode),
     ).samples
     decoded = _network(ctx, "ss_dec")(z_s) > 0
+    full = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int() if draws is not None else None
     if resolution != decoded.shape[2]:
         ratio = decoded.shape[2] // resolution
         decoded = torch.nn.functional.max_pool3d(decoded.float(), ratio, ratio, 0) > 0.5
-    return torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+    coords = torch.argwhere(decoded)[:, [0, 2, 3, 4]].int()
+    if draws is not None:
+        draws.append((coords, full))
+    return coords
 
 
 def ss(ctx: PartContext, prop: PropState, mode: str) -> None:
     store, request = ctx.store, prop.req
     cond = _as_reference_layout(ctx.take(prop, "cond_ss"), prop.req.multi)
     pair = {"cond": cond, "neg_cond": _proj_cond().negative(cond)}
-    draw = functools.partial(draw_sparse_structure, ctx, prop, mode)
+    draws = [] if geometry(prop) == "hi3d" else None
+    draw = functools.partial(draw_sparse_structure, ctx, prop, mode, draws=draws)
     torch.manual_seed(request.seed)
     with ctx.hooks.prop_scope(request, "ss") as found, ctx.engine.drawing(draw):
         coords = ctx.engine.sample_sparse_structure(pair, 32, 1, request.sampler_params.get("ss", {}))
     rng = torch.get_rng_state()
     if coords.shape[0] == 0:
         raise PropFailed("The first stage found no shape in the picture.")
+    if draws is not None:
+        full = next(occupied for returned, occupied in draws if returned is coords)
+        store.put_small(prop.id, "hi3d_ss64", {"coords": full[:, 1:].cpu()})
     store.put_small(prop.id, "coords_ss", {"coords": coords.cpu()})
     store.put_small(prop.id, "rng_ss", {"state": rng})
     store.put_small(prop.id, "notes", {**store.get_small(prop.id, "notes"), **(found or {})})
@@ -791,6 +820,10 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     grid = int(stored["res"][0]) // 16
     z1024 = ctx.take(prop, "dino1024")["z"]
     image = proj_cond.image_tensor(source, 1024, ctx.device)
+    if geometry(prop) == "hi3d":
+        tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
+        ctx.store.put_device(prop.id, "cond_tex", tex)
+        return
     together = mode == "normal"
     pair_fn = getattr(proj_cond, "cond_tokens_pair", None)      # a conditioning module without it: the two calls
     pair = None
@@ -842,9 +875,13 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
 
     store.put_small(prop.id, "tex_slat", {"feats": tex_feats})
     if request.request_hash:
-        store.checkpoint(prop.id, request.request_hash,
-                         {"coords": stored["coords"], "res": stored["res"], "shape_slat": shape_feats,
-                          "tex_slat": tex_feats}, prop.noted(store.get_small(prop.id, "notes")))
+        tensors = {"coords": stored["coords"], "res": stored["res"], "shape_slat": shape_feats, "tex_slat": tex_feats}
+        if geometry(prop) == "hi3d":
+            mesh = store.get_small(prop.id, "hi3d_mesh")
+            tensors.update({"hi3d_vertices": mesh["vertices"], "hi3d_faces": mesh["faces"],
+                            "voxels": stored["voxels"], **{f"hi3d_{key}": sub for key, sub in
+                                                           store.get_small(prop.id, "hi3d_subs").items()}})
+        store.checkpoint(prop.id, request.request_hash, tensors, prop.noted(store.get_small(prop.id, "notes")))
 
 
 def decoders_fit(voxels: int, limit_mib: int) -> bool:
@@ -860,6 +897,8 @@ def decode_voxels(stored: dict) -> int:
 
 
 def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None":
+    if geometry(prop) == "hi3d":
+        return _finish_hi3d(ctx, prop, mode)
     decode = _decode()
     store, loader, device = ctx.store, ctx.loader, ctx.device
     stored = store.get_small(prop.id, "coords_hr")
@@ -935,5 +974,57 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
     return None
 
 
+def _finish_hi3d(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None":
+    """`finish` for a Hi3D prop: its mesh is Hi3D's, so only the texture is decoded, along the guide tables made
+    from the mesh's own voxels (hi3d.guide_subs); the mesh's holes were closed when it was extracted."""
+    decode = _decode()
+    store, loader, device = ctx.store, ctx.loader, ctx.device
+    stored = store.get_small(prop.id, "coords_hr")
+    resolution = int(stored["res"][0])
+    notes = prop.noted(store.get_small(prop.id, "notes"))
+    capped = mode != "uncapped"
+    voxels = decode_voxels(stored)
+    limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
+    room = limit - _kept_beside(ctx) if capped else 0
+    chunk = chunk_for(voxels)
+    lean = mode != "normal" or (capped and lean_needed(voxels, 1, chunk, room))
+    if loader.get("shape_dec") is not None:
+        loader.drop("shape_dec")
+    ctx.check()
+    _decoder(ctx, "tex_dec", chunk, lean)
+    coords = stored["coords"].to(device)
+    subs = [sub.to(device) for _, sub in sorted(store.get_small(prop.id, "hi3d_subs").items())]
+    tex_feats = store.get_small(prop.id, "tex_slat")["feats"].to(device)
+    ctx.emit(Event("step", "finish", prop.id, 1, 3))
+    tex_coords, attrs = decode.decode_texture(loader.get("tex_dec"), tex_feats, coords, subs)
+    del tex_feats, subs, coords
+    tex_coords, attrs = tex_coords.cpu(), attrs.cpu()
+    gone = [name for name in LAZY["finish"] if loader.get(name) is not None and name not in ctx.hold]
+    if gone:
+        loader.drop(*gone)
+    else:
+        loader.trim()
+    ctx.emit(Event("step", "finish", prop.id, 2, 3))
+    mesh = store.get_small(prop.id, "hi3d_mesh")
+    decoded = DecodedMesh(vertices=mesh["vertices"], faces=mesh["faces"], coords=tex_coords, attrs=attrs,
+                          resolution=resolution, attr_layout=ctx.args(prop).pbr_attr_layout)
+    del tex_coords, attrs
+    ctx.emit(Event("step", "finish", prop.id, 3, 3))
+    loader.trim()
+
+    ctx.check()
+    reserve = glb_reserve(decoded.faces.shape[0])
+    if capped:
+        loader.set_cap(reserve, safety_mib=FINISH_SAFETY_MIB)
+    prop.resolution = resolution
+    outcome = ctx.hooks.finish(prop.req, decoded, notes)
+    if isinstance(outcome, FinishSteps):
+        outcome.native_mib = outcome.native_mib or reserve
+        outcome.safety_mib = FINISH_SAFETY_MIB if outcome.safety_mib is None else outcome.safety_mib
+        return outcome
+    prop.result = dict(outcome or {})
+    return None
+
+
 TABLE = {"cutout": cutout, "camera": camera, "features": features, "ss": ss, "cond_lr": cond_lr, "lr": lr,
-         "upsample": upsample, "cond_hr": cond_hr, "hr": hr, "tex": tex, "finish": finish}
+         "upsample": upsample, "cond_hr": cond_hr, "hr": hr, "tex": tex, "finish": finish, **hi3d.TABLE}

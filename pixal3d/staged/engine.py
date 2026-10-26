@@ -151,6 +151,12 @@ class StagedEngine:
         for name in BUILDERS:
             build = options.builders[name]
             self.loader.register_builder(name, build, _builder_file(name, build))
+        self.hi3d_scheduler = None          # Hi3D's flow scheduler, where its networks are given (options.hi3d)
+        if getattr(options, "hi3d", None) is not None:
+            from . import hi3d
+
+            hi3d.register(self.loader, options.hi3d)
+            self.hi3d_scheduler = hi3d.scheduler(options.hi3d)
         # The first network a batch loads (background removal, at its first cut-out: 0.9 GB, read from a cold disk
         # in the first batch otherwise) is read into the system's file cache now, by the loader's read-ahead
         # thread; nothing is kept in the process and the card is not touched. The runner does the same after a

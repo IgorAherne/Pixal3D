@@ -93,6 +93,7 @@ class _Checkpoint:
     config_file: Path
     file: Path
     convert: Callable[[nn.Module], nn.Module] | None = None     # applied to the loaded module (modules/int8.py)
+    config: dict | None = None      # {"name", "args"} given at registration instead of the config file
 
 
 @dataclass
@@ -143,14 +144,17 @@ class NetworkLoader:
     # ------------------------------------------------------------------------------------------------ registration
 
     def register_checkpoint(self, name: str, ckpt: Path,
-                            convert: Callable[[nn.Module], nn.Module] | None = None) -> None:
+                            convert: Callable[[nn.Module], nn.Module] | None = None, *,
+                            config: dict | None = None, file: Path | None = None) -> None:
         """A flow model or decoder: `ckpt` is the path without extension (<ckpt>.json and <ckpt>.safetensors; a
         copy of the latter in the model's dtypes, weights.copy_of, is read in its place while it is valid).
         Nothing is read here: files that are missing or broken are reported by `load`. `convert`, when given, is
         applied to the module once its weights are on the device and before its size is measured (the flows'
-        linears as int8 GEMMs, modules/int8.py: it returns the module unchanged when that is off)."""
+        linears as int8 GEMMs, modules/int8.py: it returns the module unchanged when that is off). A network laid out
+        otherwise (Hi3D's) gives its `config` ({"name": "package.module:Class", "args"}) and weights `file`."""
         self._free_name(name)
-        self._sources[name] = _Checkpoint(Path(f"{ckpt}.json"), Path(f"{ckpt}.safetensors"), convert)
+        self._sources[name] = _Checkpoint(Path(f"{ckpt}.json"), Path(file) if file is not None
+                                          else Path(f"{ckpt}.safetensors"), convert, config)
 
     def register_builder(self, name: str, build: Callable[[str], nn.Module], file: Path | None = None) -> None:
         """A model with a loader of its own: `build(device)` returns it on that device. `file` is what `prefetch`
@@ -361,7 +365,7 @@ class NetworkLoader:
         collected in `state`, which the caller owns and empties. They come from the checkpoint's copy when it is
         valid (weights.usable_copy), else from its own file; a copy that fails while it is read is given up for
         the original, read from its first tensor."""
-        plan = _plan(source.config_file, source.file)
+        plan = _plan(source.config_file, source.file, source.config)
         copy = weights.usable_copy(source.file, plan.keys, plan.want)
         if copy is not None:
             broken = False
@@ -522,11 +526,11 @@ class NetworkLoader:
         return model
 
 
-def _plan(config_file: Path, file: Path) -> _Plan:
+def _plan(config_file: Path, file: Path, config: dict | None = None) -> _Plan:
     """A checkpoint's load settled: its config read, its model built without weights (for real when COMPUTED
     lists the class), its file's header checked against the model's state. KeyError when the file lacks a tensor
     the model needs, ValueError when one has another shape; nothing of the tensors is read."""
-    config = _config(config_file)
+    config = _config(config_file) if config is None else config
     header = stfile.read_header(file)
     cls, args = _model_class(config["name"]), config["args"]
     computed = COMPUTED.get(cls.__name__, frozenset())
@@ -554,6 +558,12 @@ def _config(file: Path) -> dict:
 
 
 def _model_class(name: str) -> type:
+    """A class of pixal3d.models, or "package.module:Class" for another package's network."""
+    if ":" in name:
+        import importlib
+
+        module, _, attribute = name.partition(":")
+        return getattr(importlib.import_module(module), attribute)
     from .. import models
 
     return getattr(models, name)

@@ -312,6 +312,9 @@ class StagedRunner:
         for prop in self.props:
             if prop.kind == "mv" and not prop.resumed and not ctx.engine.multiview:
                 self._fail(prop, "", ("mv_missing", "The multi-view networks are not installed.", ""))
+            elif getattr(prop.req, "geometry", "pixal3d") == "hi3d" and getattr(ctx.engine, "hi3d_scheduler",
+                                                                                 None) is None:
+                self._fail(prop, "", ("missing_file", "Hi3D's networks are not installed.", ""))
 
         order = [prop for kind in KINDS for prop in self.props if prop.kind == kind]
         fresh = [prop for prop in order if not prop.resumed and not prop.over]
@@ -329,10 +332,20 @@ class StagedRunner:
             shape_slat, tex_slat = tensors["shape_slat"], tensors["tex_slat"]
         except KeyError:
             return False
+        hi3d = getattr(prop.req, "geometry", "pixal3d") == "hi3d"
+        if hi3d and "hi3d_vertices" not in tensors:
+            return False
         notes = dict(checkpoint.get("notes") or {})
         prop.slow = list(notes.get("slow") or [])
         store = self.ctx.store
-        store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res})
+        if hi3d:
+            store.put_small(prop.id, "hi3d_mesh", {"vertices": tensors["hi3d_vertices"],
+                                                   "faces": tensors["hi3d_faces"]})
+            store.put_small(prop.id, "hi3d_subs", {key[len("hi3d_"):]: value for key, value in tensors.items()
+                                                   if key.startswith("hi3d_s")})
+            store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res, "voxels": tensors["voxels"]})
+        else:
+            store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res})
         store.put_small(prop.id, "shape_slat", {"feats": shape_slat})
         store.put_small(prop.id, "tex_slat", {"feats": tex_slat})
         store.put_small(prop.id, "notes", notes)
