@@ -21,6 +21,9 @@ process times or tunes anything while the artist works:
      (modules/sparse/conv/tuning.py `calibrate`, written into flex_gemm's autotune_cache.json): afterwards a size
      that was not calibrated takes the configuration of the nearest one that was, instead of being tuned while the
      artist waits (every configuration gives the same values; only the time differs).
+  5. Where Hi3D's code is on this PC (code/hi3d beside the fork, or SPELLCAST_HI3D_CODE): spconv's kernel choice
+     for every sparse convolution Hi3D runs (sparc3d.ops.spconv_tuning), which spconv otherwise times again in
+     every process on the first prop's own input, and which could differ between sessions.
 
 Nothing here changes a result: every choice is between kernels that give the same numbers (the convolutions' split-K
 choice aside, which flex_gemm has always timed per install). A step that fails is recorded and the others go on; the
@@ -63,7 +66,7 @@ SAY_EVERY = 30.0         # while waiting: one line this often
 MAX_ATTEMPTS = 3         # (kept for the record's "attempts" count; the installer no longer retries by itself)
 # Where the run's bar stands when each step begins (the installer shows it on its page: components._calibrate reads
 # the "NN%" of a progress line).
-SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "convolutions": 0.18, "done": 1.0}
+SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "convolutions": 0.18, "spconv": 0.95, "done": 1.0}
 
 
 def say(text: str) -> None:
@@ -205,8 +208,9 @@ def _timed(name: str, step: Callable[[], Any], record: dict) -> Any:
 def _triton(device: Any) -> dict:
     """Compile the engine's Triton kernels: each family's self-check (which says whether it can run here), then the
     kernels as the flows and decoders call them - the int8 layers of the shipped policy at the flows' widths, the
-    fused elementwise kernels, the row codes, NAF's RoPE - at a row count divisible by 16 and one that is not
-    (Triton compiles a kernel again for each), so that the first 3D job finds them in the cache."""
+    fused elementwise kernels, the row codes, NAF's RoPE, and Hi3D's (its int8 layers, fused chains and int8
+    attention) where its code is on this PC - at a row count divisible by 16 and one that is not (Triton compiles
+    a kernel again for each), so that the first 3D job finds them in the cache."""
     import torch
 
     done: dict[str, Any] = {}
@@ -221,7 +225,7 @@ def _triton(device: Any) -> dict:
     torch.cuda.synchronize(device)
     warmed: dict[str, Any] = {}
     for name, step in (("int8_layers", _warm_int8), ("fused", _warm_fused), ("codes", _warm_codes),
-                       ("rope", _warm_rope)):
+                       ("rope", _warm_rope), ("hi3d", _warm_hi3d)):
         began = time.perf_counter()
         try:
             count = step(device)
@@ -270,6 +274,62 @@ def _warm_int8(device: Any) -> int:
             for rows in WARM_ROWS:
                 mlp(torch.randn(rows, 1536, device=device, dtype=torch.bfloat16, generator=g))
                 calls += 1
+    return calls
+
+
+def _warm_hi3d(device: Any) -> int:
+    """Hi3D's Triton kernels at its transformer's widths (2112 channels, 22 x 96 heads, 8448 hidden): the int8
+    layers of the shipped policy on Pixal3D's int8mm, sparc3d's fused norm / rope chains and its int8 attention,
+    each through its own self-check first; nothing where Hi3D's code is not on this PC."""
+    code = _hi3d_code()
+    if code is None:
+        return 0
+    if str(code) not in sys.path:
+        sys.path.insert(0, str(code))
+    import torch
+    from torch import nn
+
+    from pixal3d.modules import int8, int8mm
+    from sparc3d.nn import fused as sparc_fused
+    from sparc3d.nn import int8_linear
+    from sparc3d.nn.sparse.attention import int8_attention
+
+    calls = 0
+    with torch.no_grad():
+        g = torch.Generator(device=device).manual_seed(0)
+        if int8.policy() is not None and int8.available(device):
+            int8_linear.install(int8mm)
+            rules = int8_linear.POLICIES[int8_linear.DEFAULT_POLICY]
+            layers = {"qkv": (2112, 6336), "out": (2112, 2112)}
+            for name, (k, n) in layers.items():
+                q = int8_linear.Int8Linear(nn.Linear(k, n).to(device=device, dtype=torch.float16), rules[name])
+                for rows in WARM_ROWS:
+                    q(torch.randn(rows, k, device=device, dtype=torch.float16, generator=g))
+                    calls += 1
+            mlp = int8_linear.Int8FeedForward(nn.Linear(2112, 8448).to(device=device, dtype=torch.float16),
+                                              nn.Linear(8448, 2112).to(device=device, dtype=torch.float16),
+                                              rules["mlp"])
+            for rows in WARM_ROWS:
+                mlp(torch.randn(rows, 2112, device=device, dtype=torch.float16, generator=g))
+                calls += 1
+        if sparc_fused.check(device)[0]:
+            weight = torch.ones(2112, device=device, dtype=torch.float32)
+            for rows in WARM_ROWS:
+                x = torch.randn(rows, 2112, device=device, dtype=torch.float16, generator=g)
+                sparc_fused.norm_modulate(x, 1e-6, scale1=x[0], shift=x[1])
+                sparc_fused.norm_modulate(x, 1e-6, weight=weight, bias=weight)
+                qkv = torch.randn(rows, 3, 22, 96, device=device, dtype=torch.float16, generator=g)
+                angles = torch.rand(rows, 48, device=device, generator=g) * 6.28
+                gamma = torch.ones(22, 96, device=device, dtype=torch.float32)
+                sparc_fused.rope_rms_(qkv, torch.polar(torch.ones_like(angles), angles), gamma, gamma, 96 ** 0.5)
+                calls += 3
+        if torch.cuda.get_device_capability(device) >= (8, 0) and int8_attention.self_check(device)[0]:
+            for rows in WARM_ROWS:
+                qkv = torch.randn(rows, 3, 22, 96, device=device, dtype=torch.float16, generator=g)
+                q, k, v = qkv.unbind(1)
+                int8_attention.attention(q, k, v)
+                calls += 1
+    torch.cuda.synchronize(device)
     return calls
 
 
@@ -358,13 +418,32 @@ def _convolutions(device: Any, quiet: Quiet, grid: Optional[dict] = None) -> dic
         """The step's own lines; one per finished shape ("convolutions 1024x1024: 9 sizes ...") moves the bar."""
         if text.startswith("convolutions ") and " sizes (" in text:
             done[0] += 1
-            progress(SHARE["convolutions"] + (SHARE["done"] - SHARE["convolutions"]) * min(done[0], shapes) / shapes,
+            progress(SHARE["convolutions"] + (SHARE["spconv"] - SHARE["convolutions"]) * min(done[0], shapes) / shapes,
                      f"{text} - shape {done[0]} of {shapes}")
         else:
             say(text)
     if grid is None:
         return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True))
     return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True), grid=grid, drop=False)
+
+
+def _hi3d_code() -> Optional[Path]:
+    """Hi3D's checkout (sparc3d/ inside), as Spellcast3D's launcher finds it, or None."""
+    code = Path(os.environ.get("SPELLCAST_HI3D_CODE") or FORK.parent / "hi3d")
+    return code if (code / "sparc3d" / "__init__.py").is_file() else None
+
+
+def _spconv(device: Any, quiet: Quiet) -> dict:
+    """The spconv step: spconv's kernel choice for every sparse convolution Hi3D runs, measured on random points
+    (sparc3d.ops.spconv_tuning.calibrate); skipped where Hi3D's code is not on this PC."""
+    code = _hi3d_code()
+    if code is None:
+        return {"ok": True, "skipped": "Hi3D's code is not on this PC", "entries": []}
+    if str(code) not in sys.path:
+        sys.path.insert(0, str(code))
+    from sparc3d.ops import spconv_tuning
+
+    return spconv_tuning.calibrate(device, say=say, pause=lambda: quiet.wait(quick=True))
 
 
 def _shapes_lacking(earlier: dict, record: dict) -> Optional[dict]:
@@ -397,7 +476,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--version", type=int, default=1, help="the calibration's version (the installer's)")
     ap.add_argument("--record", default="", help="the record file (default: pixal3d/calibration.py's)")
     ap.add_argument("--quiet-wait", type=float, default=900.0, help="seconds to wait for a quiet card at most")
-    ap.add_argument("--skip", default="", help="comma-separated steps to leave out: triton, sage, convolutions")
+    ap.add_argument("--skip", default="",
+                    help="comma-separated steps to leave out: triton, sage, convolutions, spconv")
     args = ap.parse_args(argv)
     if args.record:
         os.environ["PIXAL3D_CALIBRATION_FILE"] = args.record
@@ -438,16 +518,16 @@ def main(argv: Optional[list[str]] = None) -> int:
             if lacking else "the earlier calibration stands: no new convolution shapes to measure")
     began = time.monotonic()
     if "triton" not in skip:
-        progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 3)")
+        progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 4)")
         _timed("triton", lambda: _triton(device), record)
     if "sage" not in skip:
-        progress(SHARE["sage"], "timing the attention kernels (step 2 of 3)")
+        progress(SHARE["sage"], "timing the attention kernels (step 2 of 4)")
         quiet.wait(quick=True)
         found = _timed("sage", lambda: _sage(device), record)
         if found:
             say(f"attention: the {'tuned' if found.get('tuned') else 'shipped'} kernel ({found.get('summary', '')})")
     if "convolutions" not in skip:
-        progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 3, the longest: "
+        progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 4, the longest: "
                                         "several minutes)")
         if lacking is not None and not lacking:
             record["flex_gemm"] = earlier["flex_gemm"]
@@ -457,9 +537,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 record["flex_gemm"] = _merged(earlier, record["flex_gemm"])
             if found:
                 say(f"convolutions: {record['flex_gemm'].get('summary', found)}")
+    if "spconv" not in skip:
+        if lacking is not None and (earlier.get("spconv") or {}).get("ok") and earlier["spconv"].get("entries"):
+            record["spconv"] = earlier["spconv"]        # the earlier record's choices stand
+        else:
+            progress(SHARE["spconv"], "choosing spconv's kernels for Hi3D's convolutions (step 4 of 4)")
+            quiet.wait(quick=True)
+            found = _timed("spconv", lambda: _spconv(device, quiet), record)
+            if found:
+                say(f"spconv: {found.get('summary') or found.get('skipped')}")
     record["seconds"] = round(time.monotonic() - began, 1)
     record["quiet"] = quiet.record()
-    steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm"}      # --skip name -> record section
+    # --skip name -> record section
+    steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm", "spconv": "spconv"}
     failed = [key for step, key in steps.items() if step not in skip and not (record.get(key) or {}).get("ok", False)]
     record["failed"] = failed
     record["complete"] = not failed and not quiet.busy_during

@@ -6,10 +6,17 @@ runs cond_lr, lr, upsample and hr (parts.applies):
     hi3d_cond    DINOv2-L and CLIP-L on the front picture cut out; the coarse mesh voxelized for the first pass
     hi3d_pK      pass K's latents: transformer_512 on the 64 grid, transformer_1024 on the 128 and 192 grids
     hi3d_dK      pass K decoded and its mesh extracted, then voxelized for the next pass or kept as the prop's mesh
+                 (the last pass: reduced to Hi3D's face target, fitted into the cube, and its dual grid for the
+                 texture started on a worker thread, so that the next prop's decode has the card meanwhile)
     hi3d_encode  the mesh into TRELLIS.2's shape latent (the encoder paired with the shape decoder Pixal3D ships,
                  downloaded with Hi3D): the texture flow's input and tokens, and the texture decoder's guide tables
                  from the mesh's own voxels
 then cond_hr (the texture's conditioning alone), tex and finish as for a Pixal3D prop, the mesh being Hi3D's.
+
+The sampler's kernels follow Pixal3D's switches (`accelerate`, `int8_convert`): PIXAL3D_FUSED the fused elementwise
+chains, PIXAL3D_SAGE the int8 self-attention, PIXAL3D_INT8 the blocks' linears as int8 GEMMs (PIXAL3D_HI3D_INT8=off
+turns Hi3D's alone off); spconv's kernel choices come from the install's calibration record
+(`_restore_spconv_choices`).
 
 Frames: Pixal3D's voxels lie in [-0.5, 0.5]^3, Y up with the picture's front towards +Z (its GLB step's axis swap and
 the launcher's GLB_ROTATION cancel out), which is the frame Hi3D was trained in. Every Hi3D pass fits its input mesh
@@ -18,7 +25,9 @@ into its own grid; the chain of those maps (`frames`) brings the last pass's mes
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -91,13 +100,44 @@ def register(loader: Any, paths: Hi3DPaths) -> None:
     for name, folder in (("hi3d_t512", "transformer_512"), ("hi3d_t1024", "transformer_1024")):
         with open(paths.weights / folder / "config.json", "r", encoding="utf-8") as handle:
             args = json.load(handle)
-        loader.register_checkpoint(name, paths.weights / folder / "model",
+        loader.register_checkpoint(name, paths.weights / folder / "model", int8_convert,
                                    config={"name": "sparc3d.models.transformers:Sparc3DTransformer", "args": args},
                                    file=paths.weights / folder / "model.safetensors")
     loader.register_builder("hi3d_vae", lambda device: _vae(paths, device), paths.weights / "vae" / "model.safetensors")
     loader.register_builder("hi3d_cond", lambda device: _conditioner(paths, device),
                             paths.dino / "model.safetensors")
     loader.register_checkpoint("shape_enc", paths.encoder)
+
+
+def int8_convert(model: Any) -> Any:
+    """The loader's convert hook for Hi3D's two transformers: the blocks' token-sized linears as int8 tensor-core
+    GEMMs (sparc3d.nn.int8_linear on Pixal3D's own int8mm kernels) where PIXAL3D_INT8 is on and the card runs them,
+    as the flows' linears are converted (modules/int8.py); the model unchanged otherwise, or where PIXAL3D_HI3D_INT8
+    says off (Hi3D's own veto, the flows' int8 untouched). Half the weights' bytes on the card, a guided step at the
+    finest pass about a third faster; judged end to end like the other kernels."""
+    from ..modules import int8
+
+    if int8.policy() is None or os.environ.get("PIXAL3D_HI3D_INT8", "").strip().lower() in int8._OFF:
+        return model
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        return model
+    if device.type != "cuda" or not int8.available(device):
+        return model
+    from sparc3d.nn import int8_linear
+
+    from ..modules import int8mm
+
+    int8_linear.install(int8mm)
+    before = int8._bytes(model)
+    counts = int8_linear.convert(model, int8_linear.DEFAULT_POLICY)
+    if counts:
+        print(f"[INT8] Hi3D's {type(model).__name__} (policy {int8_linear.DEFAULT_POLICY}): "
+              + ", ".join(f"{kind} x{count}" for kind, count in counts.items())
+              + f" as int8 GEMMs ({int8.KERNEL}; PIXAL3D_INT8), {before / 2**20:,.0f} -> "
+              f"{int8._bytes(model) / 2**20:,.0f} MiB of weights", flush=True)
+    return model
 
 
 def _vae(paths: Hi3DPaths, device: str) -> Any:
@@ -207,12 +247,30 @@ def into_cube(vertices: np.ndarray) -> tuple[np.ndarray, float]:
     return vertices * scale, scale
 
 
-def simplified(vertices: np.ndarray, faces: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
-    """The mesh reduced to about `target` faces as Hi3D's own pipeline reduces its output (pyfqmr with its
-    settings), when it has more: the extraction's 7-14 M faces at 1536 are far beyond what carries the detail,
-    and the texture's dual grid, the mesh's RAM and the hub's own reduction all go by the count."""
+def simplified(vertices: np.ndarray, faces: np.ndarray, target: int,
+               device: str | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """The mesh reduced to about `target` faces when it has more (the extraction's 7-14 M faces at 1536 are far
+    beyond what carries the detail, and the texture's dual grid, the mesh's RAM and the hub's own reduction all go
+    by the count): cumesh's quadric simplification on the card (the hub's finish reduces every mesh with it; a
+    7.7 M-face mesh in 1.2 s, within a tenth of a fine voxel of pyfqmr's result on average), or pyfqmr as Hi3D's
+    own pipeline does (9 s on the CPU, which holds Python's lock meanwhile) where cumesh or a card is missing."""
     if faces.shape[0] <= target:
         return vertices, faces
+    if device is not None and torch.device(device).type == "cuda":
+        try:
+            import cumesh
+        except ImportError:
+            cumesh = None
+        if cumesh is not None:
+            torch.cuda.empty_cache()        # cumesh allocates outside PyTorch: the decode's cached blocks go first
+            mesh = cumesh.CuMesh()
+            mesh.init(torch.from_numpy(np.ascontiguousarray(vertices, dtype=np.float32)).to(device),
+                      torch.from_numpy(np.ascontiguousarray(faces, dtype=np.int32)).to(device))
+            mesh.simplify(target, verbose=False)
+            fewer_vertices, fewer_faces = mesh.read()
+            del mesh
+            return (np.ascontiguousarray(fewer_vertices.double().cpu().numpy()),
+                    np.ascontiguousarray(fewer_faces.long().cpu().numpy()))
     import pyfqmr
 
     simplifier = pyfqmr.Simplify()
@@ -296,12 +354,29 @@ def _pipeline(transformer: Any, steps: Any, device: str) -> Any:
 _kernels_chosen = False
 
 
+def _restore_spconv_choices(card: torch.device) -> None:
+    """spconv's kernel choices from this install's calibration record (sparc3d.ops.spconv_tuning), so that no
+    convolution of the first prop times its candidates and every session runs the same kernels."""
+    try:
+        from sparc3d.ops import spconv_tuning
+
+        from .. import calibration
+
+        restored = spconv_tuning.restore(calibration.section("spconv", card), card)
+    except Exception as exc:        # noqa: BLE001 - a record that cannot be read: spconv tunes as it did
+        print(f"[HI3D] spconv's kernel choices were not restored ({type(exc).__name__}: {str(exc)[:200]})", flush=True)
+        return
+    if restored:
+        print(f"[HI3D] {restored} spconv kernel choices restored from the calibration record", flush=True)
+
+
 def accelerate(device: str) -> None:
-    """Hi3D's sampler kernels, chosen once a process at its first pass, under Pixal3D's own switches as Pixal3D
-    reads them: the fused elementwise chains (sparc3d's SPARC3D_FUSED kernels) where PIXAL3D_FUSED is its default
-    "rounded" (modules.fused.MODE), the int8 self-attention on sm_80+ cards where PIXAL3D_SAGE is on
-    (modules.sage.from_env). Both check themselves on the card first and stand down if that fails. The sampler's
-    bit-identical savings (SPARC3D_FAST) are sparc3d's own default."""
+    """Hi3D's sampler kernels, chosen once a process at its first pass (and spconv's kernel choices restored from
+    the calibration record), under Pixal3D's own switches as Pixal3D reads them: the fused elementwise chains
+    (sparc3d's SPARC3D_FUSED kernels) where PIXAL3D_FUSED is its default "rounded" (modules.fused.MODE), the int8
+    self-attention on sm_80+ cards where PIXAL3D_SAGE is on (modules.sage.from_env). Both check themselves on the
+    card first and stand down if that fails. The sampler's bit-identical savings (SPARC3D_FAST) are sparc3d's own
+    default; the int8 GEMMs are chosen at load (`int8_convert`)."""
     global _kernels_chosen
     if _kernels_chosen:
         return
@@ -312,6 +387,7 @@ def accelerate(device: str) -> None:
 
     accel.FUSED = fused.MODE == "rounded"
     card = torch.device(device)
+    _restore_spconv_choices(card)
     if card.type != "cuda" or not sage.from_env() or torch.cuda.get_device_capability(card) < (8, 0):
         return
     from sparc3d.nn.sparse.attention import int8_attention
@@ -422,7 +498,7 @@ def _decoded(ctx: Any, prop: Any, mode: str, index: int) -> None:
         store.put_small(prop.id, "hi3d_frames", frames_with(frames, fit))
     else:
         began = time.perf_counter()
-        coarse, faces = simplified(back_to_coarse(vertices, frames), faces, FACE_TARGETS[index])
+        coarse, faces = simplified(back_to_coarse(vertices, frames), faces, FACE_TARGETS[index], device)
         coarse, scale = into_cube(coarse)
         print(f"[HI3D] the mesh: {len(faces):,} faces of {len(vertices):,} points"
               + (f", scaled by {scale:.3f} into the cube" if scale < 1.0 else "")
@@ -431,7 +507,38 @@ def _decoded(ctx: Any, prop: Any, mode: str, index: int) -> None:
         store.put_device(prop.id, "hi3d_mesh", {"vertices": torch.from_numpy(coarse.astype(np.float32)),
                                                 "faces": torch.from_numpy(faces.astype(np.int32))})
         store.put_small(prop.id, "hi3d_frames", frames)
+        _grid_ahead(store, prop, int(prop.req.resolution))
     ctx.emit(_parts().Event("step", part, prop.id, 2, 2))
+
+
+_grids: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def _grid_ahead(store: Any, prop: Any, resolution: int) -> None:
+    """The texture's dual grid of the prop's mesh at the request's resolution, started on a worker thread (o_voxel's
+    CPU work, 8-35 s at 1536, which lets go of Python's lock) so that the next prop's decode has the card meanwhile;
+    `encode` takes it (`_grid`). Kept on the store, which lives as long as the batch."""
+    global _grids
+    pending = getattr(store, "hi3d_grids", None)
+    if pending is None:
+        try:
+            store.hi3d_grids = pending = {}
+        except AttributeError:          # a store that takes no attribute: encode makes the grid itself
+            return
+    if _grids is None:
+        _grids = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="hi3d-grid")
+    mesh = store.get_large(prop.id, "hi3d_mesh")
+    pending[prop.id] = (resolution, _grids.submit(dual_grid, mesh["vertices"], mesh["faces"], resolution))
+
+
+def _grid(store: Any, prop: Any, mesh: dict, resolution: int) -> tuple[torch.Tensor, ...]:
+    """The mesh's dual grid at `resolution`: the one made ahead when it is that resolution's (an error it met is
+    raised here, the prop's), else made now."""
+    pending = getattr(store, "hi3d_grids", None) or {}
+    ahead = pending.pop(prop.id, None)
+    if ahead is not None and ahead[0] == resolution:
+        return ahead[1].result()
+    return dual_grid(mesh["vertices"], mesh["faces"], resolution)
 
 
 ENCODE_BYTES_PER_VOXEL = 1024       # the shape encoder's peak on the card per fine voxel beside its weights (0.91
@@ -492,7 +599,7 @@ def encode(ctx: Any, prop: Any, mode: str) -> None:
     room = encoder_room_mib(ctx)
     resolution, unbounded, why = int(request.resolution), None, None
     while True:
-        fine, dual, intersected = dual_grid(mesh["vertices"], mesh["faces"], resolution)
+        fine, dual, intersected = _grid(store, prop, mesh, resolution)
         fine = fine.int()
         voxels, tokens = fine.shape[0], _tokens(fine, resolution)
         ctx.check()

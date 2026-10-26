@@ -197,7 +197,8 @@ def _build():
                     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
         # A: int8 [M, K] row-major; B: int8 [N, K] row-major (the weight as stored: both operands K-contiguous,
         # the "TN" layout int8 mma wants). OUT: 0 = bf16, 1 = the raw int32 accumulator (checks), 2 = int8 with one
-        # fp32 scale per row and per BLOCK_N columns (QS [M, N / BLOCK_N]: the next layer's group-scaled input).
+        # fp32 scale per row and per BLOCK_N columns (QS [M, N / BLOCK_N]: the next layer's group-scaled input),
+        # 3 = fp16 (Hi3D's transformer keeps its activations in fp16).
         # A_GROUP: 0 = AS holds one scale per row; else AS [M, K / BLOCK_K] and the int32 partial product of each
         # BLOCK_K slab is scaled into an fp32 accumulator (MAGIC: int32 -> fp32 by the 1.5 * 2^23 trick, exact for
         # |partial| < 2^22, i.e. BLOCK_K <= 256). B_GROUP (needs A_GROUP): BS [N, K / BLOCK_K] column-major (a
@@ -274,6 +275,8 @@ def _build():
                 tl.store(c_ptrs, q.to(tl.int8), mask=mask)
                 tl.store(QS + rm.to(tl.int64) * stride_qsm + pid_n,
                          tl.div_rn(amax, tl.full([BLOCK_M], 127.0, tl.float32)), mask=rm < M)
+            elif OUT == 3:
+                tl.store(c_ptrs, y.to(tl.float16), mask=mask)
             else:
                 tl.store(c_ptrs, y.to(tl.bfloat16), mask=mask)
 
@@ -439,9 +442,9 @@ def pick_config(M: int, N: int, K: int, group: int = 0, w_group: bool = False) -
 def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor],
          *, gelu: bool = False, out: str = "bf16", group: int = 0, cfg: Optional[tuple] = None,
          magic: bool = True, out_smooth: Optional[torch.Tensor] = None):
-    """The Triton int8 GEMM with the epilogue fused. out: "bf16" -> bf16 [M, N]; "int32" -> the raw accumulator
-    (per-row mode only); "int8" -> (int8 [M, N], fp32 scales [M, N // BLOCK_N]). w_s: fp32 [N] (one scale per
-    output channel) or [N, K // group] (one per output channel and group of K: needs group scales on x too).
+    """The Triton int8 GEMM with the epilogue fused. out: "bf16" -> bf16 [M, N]; "fp16" -> fp16 [M, N]; "int32" ->
+    the raw accumulator (per-row mode only); "int8" -> (int8 [M, N], fp32 scales [M, N // BLOCK_N]). w_s: fp32 [N]
+    (one scale per output channel) or [N, K // group] (one per output channel and group of K: needs group scales on x too).
     out_smooth: fp32 [N] that multiplies the result before an "int8" output is quantised (the next layer's 1 / s)."""
     k = _build()
     M, K = xq.shape
@@ -456,10 +459,10 @@ def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tenso
         raise ValueError(f"weight scales {tuple(w_s.shape)} per group need group scales on x (group {group}, K {K})")
     if b_group and (w_s.stride(0) != 1 or w_s.stride(1) != N):
         w_s = w_s.t().contiguous().t()      # the kernel reads them column-major (quantize_weight gives them so)
-    mode = {"bf16": 0, "int32": 1, "int8": 2}[out]
+    mode = {"bf16": 0, "int32": 1, "int8": 2, "fp16": 3}[out]
     if mode == 1 and b_group:
         raise ValueError("the raw int32 output is for per-row scales only")
-    dtype = {0: torch.bfloat16, 1: torch.int32, 2: torch.int8}[mode]
+    dtype = {0: torch.bfloat16, 1: torch.int32, 2: torch.int8, 3: torch.float16}[mode]
     y = torch.empty((M, N), dtype=dtype, device=xq.device)
     qs = None
     if mode == 2:
