@@ -36,6 +36,8 @@ DECODE_PARTS = ("hi3d_d1", "hi3d_d2", "hi3d_d3")
 PARTS = ("hi3d_cond", *[part for pair in zip(SAMPLE_PARTS, DECODE_PARTS) for part in pair], "hi3d_encode")
 TRANSFORMERS = ("hi3d_t512", "hi3d_t1024", "hi3d_t1024")
 LATENT_LEVELS = 4                           # the shape latent's grid is the texture resolution / 16
+DECODE_MARGIN_MIB = 300     # under the cap: the caching allocator reserves up to ~100 MiB above the decode's budget
+TIGHT_SHARE = 0.8           # the budget on the ladder's tight rung (an attempt that ran out of memory)
 
 ENTER = {"hi3d_cond": ("hi3d_cond",), "hi3d_encode": ("shape_enc",),
          **{part: (net,) for part, net in zip(SAMPLE_PARTS, TRANSFORMERS)},
@@ -282,21 +284,17 @@ def sample(transformer: Any, steps: Any, cond_tokens: torch.Tensor, coords: torc
 
 
 def decode(vae: Any, coords: torch.Tensor, feats: torch.Tensor, index: int, device: str,
-           between: Any) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
-    """Pass `index`'s latents decoded and the mesh extracted: (vertices [V, 3] float64 in the decode's unit frame,
-    faces [F, 3] int64, the decode's grid-to-unit matrix [4, 4] float64). `between()` after the decode."""
-    from sparc3d.nn.sparse.basic import SparseTensor as Sparc3DTensor
+           budget_mib: float) -> tuple[np.ndarray, np.ndarray, torch.Tensor]:
+    """Pass `index`'s latents decoded and the mesh extracted within `budget_mib` of the card (sparc3d's streamed
+    decode: what does not fit goes through page-locked RAM): (vertices [V, 3] float64 in the decode's unit frame,
+    faces [F, 3] int64, the decode's grid-to-unit matrix [4, 4] float64)."""
+    from sparc3d.pipelines.streamed_decode import decode_and_extract
 
-    pipe = _pipeline(None, None, device)
-    pipe.vae = vae
-    latents = Sparc3DTensor(feats=feats.to(device), coords=coords.to(device))
-    decoded = pipe._decode_latents(latents, STRUCTURES[index])
-    del latents
-    between()
-    mesh = pipe._extract_mesh(decoded)
-    matrix = decoded["matrix"].double().cpu()
-    del decoded
-    return np.asarray(mesh.vertices, dtype=np.float64), np.asarray(mesh.faces, dtype=np.int64), matrix
+    mesh = decode_and_extract(vae, coords, feats, STRUCTURES[index], budget_mib=budget_mib, device=device)
+    print(f"[HI3D] pass {index + 1}: {mesh.decoded_points:,} points decoded in {mesh.seconds['decode']:.1f} s, "
+          f"{len(mesh.faces):,} faces in {mesh.seconds['extract']:.1f} s (card {mesh.peak_reserved_mib:,.0f} MiB of "
+          f"{budget_mib:,.0f}, page-locked RAM {mesh.host_mib:,.0f} MiB)", flush=True)
+    return mesh.vertices.double().numpy(), mesh.faces.numpy(), mesh.matrix
 
 
 def encode_mesh(encoder: Any, fine: torch.Tensor, dual: torch.Tensor, intersected: torch.Tensor, resolution: int,
@@ -334,16 +332,27 @@ def _sample(ctx: Any, prop: Any, mode: str, index: int) -> None:
     store.put_small(prop.id, "hi3d_rng", {"state": generator.get_state()})
 
 
+def decode_budget(ctx: Any, mode: str) -> float:
+    """MiB the streamed decode may hold on the card: the cap in force (the VAE's weights inside it) less
+    DECODE_MARGIN_MIB for the allocator's own reserve, TIGHT_SHARE of that on the ladder's tight rung; without a cap,
+    what the card has free."""
+    cap = ctx.loader.stats().get("cap_mib")
+    if not cap and torch.device(ctx.device).type != "cuda":
+        return float("inf")
+    if not cap:
+        free, _ = torch.cuda.mem_get_info()
+        cap = (free >> 20) + torch.cuda.memory_reserved() / 2**20 - ctx.loader.safety_mib
+    budget = cap - DECODE_MARGIN_MIB
+    return budget * TIGHT_SHARE if mode == "tight" else budget
+
+
 def _decoded(ctx: Any, prop: Any, mode: str, index: int) -> None:
     store, device, part = ctx.store, ctx.device, DECODE_PARTS[index]
-
-    def between() -> None:
-        ctx.emit(_parts().Event("step", part, prop.id, 1, 2))
-        ctx.check()
-
     stored = store.get_small(prop.id, "hi3d_lat")
     vertices, faces, matrix = decode(_parts()._network(ctx, "hi3d_vae"), stored["coords"], stored["feats"], index,
-                                     device, between)
+                                     device, decode_budget(ctx, mode))
+    ctx.emit(_parts().Event("step", part, prop.id, 1, 2))
+    ctx.check()
     frames = {key: value.clone() for key, value in store.get_small(prop.id, "hi3d_frames").items()}
     frames["matrix"][index] = matrix
     if index + 1 < passes(prop.req):
