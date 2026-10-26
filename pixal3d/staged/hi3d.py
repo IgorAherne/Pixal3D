@@ -19,6 +19,7 @@ into its own grid; the chain of those maps (`frames`) brings the last pass's mes
 from __future__ import annotations
 
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -263,6 +264,33 @@ def _pipeline(transformer: Any, steps: Any, device: str) -> Any:
     return pipe
 
 
+_kernels_chosen = False
+OFF_WORDS = {"0", "off", "false", "no"}
+
+
+def accelerate(device: str) -> None:
+    """Hi3D's sampler kernels, chosen once a process at its first pass, under Pixal3D's own switches: the fused
+    elementwise chains (sparc3d's SPARC3D_FUSED kernels) unless PIXAL3D_FUSED is off, the int8 self-attention on
+    sm_80+ cards unless PIXAL3D_SAGE is off. Both check themselves on the card first and stand down if that fails.
+    The sampler's bit-identical savings (SPARC3D_FAST) are sparc3d's own default."""
+    global _kernels_chosen
+    if _kernels_chosen:
+        return
+    _kernels_chosen = True
+    from sparc3d.nn import accel
+
+    accel.FUSED = os.environ.get("PIXAL3D_FUSED", "").strip().lower() not in OFF_WORDS
+    card = torch.device(device)
+    if card.type != "cuda" or os.environ.get("PIXAL3D_SAGE", "").strip().lower() in OFF_WORDS             or torch.cuda.get_device_capability(card) < (8, 0):
+        return
+    from sparc3d.nn.sparse.attention import int8_attention
+
+    if int8_attention.install(device=card):
+        print("[HI3D] the transformer's self-attention runs int8 (q, k) with fp16 P.V (PIXAL3D_SAGE)", flush=True)
+    else:
+        print(f"[HI3D] int8 self-attention is off on this card: {int8_attention.state().get('why')}", flush=True)
+
+
 # The model calls of the parts, each one function (the engine's checks stand fakes in for them).
 
 def condition(conditioner: Any, picture: Any) -> torch.Tensor:
@@ -276,6 +304,7 @@ def sample(transformer: Any, steps: Any, cond_tokens: torch.Tensor, coords: torc
            generator: torch.Generator, device: str, tick: Any) -> tuple[torch.Tensor, torch.Tensor]:
     """Pass `index`'s latents on the voxels `coords` [N, 3]: (coords [N, 4], feats [N, 32] float32) on the CPU.
     `tick(step, steps)` after every scheduler update."""
+    accelerate(device)
     pipe = _pipeline(transformer, steps, device)
     pipe.progress_callback = lambda event: tick(event.step, event.num_inference_steps)
     latents = pipe._sample_latents(transformer, cond_tokens, coords, STRUCTURES[index], STEPS, generator,
