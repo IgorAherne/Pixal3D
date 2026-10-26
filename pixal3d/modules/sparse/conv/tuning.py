@@ -382,15 +382,17 @@ def choice(logn: int, ci: int, co: int, v: int = 27) -> dict:
     return out
 
 
-def calibrate(device: Any, say: Callable[[str], None] = print, pause: Optional[Callable[[], None]] = None) -> dict:
+def calibrate(device: Any, say: Callable[[str], None] = print, pause: Optional[Callable[[], None]] = None,
+              grid: Optional[dict] = None, drop: bool = True) -> dict:
     """Tune every convolution size the decoders can meet on this card, once (the install's calibration, `python -m
     pixal3d.calibrate`, on a quiet card): flex_gemm's own tuners through the functions the decoders call, with the
     steady benchmark and EXTRA_CONFIGS, saved into flex_gemm's cache file; this card's earlier entries of the three
-    tuners are dropped first. Returns the record's "flex_gemm" section (calibrate_conv.run): the grid of sizes the
-    calibrated lookup reads, every key's choice, time and card memory, "summary" in one line. `pause()` runs
-    before each key (the caller checks the card is still quiet)."""
+    tuners are dropped first (`drop`). `grid`: the shapes to tune instead of calibrate_conv.GRID (the shapes a
+    record lacks, with drop=False: the others' choices stand). Returns the record's "flex_gemm" section
+    (calibrate_conv.run): the grid of sizes the calibrated lookup reads, every key's choice, time and card memory,
+    "summary" in one line. `pause()` runs before each key (the caller checks the card is still quiet)."""
     from . import calibrate_conv
 
-    found = calibrate_conv.run(device, say=say, pause=pause)
+    found = calibrate_conv.run(device, say=say, pause=pause, grid=grid, drop=drop)
     forget_grid()
     return found

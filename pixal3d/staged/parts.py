@@ -411,12 +411,14 @@ def ram_available_mib() -> int | None:
         return None
 
 
-def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int) -> str | None:
+def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int,
+                    voxels: int | None = None) -> str | None:
     """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
     "ram" - or None when it fits. The card: the widest moment of `finish` (finish_mib: the decode, in boxes for a
     big shape, or the closing of the holes) under the cap it will get, and the 1024-grid samplers under the cap in
-    force; the RAM: what the finish hook needs beside the process."""
-    voxels = voxels_at(occupied, resolution)
+    force; the RAM: what the finish hook needs beside the process. The voxels are foreseen from the `occupied`
+    cells of the 512 grid, or given (a Hi3D prop's mesh has them exactly)."""
+    voxels = voxels_at(occupied, resolution) if voxels is None else voxels
     limits = card_limits(ctx)
     if limits is not None:
         finish_limit, cap_now = limits
@@ -482,6 +484,8 @@ def discards(part: str, prop: PropState) -> tuple[str, ...]:
     keys = tuple(key for key in SPENT.get(part, ()) if key != "bundle" or prop.bundled)
     if part == "cond_hr":
         keys += tuple(f"image_{index}" for index in range(prop.views))
+    if part == "finish" and geometry(prop) == "hi3d":
+        keys += ("hi3d_mesh", "hi3d_subs")      # the hook holds the mesh it was handed
     return keys
 
 
@@ -675,7 +679,8 @@ def features(ctx: PartContext, prop: PropState, mode: str) -> None:
     z512 = proj_cond.encode(dino, proj_cond.image_tensor(source, 512, ctx.device))
     z1024 = proj_cond.encode(dino, proj_cond.image_tensor(source, 1024, ctx.device))
     cond = _bf16(proj_cond.cond_dense(proj_cond.SPECS["ss"], z512, view))
-    ctx.store.put_device(prop.id, "dino512", {"z": z512})
+    if geometry(prop) != "hi3d":            # cond_lr's: a Hi3D prop has no cond_lr
+        ctx.store.put_device(prop.id, "dino512", {"z": z512})
     ctx.store.put_device(prop.id, "dino1024", {"z": z1024})
     ctx.store.put_device(prop.id, "cond_ss", cond)
     _keep_bundle(ctx, prop, source)
@@ -720,8 +725,11 @@ def ss(ctx: PartContext, prop: PropState, mode: str) -> None:
     rng = torch.get_rng_state()
     if coords.shape[0] == 0:
         raise PropFailed("The first stage found no shape in the picture.")
-    if draws is not None:
-        full = next(occupied for returned, occupied in draws if returned is coords)
+    if draws is not None:       # the draw the guard returned (the object itself; a copy of it by its values)
+        full = next((occupied for returned, occupied in draws if returned is coords),
+                    next((occupied for returned, occupied in draws if torch.equal(returned, coords)), None))
+        if full is None:
+            raise RuntimeError("the sparse structure returned is none of the draws made")
         store.put_small(prop.id, "hi3d_ss64", {"coords": full[:, 1:].cpu()})
     store.put_small(prop.id, "coords_ss", {"coords": coords.cpu()})
     store.put_small(prop.id, "rng_ss", {"state": rng})
@@ -877,7 +885,7 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     if request.request_hash:
         tensors = {"coords": stored["coords"], "res": stored["res"], "shape_slat": shape_feats, "tex_slat": tex_feats}
         if geometry(prop) == "hi3d":
-            mesh = store.get_small(prop.id, "hi3d_mesh")
+            mesh = store.get_large(prop.id, "hi3d_mesh")
             tensors.update({"hi3d_vertices": mesh["vertices"], "hi3d_faces": mesh["faces"],
                             "voxels": stored["voxels"], **{f"hi3d_{key}": sub for key, sub in
                                                            store.get_small(prop.id, "hi3d_subs").items()}})
@@ -956,15 +964,19 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
                           attrs=attrs, resolution=resolution, attr_layout=ctx.args(prop).pbr_attr_layout)
     del mesh, tex_coords, attrs
     loader.trim()
+    return _hand_over(ctx, prop, decoded, notes, capped)
 
-    # Phase 2, the caller's hook. Once it has started the prop is finished and saved, cancel or not. The hook may
-    # hand the rest back as steps (types.FinishSteps): the runner then runs them around the next props' decodes,
-    # the CPU ones on its worker thread.
+
+def _hand_over(ctx: PartContext, prop: PropState, decoded: "DecodedMesh", notes: dict,
+               capped: bool) -> "FinishSteps | None":
+    """Phase 2 of `finish`, the caller's hook. Once it has started the prop is finished and saved, cancel or not.
+    The hook may hand the rest back as steps (types.FinishSteps): the runner then runs them around the next props'
+    decodes, the CPU ones on its worker thread."""
     ctx.check()
     reserve = glb_reserve(decoded.faces.shape[0])
     if capped:
-        loader.set_cap(reserve, safety_mib=FINISH_SAFETY_MIB)
-    prop.resolution = resolution
+        ctx.loader.set_cap(reserve, safety_mib=FINISH_SAFETY_MIB)
+    prop.resolution = decoded.resolution
     outcome = ctx.hooks.finish(prop.req, decoded, notes)
     if isinstance(outcome, FinishSteps):
         outcome.native_mib = outcome.native_mib or reserve
@@ -1005,25 +1017,13 @@ def _finish_hi3d(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps |
     else:
         loader.trim()
     ctx.emit(Event("step", "finish", prop.id, 2, 3))
-    mesh = store.get_small(prop.id, "hi3d_mesh")
+    mesh = store.get_large(prop.id, "hi3d_mesh")
     decoded = DecodedMesh(vertices=mesh["vertices"], faces=mesh["faces"], coords=tex_coords, attrs=attrs,
                           resolution=resolution, attr_layout=ctx.args(prop).pbr_attr_layout)
     del tex_coords, attrs
     ctx.emit(Event("step", "finish", prop.id, 3, 3))
     loader.trim()
-
-    ctx.check()
-    reserve = glb_reserve(decoded.faces.shape[0])
-    if capped:
-        loader.set_cap(reserve, safety_mib=FINISH_SAFETY_MIB)
-    prop.resolution = resolution
-    outcome = ctx.hooks.finish(prop.req, decoded, notes)
-    if isinstance(outcome, FinishSteps):
-        outcome.native_mib = outcome.native_mib or reserve
-        outcome.safety_mib = FINISH_SAFETY_MIB if outcome.safety_mib is None else outcome.safety_mib
-        return outcome
-    prop.result = dict(outcome or {})
-    return None
+    return _hand_over(ctx, prop, decoded, notes, capped)
 
 
 TABLE = {"cutout": cutout, "camera": camera, "features": features, "ss": ss, "cond_lr": cond_lr, "lr": lr,

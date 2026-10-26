@@ -343,13 +343,15 @@ def _sage(device: Any) -> dict:
     return sage.calibrate(device)
 
 
-def _convolutions(device: Any, quiet: Quiet) -> dict:
+def _convolutions(device: Any, quiet: Quiet, grid: Optional[dict] = None) -> dict:
+    """The convolution step: every shape of calibrate_conv.GRID (this card's earlier choices dropped), or `grid`
+    alone with the earlier choices kept."""
     from pixal3d.modules.sparse.conv import calibrate_conv, tuning
 
     calibrate = getattr(tuning, "calibrate", None)
     if calibrate is None:
         return {"ok": False, "why": "this build has no convolution calibration"}
-    shapes = max(1, len(getattr(calibrate_conv, "GRID", {})) or 1)
+    shapes = max(1, len(grid if grid is not None else getattr(calibrate_conv, "GRID", {})) or 1)
     done = [0]
 
     def tell(text: str) -> None:
@@ -360,7 +362,34 @@ def _convolutions(device: Any, quiet: Quiet) -> dict:
                      f"{text} - shape {done[0]} of {shapes}")
         else:
             say(text)
-    return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True))
+    if grid is None:
+        return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True))
+    return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True), grid=grid, drop=False)
+
+
+def _shapes_lacking(earlier: dict, record: dict) -> Optional[dict]:
+    """The shapes of calibrate_conv.GRID a complete earlier record of this card does not hold, {} when it holds
+    them all, None when there is no such record (a first calibration, another card, a failed convolution step).
+    A new version of the calibration that adds shapes measures those alone: the choices Pixal3D's own decoders
+    run with stand, and so do their bits."""
+    from pixal3d.modules.sparse.conv import calibrate_conv
+
+    if not earlier.get("complete") or not (earlier.get("flex_gemm") or {}).get("ok"):
+        return None
+    if (earlier.get("card_uuid") or earlier.get("card")) != (record.get("card_uuid") or record.get("card")):
+        return None
+    held = set(earlier["flex_gemm"].get("grid") or {})
+    return {shape: span for shape, span in calibrate_conv.GRID.items() if calibrate_conv.family(*shape) not in held}
+
+
+def _merged(earlier: dict, added: dict) -> dict:
+    """The earlier convolution section with the added shapes' keys and grid."""
+    old = earlier["flex_gemm"]
+    return {**old, **added, "keys": old.get("keys", []) + added.get("keys", []),
+            "grid": {**(old.get("grid") or {}), **(added.get("grid") or {})},
+            "skipped": old.get("skipped", []) + added.get("skipped", []),
+            "dropped": old.get("dropped", {}), "seconds": old.get("seconds", 0) + added.get("seconds", 0),
+            "summary": f"{old.get('summary', '')}; added {added.get('summary', '')}"}
 
 
 def main(argv: Optional[list[str]] = None) -> int:
@@ -401,6 +430,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     }
     say(f"calibrating for {record['card']} (sm_{record['capability'][0]}{record['capability'][1]})"
         + (f", attempt {attempts}" if attempts > 1 else ""))
+    lacking = _shapes_lacking(earlier, record)
+    if lacking is not None:         # the record stands; the shapes it lacks are added, the other steps kept
+        skip |= {"triton", "sage"}
+        record.update({key: earlier[key] for key in ("triton", "sage") if key in earlier})
+        say(f"the earlier calibration stands: {len(lacking)} new convolution shapes are measured"
+            if lacking else "the earlier calibration stands: no new convolution shapes to measure")
     began = time.monotonic()
     if "triton" not in skip:
         progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 3)")
@@ -414,9 +449,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     if "convolutions" not in skip:
         progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 3, the longest: "
                                         "several minutes)")
-        found = _timed("flex_gemm", lambda: _convolutions(device, quiet), record)
-        if found:
-            say(f"convolutions: {found.get('summary', found)}")
+        if lacking is not None and not lacking:
+            record["flex_gemm"] = earlier["flex_gemm"]
+        else:
+            found = _timed("flex_gemm", lambda: _convolutions(device, quiet, grid=lacking), record)
+            if found and lacking:
+                record["flex_gemm"] = _merged(earlier, record["flex_gemm"])
+            if found:
+                say(f"convolutions: {record['flex_gemm'].get('summary', found)}")
     record["seconds"] = round(time.monotonic() - began, 1)
     record["quiet"] = quiet.record()
     steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm"}      # --skip name -> record section

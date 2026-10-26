@@ -35,7 +35,7 @@ from typing import Any, Callable
 
 import torch
 
-from .types import PARTS, BatchBroken, Cancelled, Event, FinishSteps, PropFailed, PropRequest
+from .types import GEOMETRIES, PARTS, BatchBroken, Cancelled, Event, FinishSteps, PropFailed, PropRequest
 
 MODES = ("normal", "tight", "uncapped")
 KINDS = ("mv", "sv")                # the order inside every part: multi-view props first
@@ -310,10 +310,14 @@ class StagedRunner:
             else:
                 store.put_small(prop.id, "notes", {})
         for prop in self.props:
-            if prop.kind == "mv" and not prop.resumed and not ctx.engine.multiview:
+            if prop.resumed:            # its finish needs the texture decoder alone
+                continue
+            geometry = getattr(prop.req, "geometry", "pixal3d")
+            if prop.kind == "mv" and not ctx.engine.multiview:
                 self._fail(prop, "", ("mv_missing", "The multi-view networks are not installed.", ""))
-            elif getattr(prop.req, "geometry", "pixal3d") == "hi3d" and getattr(ctx.engine, "hi3d_scheduler",
-                                                                                 None) is None:
+            elif geometry not in GEOMETRIES:
+                self._fail(prop, "", ("input", f"The geometry {geometry!r} is none of {', '.join(GEOMETRIES)}.", ""))
+            elif geometry == "hi3d" and getattr(ctx.engine, "hi3d_scheduler", None) is None:
                 self._fail(prop, "", ("missing_file", "Hi3D's networks are not installed.", ""))
 
         order = [prop for kind in KINDS for prop in self.props if prop.kind == kind]
@@ -326,24 +330,24 @@ class StagedRunner:
 
     def _restore(self, prop: PropState, checkpoint: dict) -> bool:
         """Put a checkpoint's latents where part "finish" reads them. False when it does not hold them all."""
+        hi3d = getattr(prop.req, "geometry", "pixal3d") == "hi3d"
         try:
             tensors = checkpoint["tensors"]
             coords, res = tensors["coords"], tensors["res"]
             shape_slat, tex_slat = tensors["shape_slat"], tensors["tex_slat"]
+            if hi3d:
+                mesh = {"vertices": tensors["hi3d_vertices"], "faces": tensors["hi3d_faces"]}
+                stored = {"coords": coords, "res": res, "voxels": tensors["voxels"]}
         except KeyError:
-            return False
-        hi3d = getattr(prop.req, "geometry", "pixal3d") == "hi3d"
-        if hi3d and "hi3d_vertices" not in tensors:
             return False
         notes = dict(checkpoint.get("notes") or {})
         prop.slow = list(notes.get("slow") or [])
         store = self.ctx.store
         if hi3d:
-            store.put_small(prop.id, "hi3d_mesh", {"vertices": tensors["hi3d_vertices"],
-                                                   "faces": tensors["hi3d_faces"]})
+            store.put_device(prop.id, "hi3d_mesh", mesh)
             store.put_small(prop.id, "hi3d_subs", {key[len("hi3d_"):]: value for key, value in tensors.items()
                                                    if key.startswith("hi3d_s")})
-            store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res, "voxels": tensors["voxels"]})
+            store.put_small(prop.id, "coords_hr", stored)
         else:
             store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res})
         store.put_small(prop.id, "shape_slat", {"feats": shape_slat})

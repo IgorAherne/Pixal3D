@@ -155,8 +155,12 @@ class StagedEngine:
         if getattr(options, "hi3d", None) is not None:
             from . import hi3d
 
-            hi3d.register(self.loader, options.hi3d)
-            self.hi3d_scheduler = hi3d.scheduler(options.hi3d)
+            try:        # a broken Hi3D checkout or download never keeps Pixal3D's own props from being made
+                hi3d.register(self.loader, options.hi3d)
+                self.hi3d_scheduler = hi3d.scheduler(options.hi3d)
+            except Exception as exc:            # noqa: BLE001
+                print(f"[HI3D] Hi3D cannot be used ({type(exc).__name__}: {str(exc)[:200]}): props set to Hi3D "
+                      f"will fail until its files are repaired", flush=True)
         # The first network a batch loads (background removal, at its first cut-out: 0.9 GB, read from a cold disk
         # in the first batch otherwise) is read into the system's file cache now, by the loader's read-ahead
         # thread; nothing is kept in the process and the card is not touched. The runner does the same after a

@@ -11,9 +11,11 @@ of each level follow from the prop (Spellcast3D code/devtools/pixal3d-lowmem/rou
 golden cases sv1024 ... big1536 and this PC's cache of every prop it made): level 0 holds the upsample's 32-grid
 tokens (2^9 for a small prop) and the HR tokens (up to 2^15: the token cap at 1536, 49,152), every level about 4.4x
 the one before; from level 2 on a large prop is decoded in boxes (chunked.py: 2 M fine voxels a box, conv1 in
-slabs), a small one whole. GRID spans each shape's buckets with one more on either side. A key outside it - a
-slab's small remainder, a prop beyond the test set - takes the nearest calibrated key's choice at run time
-(tuning.install's rule) instead of being tuned.
+slabs), a small one whole. The shape encoder (a Hi3D prop's mesh into the texture's latent, staged/hi3d.py) mirrors
+the shape decoder level for level and adds its down-blocks' conv1 Ci x Ci' / 8 (64x16 on the fine voxels, whole:
+up to ~2^23 at 1536, then 128x32, 256x64, 512x128). GRID spans each shape's buckets with one more on either side. A
+key outside it - a slab's small remainder, a prop beyond the test set - takes the nearest calibrated key's choice at
+run time (tuning.install's rule) instead of being tuned.
 
 The inputs: a voxel shell (a sphere, SHELL_THICKNESS voxels thick, rows in Morton order, the first n of them) has
 about the real levels' neighbourhood - 14-16 valid neighbours of 27 on average, the masked kernel's issued work
@@ -38,6 +40,7 @@ GRID: Dict[Tuple[int, int], Tuple[int, int]] = {
     (256, 256): (12, 20), (256, 1024): (12, 18),
     (128, 128): (14, 20), (128, 512): (14, 20),
     (64, 64): (16, 22),
+    (64, 16): (16, 23), (128, 32): (14, 21), (256, 64): (12, 19), (512, 128): (10, 17),      # the shape encoder's
 }
 SHELL_THICKNESS = 1.6       # voxels: the real levels' 14-16 neighbours of 27 (calibrate/synth_stats.py)
 MAX_KEY_MIB = 1500          # the card one key may take (its tables, the neighbour cache while built, the output)

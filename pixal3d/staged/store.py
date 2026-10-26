@@ -487,6 +487,28 @@ class PropStore:
             return {name: self._copy(tensor) for name, tensor in item.ram.items()}
         return self._from_file(item)
 
+    def get_large(self, prop_id: str, key: str) -> dict[str, torch.Tensor]:
+        """A large item's tensors in RAM, for work on the CPU (a mesh): the cache's own tensors (not to be changed)
+        when it holds them, else read back from the item's file or copied from the card, waiting for that. The item
+        stays in the store, as after `take`."""
+        prop = self._open(prop_id)
+        item = prop.large.get(key)
+        if item is None:
+            raise KeyError(f"prop {prop_id!r} has no large item {key!r}")
+        self._tick()
+        item.touch = self._tick_clock()
+        if item.ram is not None:
+            return dict(item.ram)
+        if item.device is not None:
+            return {name: tensor.cpu() for name, tensor in item.device.items()}
+        slot = item.slot
+        if slot is not None and slot.state == FILLING:
+            self._await(slot.job, f"{key} of {prop_id} to be staged")
+            slot = item.slot
+        if slot is not None and slot.state == STAGED:
+            return {name: view.clone() for name, view in slot.views.items()}
+        return self._read_back(item)        # views of a buffer of this call's own
+
     def discard(self, prop_id: str, *keys: str) -> None:
         """Items the prop needs no more: out of RAM now, the file by the helper thread."""
         prop = self._props.get(prop_id)
@@ -796,6 +818,13 @@ class PropStore:
                 self._open(item.prop.id)        # item went with it: say why, in the words the artist is shown
                 raise RuntimeError(f"{item.key} of {item.prop.id} was dropped while it was being read")
             return self._issue(item.slot)
+        return {name: self._copy(view) for name, view in self._read_back(item).items()}
+
+    def _read_back(self, item: _Item) -> dict[str, torch.Tensor]:
+        """A spilled item's tensors as views of a pageable buffer of this thread's, read by the helper thread
+        (waiting for it), in the order they were put."""
+        if not item.on_disk:
+            raise RuntimeError(f"{item.key} of {item.prop.id} is neither in RAM nor on disk")
         buffer = torch.empty(item.need, dtype=torch.uint8)
         job = self._submit("read", prop_id=item.prop.id, key=item.key, path=item.path,
                            names=item.names, buffer=buffer)
@@ -806,7 +835,7 @@ class PropStore:
         problem = _mismatch(item, views)
         if problem:
             raise RuntimeError(f"{item.path}: {problem}")
-        return {name: self._copy(views[name]) for name in item.names}
+        return {name: views[name] for name in item.names}
 
     # =================================================================================================================
     # GPU thread: the helper thread's queue and its reports

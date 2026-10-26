@@ -6,9 +6,9 @@ runs cond_lr, lr, upsample and hr (parts.applies):
     hi3d_cond    DINOv2-L and CLIP-L on the front picture cut out; the coarse mesh voxelized for the first pass
     hi3d_pK      pass K's latents: transformer_512 on the 64 grid, transformer_1024 on the 128 and 192 grids
     hi3d_dK      pass K decoded and its mesh extracted, then voxelized for the next pass or kept as the prop's mesh
-    hi3d_encode  the mesh into TRELLIS.2's shape latent (the encoder of the shape decoder Pixal3D ships, the same
-                 file): the texture flow's input and tokens, and the texture decoder's guide tables from the mesh's
-                 own voxels
+    hi3d_encode  the mesh into TRELLIS.2's shape latent (the encoder paired with the shape decoder Pixal3D ships,
+                 downloaded with Hi3D): the texture flow's input and tokens, and the texture decoder's guide tables
+                 from the mesh's own voxels
 then cond_hr (the texture's conditioning alone), tex and finish as for a Pixal3D prop, the mesh being Hi3D's.
 
 Frames: Pixal3D's voxels lie in [-0.5, 0.5]^3, Y up with the picture's front towards +Z (its GLB step's axis swap and
@@ -19,8 +19,8 @@ into its own grid; the chain of those maps (`frames`) brings the last pass's mes
 from __future__ import annotations
 
 import json
-import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,6 +30,8 @@ import torch
 
 STRUCTURES = (64, 128, 192)                 # each pass's structure grid; the decoder extracts at 8x
 BUDGETS = (80_000, 90_000, 110_000)         # the voxels a pass takes at most (sparc3d's PASS_BUDGETS)
+FACE_TARGETS = (1_000_000, 1_000_000, 2_000_000)    # the faces a pass's mesh is reduced to (sparc3d's TARGET_FACE_COUNTS)
+CUBE_FIT = 0.499                            # the mesh's furthest vertex from the centre once fitted into the cube
 PASSES = {1024: 2, 1536: 3}                 # the request's resolution -> Hi3D's passes
 STEPS = 25                                  # scheduler updates a pass (the checkpoint's scheduler_config)
 SAMPLE_PARTS = ("hi3d_p1", "hi3d_p2", "hi3d_p3")
@@ -72,7 +74,7 @@ def applies(part: str, req: Any) -> bool:
 def spent(part: str, req: Any) -> tuple[str, ...]:
     """What nobody reads once `part` is over for this prop."""
     if part == "hi3d_cond":
-        return ("hi3d_ss64", "cutout", "dino512")
+        return ("hi3d_ss64", "cutout")
     if part in SAMPLE_PARTS and SAMPLE_PARTS.index(part) == passes(req) - 1:
         return ("hi3d_cond", "hi3d_coords")
     if part in DECODE_PARTS:
@@ -138,7 +140,7 @@ def coarse_mesh(coords64: torch.Tensor) -> tuple[np.ndarray, np.ndarray]:
             cells = np.argwhere(grid & ~neighbour)
             if len(cells) == 0:
                 continue
-            u, v = [a for a in range(3) if a != axis]
+            u, v = (axis + 1) % 3, (axis + 2) % 3          # u x v = +axis: the faces wound outwards
             base = cells.copy()
             base[:, axis] += 1 if step > 0 else 0
             corners = np.repeat(base[:, None, :], 4, axis=1)
@@ -192,6 +194,33 @@ def back_to_coarse(vertices: np.ndarray, frames: dict) -> np.ndarray:
         fit = {"center": frames["center"][k].numpy(), "scale": float(frames["scale"][k]), "res": int(frames["res"][k])}
         vertices = to_previous(vertices, frames["matrix"][k].numpy(), fit)
     return np.ascontiguousarray(vertices)
+
+
+def into_cube(vertices: np.ndarray) -> tuple[np.ndarray, float]:
+    """The mesh scaled about the cube's centre into Pixal3D's frame [-0.5, 0.5]^3 when a pass carried it past a
+    face (the refiner may push the surface a voxel past the coarse one: a crate's face by 3 %): one uniform scale,
+    so that nothing downstream clamps it flat. (The vertices, the scale: 1.0 when none was needed.)"""
+    span = float(np.abs(vertices).max()) if len(vertices) else 0.0
+    if span <= CUBE_FIT:
+        return vertices, 1.0
+    scale = CUBE_FIT / span
+    return vertices * scale, scale
+
+
+def simplified(vertices: np.ndarray, faces: np.ndarray, target: int) -> tuple[np.ndarray, np.ndarray]:
+    """The mesh reduced to about `target` faces as Hi3D's own pipeline reduces its output (pyfqmr with its
+    settings), when it has more: the extraction's 7-14 M faces at 1536 are far beyond what carries the detail,
+    and the texture's dual grid, the mesh's RAM and the hub's own reduction all go by the count."""
+    if faces.shape[0] <= target:
+        return vertices, faces
+    import pyfqmr
+
+    simplifier = pyfqmr.Simplify()
+    simplifier.setMesh(np.ascontiguousarray(vertices, dtype=np.float64), np.ascontiguousarray(faces, dtype=np.int64))
+    simplifier.simplify_mesh(target_count=target, aggressiveness=5, preserve_border=True, verbose=False)
+    fewer_vertices, fewer_faces, _ = simplifier.getMesh()
+    return (np.ascontiguousarray(fewer_vertices, dtype=np.float64),
+            np.ascontiguousarray(fewer_faces, dtype=np.int64))
 
 
 def frames_with(frames: dict | None, fit: dict) -> dict:
@@ -265,23 +294,25 @@ def _pipeline(transformer: Any, steps: Any, device: str) -> Any:
 
 
 _kernels_chosen = False
-OFF_WORDS = {"0", "off", "false", "no"}
 
 
 def accelerate(device: str) -> None:
-    """Hi3D's sampler kernels, chosen once a process at its first pass, under Pixal3D's own switches: the fused
-    elementwise chains (sparc3d's SPARC3D_FUSED kernels) unless PIXAL3D_FUSED is off, the int8 self-attention on
-    sm_80+ cards unless PIXAL3D_SAGE is off. Both check themselves on the card first and stand down if that fails.
-    The sampler's bit-identical savings (SPARC3D_FAST) are sparc3d's own default."""
+    """Hi3D's sampler kernels, chosen once a process at its first pass, under Pixal3D's own switches as Pixal3D
+    reads them: the fused elementwise chains (sparc3d's SPARC3D_FUSED kernels) where PIXAL3D_FUSED is its default
+    "rounded" (modules.fused.MODE), the int8 self-attention on sm_80+ cards where PIXAL3D_SAGE is on
+    (modules.sage.from_env). Both check themselves on the card first and stand down if that fails. The sampler's
+    bit-identical savings (SPARC3D_FAST) are sparc3d's own default."""
     global _kernels_chosen
     if _kernels_chosen:
         return
     _kernels_chosen = True
     from sparc3d.nn import accel
 
-    accel.FUSED = os.environ.get("PIXAL3D_FUSED", "").strip().lower() not in OFF_WORDS
+    from ..modules import fused, sage
+
+    accel.FUSED = fused.MODE == "rounded"
     card = torch.device(device)
-    if card.type != "cuda" or os.environ.get("PIXAL3D_SAGE", "").strip().lower() in OFF_WORDS             or torch.cuda.get_device_capability(card) < (8, 0):
+    if card.type != "cuda" or not sage.from_env() or torch.cuda.get_device_capability(card) < (8, 0):
         return
     from sparc3d.nn.sparse.attention import int8_attention
 
@@ -366,11 +397,12 @@ def decode_budget(ctx: Any, mode: str) -> float:
     DECODE_MARGIN_MIB for the allocator's own reserve, TIGHT_SHARE of that on the ladder's tight rung; without a cap,
     what the card has free."""
     cap = ctx.loader.stats().get("cap_mib")
-    if not cap and torch.device(ctx.device).type != "cuda":
+    device = torch.device(ctx.device)
+    if not cap and device.type != "cuda":
         return float("inf")
     if not cap:
-        free, _ = torch.cuda.mem_get_info()
-        cap = (free >> 20) + torch.cuda.memory_reserved() / 2**20 - ctx.loader.safety_mib
+        free, _ = torch.cuda.mem_get_info(device)
+        cap = (free >> 20) + torch.cuda.memory_reserved(device) / 2**20 - getattr(ctx.loader, "safety_mib", 300)
     budget = cap - DECODE_MARGIN_MIB
     return budget * TIGHT_SHARE if mode == "tight" else budget
 
@@ -389,35 +421,112 @@ def _decoded(ctx: Any, prop: Any, mode: str, index: int) -> None:
         store.put_small(prop.id, "hi3d_coords", {"coords": coords.cpu()})
         store.put_small(prop.id, "hi3d_frames", frames_with(frames, fit))
     else:
-        coarse = back_to_coarse(vertices, frames)
-        store.put_small(prop.id, "hi3d_mesh", {"vertices": torch.from_numpy(coarse.astype(np.float32)),
-                                               "faces": torch.from_numpy(faces.astype(np.int32))})
+        began = time.perf_counter()
+        coarse, faces = simplified(back_to_coarse(vertices, frames), faces, FACE_TARGETS[index])
+        coarse, scale = into_cube(coarse)
+        print(f"[HI3D] the mesh: {len(faces):,} faces of {len(vertices):,} points"
+              + (f", scaled by {scale:.3f} into the cube" if scale < 1.0 else "")
+              + f" ({time.perf_counter() - began:.1f} s)", flush=True)
+        # a large item: the mesh (tens of MB) may go to the work folder while the prop waits for its texture
+        store.put_device(prop.id, "hi3d_mesh", {"vertices": torch.from_numpy(coarse.astype(np.float32)),
+                                                "faces": torch.from_numpy(faces.astype(np.int32))})
         store.put_small(prop.id, "hi3d_frames", frames)
     ctx.emit(_parts().Event("step", part, prop.id, 2, 2))
 
 
+ENCODE_BYTES_PER_VOXEL = 1024       # the shape encoder's peak on the card per fine voxel beside its weights (0.91
+#                                     KB measured on the knight at 1536 and 1024: its float32 norms, neighbour tables)
+
+
+def encode_mib(voxels: int) -> float:
+    return voxels * ENCODE_BYTES_PER_VOXEL / 2**20
+
+
+def encoder_room_mib(ctx: Any) -> float | None:
+    """MiB the shape encoder may take beside what the card holds (its weights among it) under the cap in force;
+    None without one (a CPU run, or the cap was lifted: the card and shared memory)."""
+    cap = ctx.loader.stats().get("cap_mib")
+    device = torch.device(ctx.device)
+    if not cap or device.type != "cuda":
+        return None
+    return cap - torch.cuda.memory_allocated(device) / 2**20
+
+
+def _refused(ctx: Any, request: Any, tokens: int, voxels: int, resolution: int, room: float | None) -> str | None:
+    """Why a texture of `tokens` tokens over `voxels` voxels at `resolution` would not do: "tokens" (the request's
+    cap), "card" or "ram" (parts.resolution_fits: the texture sampler and the finish as Pixal3D foresees them; the
+    encoder's own peak against `room`), or None."""
+    if tokens >= request.max_num_tokens:
+        return "tokens"
+    reason = _parts().resolution_fits(ctx, 0, tokens, resolution, voxels=voxels)
+    if reason is None and room is not None and encode_mib(voxels) > room / 1.1:
+        reason = "card"
+    return reason
+
+
+def _foreseen(ctx: Any, request: Any, tokens: int, voxels: int, resolution: int, room: float | None) -> int:
+    """The highest resolution under `resolution` (128 at a time, 1024 at least) at which the mesh is foreseen to
+    do: its voxels and tokens go about as the resolution squared. Spares a dual grid (CPU seconds) per step."""
+    lower = resolution - 128
+    while lower > 1024:
+        scale = (lower / resolution) ** 2
+        if _refused(ctx, request, int(tokens * scale), int(voxels * scale), lower, room) is None:
+            break
+        lower -= 128
+    return lower
+
+
+def _tokens(fine: torch.Tensor, resolution: int) -> int:
+    """The texture's tokens over the fine voxels: the occupied cells of the resolution / 16 grid."""
+    return int(torch.unique(_keys(fine >> 4, resolution >> 4)).shape[0])
+
+
 def encode(ctx: Any, prop: Any, mode: str) -> None:
-    """The mesh into the texture's shape latent at the request's resolution (lowered by 128 at a time, down to
-    1024, while its tokens reach the request's cap, as Pixal3D's upsample does)."""
-    store, device, request = ctx.store, ctx.device, prop.req
-    mesh = store.get_small(prop.id, "hi3d_mesh")
-    resolution = int(request.resolution)
+    """The mesh into the texture's shape latent at the request's resolution, lowered by 128 at a time (down to
+    1024) while its tokens reach the request's cap or the memory this PC leaves would not take it (_refused), as
+    Pixal3D's upsample does, and noted as "memory_cap" the same way (the artist is told). An encoder that runs out
+    of memory all the same lowers it once more."""
+    parts, store, device, request = _parts(), ctx.store, ctx.device, prop.req
+    encoder = parts._network(ctx, "shape_enc")
+    mesh = store.get_large(prop.id, "hi3d_mesh")
+    room = encoder_room_mib(ctx)
+    resolution, unbounded, why = int(request.resolution), None, None
     while True:
         fine, dual, intersected = dual_grid(mesh["vertices"], mesh["faces"], resolution)
-        tokens = torch.unique(fine // 16, dim=0).shape[0]
-        if tokens < request.max_num_tokens or resolution <= 1024:
+        fine = fine.int()
+        voxels, tokens = fine.shape[0], _tokens(fine, resolution)
+        ctx.check()
+        refused = _refused(ctx, request, tokens, voxels, resolution, room)
+        if refused == "tokens" and resolution > 1024:
+            resolution -= 128
+            continue
+        unbounded = resolution if unbounded is None else unbounded      # the token cap alone gives this
+        if refused and refused != "tokens" and resolution > 1024:
+            why = why or refused
+            resolution = _foreseen(ctx, request, tokens, voxels, resolution, room)
+            continue
+        try:
+            slat = encode_mesh(encoder, fine, dual, intersected, resolution, device)
+            subs = guide_subs(slat.coords[:, 1:], fine.to(device), resolution)
             break
+        except Exception as exc:
+            from .runner import classify
+
+            if resolution <= 1024 or classify(exc) != "oom":
+                raise
+            why = why or "card"
+        ctx.loader.trim()               # the attempt's tensors went with its exception
         resolution -= 128
-    ctx.check()
-    fine = fine.int()
-    slat = encode_mesh(_parts()._network(ctx, "shape_enc"), fine, dual, intersected, resolution, device)
-    subs = guide_subs(slat.coords[:, 1:], fine.to(device), resolution)
     store.put_small(prop.id, "coords_hr", {"coords": slat.coords.int().cpu(),
                                           "res": torch.tensor([resolution], dtype=torch.int32),
-                                          "voxels": torch.tensor([fine.shape[0]], dtype=torch.int64)})
+                                          "voxels": torch.tensor([voxels], dtype=torch.int64)})
     store.put_small(prop.id, "shape_slat", {"feats": slat.feats.float().cpu()})
     store.put_small(prop.id, "hi3d_subs", {f"s{level}": sub.cpu() for level, sub in enumerate(subs)})
     store.put_small(prop.id, "rng_hr", store.get_small(prop.id, "rng_ss"))
+    if resolution != unbounded:
+        notes = store.get_small(prop.id, "notes")
+        store.put_small(prop.id, "notes", {**notes, "memory_cap": {
+            "by": why, "resolution": resolution, "without": unbounded, "tokens": tokens}})
 
 
 TABLE = {"hi3d_cond": cond, "hi3d_encode": encode,
