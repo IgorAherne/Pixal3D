@@ -621,14 +621,16 @@ class StagedRunner:
         self.plan.leave(ctx, part, kind)
 
     def _read_ahead(self, index: int, part: str, kind: str) -> None:
-        """While a group runs, the file of the next network that will be loaded is read into the system's file
-        cache: the first one a later group needs that is neither on the card nor this group's own."""
+        """While a group runs, the files of the next networks that will be loaded are read into the system's file
+        cache: those of the first later group that needs any network neither on the card nor this group's own, all
+        of that group's in turn (they are loaded together: Hi3D's two picture encoders)."""
         loader = self.ctx.loader
         skip = set(self.plan.networks(part, kind)) | set(loader.loaded()) | set(self.plan.LIGHT)
-        ahead = [name for names in self._later(index, part, kind) for name in names if name not in skip]
+        ahead = next(([name for name in names if name not in skip] for names in self._later(index, part, kind)
+                      if any(name not in skip for name in names)), [])
         if ahead and ahead[0] != self._ahead:
             self._ahead = ahead[0]
-            loader.prefetch(ahead[0])
+            loader.prefetch(*ahead)
 
     def _want(self, part: str, prop: PropState) -> None:
         for key in self.plan.wants(part):

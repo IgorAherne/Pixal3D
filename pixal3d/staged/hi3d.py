@@ -7,7 +7,8 @@ runs cond_lr, lr, upsample and hr (parts.applies):
     hi3d_pK      pass K's latents: transformer_512 on the 64 grid, transformer_1024 on the 128 and 192 grids
     hi3d_dK      pass K decoded and its mesh extracted, then voxelized for the next pass or kept as the prop's mesh
                  (the last pass: reduced to Hi3D's face target, fitted into the cube, and its dual grid for the
-                 texture started on a worker thread, so that the next prop's decode has the card meanwhile)
+                 texture, at the resolution hi3d_encode is foreseen to settle on, started on a worker thread, so
+                 that the next prop's decode has the card meanwhile)
     hi3d_encode  the mesh into TRELLIS.2's shape latent (the encoder paired with the shape decoder Pixal3D ships,
                  downloaded with Hi3D): the texture flow's input and tokens, and the texture decoder's guide tables
                  from the mesh's own voxels
@@ -16,7 +17,8 @@ then cond_hr (the texture's conditioning alone), tex and finish as for a Pixal3D
 The sampler's kernels follow Pixal3D's switches (`accelerate`, `int8_convert`): PIXAL3D_FUSED the fused elementwise
 chains, PIXAL3D_SAGE the int8 self-attention, PIXAL3D_INT8 the blocks' linears as int8 GEMMs (PIXAL3D_HI3D_INT8=off
 turns Hi3D's alone off); spconv's kernel choices come from the install's calibration record
-(`_restore_spconv_choices`).
+(`_restore_spconv_choices`); the blocks keep the picture's K/V through a pass where the cap has the room
+(`_kv_cache_fits`; the same bits).
 
 Frames: Pixal3D's voxels lie in [-0.5, 0.5]^3, Y up with the picture's front towards +Z (its GLB step's axis swap and
 the launcher's GLB_ROTATION cancel out), which is the frame Hi3D was trained in. Every Hi3D pass fits its input mesh
@@ -51,7 +53,7 @@ LATENT_LEVELS = 4                           # the shape latent's grid is the tex
 DECODE_MARGIN_MIB = 300     # under the cap: the caching allocator reserves up to ~100 MiB above the decode's budget
 TIGHT_SHARE = 0.8           # the budget on the ladder's tight rung (an attempt that ran out of memory)
 
-ENTER = {"hi3d_cond": ("hi3d_cond",), "hi3d_encode": ("shape_enc",),
+ENTER = {"hi3d_cond": ("hi3d_dino", "hi3d_clip"), "hi3d_encode": ("shape_enc",),
          **{part: (net,) for part, net in zip(SAMPLE_PARTS, TRANSFORMERS)},
          **{part: ("hi3d_vae",) for part in DECODE_PARTS}}
 WANTS = {part: ("hi3d_cond",) for part in SAMPLE_PARTS}
@@ -104,9 +106,26 @@ def register(loader: Any, paths: Hi3DPaths) -> None:
                                    config={"name": "sparc3d.models.transformers:Sparc3DTransformer", "args": args},
                                    file=paths.weights / folder / "model.safetensors")
     loader.register_builder("hi3d_vae", lambda device: _vae(paths, device), paths.weights / "vae" / "model.safetensors")
-    loader.register_builder("hi3d_cond", lambda device: _conditioner(paths, device),
-                            paths.dino / "model.safetensors")
+    # The picture's two encoders as the loader's own checkpoints (picture_encoder builds each from its config.json
+    # alone): read ahead while the part before runs and straight onto the card, CLIP's vision tower only (1.1 of
+    # its file's 1.6 GB) - transformers' from_pretrained read both files cold from the disk (19 s here) and built
+    # them on the CPU first.
+    for name, folder, kind in (("hi3d_dino", paths.dino, "dino"), ("hi3d_clip", paths.clip, "clip")):
+        loader.register_checkpoint(name, folder / "model", file=folder / "model.safetensors",
+                                   config={"name": "pixal3d.staged.hi3d:picture_encoder",
+                                           "args": {"kind": kind, "folder": str(folder)}})
     loader.register_checkpoint("shape_enc", paths.encoder)
+
+
+def picture_encoder(kind: str, folder: str) -> Any:
+    """DINOv2-L ("dino") or CLIP-L's vision tower ("clip") built from the config.json in `folder`, no weights read:
+    the loader's class for the two checkpoints (their state dicts are the files' tensors, CLIP's the vision_model
+    ones), the weights its own read."""
+    from transformers import CLIPVisionConfig, CLIPVisionModel, Dinov2Config, Dinov2Model
+
+    if kind == "dino":
+        return Dinov2Model(Dinov2Config.from_pretrained(folder))
+    return CLIPVisionModel(CLIPVisionConfig.from_pretrained(folder))
 
 
 def int8_convert(model: Any) -> Any:
@@ -144,13 +163,6 @@ def _vae(paths: Hi3DPaths, device: str) -> Any:
     from sparc3d.models.autoencoders.config import load_sparconv_vae
 
     return load_sparconv_vae(paths.weights / "vae", device=device)
-
-
-def _conditioner(paths: Hi3DPaths, device: str) -> Any:
-    from sparc3d.models.conditioners.image import ImageConditioner
-
-    return ImageConditioner(local_files_only=True, dino_model_id=str(paths.dino),
-                            clip_model_id=str(paths.clip)).to(device).eval()
 
 
 def scheduler(paths: Hi3DPaths) -> Any:
@@ -401,22 +413,52 @@ def accelerate(device: str) -> None:
 
 # The model calls of the parts, each one function (the engine's checks stand fakes in for them).
 
-def condition(conditioner: Any, picture: Any) -> torch.Tensor:
-    """The cut-out front picture -> Hi3D's conditioning [1, 2917, 2048], framed as sparc3d's prepare_image does."""
+def condition(dino: Any, clip: Any, picture: Any) -> torch.Tensor:
+    """The cut-out front picture -> Hi3D's conditioning [1, 2917, 2048] from the two encoders on the card, framed as
+    sparc3d's prepare_image does."""
+    from sparc3d.models.conditioners.image import ImageConditioner
     from sparc3d.utils.image import prepare_image
 
-    return conditioner(prepare_image(picture))
+    return ImageConditioner.from_encoders(dino, clip)(prepare_image(picture))
+
+
+KV_CACHE_MIB = 24 * 2917 * 2 * 2112 * 2 / 2**20    # the context's K/V of the 24 blocks in fp16: 564 MiB
+SAMPLE_KIB_PER_VOXEL = 32       # a pass's activations at their peak, per voxel (17-29 KiB on the knight's passes)
+KV_CACHE_SLACK_MIB = 1024       # what stays free under the cap beside the model, the activations and the K/V
+
+
+def _kv_cache_fits(ctx: Any, voxels: int) -> bool:
+    """Whether a pass's blocks may keep the context's K/V (accel.KV_CACHE: the same bits, one projection of the 2917
+    context rows a block and pass instead of one a forward - 15 % of a first-pass step, 1-3 % of the finer passes'):
+    the cap in force has the room for them beside what the card holds, the pass's activations and a slack for the
+    allocator's fragmentation (no cap: the card is not the limit)."""
+    device = torch.device(ctx.device)
+    if device.type != "cuda":
+        return False
+    cap = ctx.loader.stats().get("cap_mib")
+    if not cap:
+        return True
+    held = torch.cuda.memory_allocated(device) / 2**20
+    return held + voxels * SAMPLE_KIB_PER_VOXEL / 1024 + KV_CACHE_MIB + KV_CACHE_SLACK_MIB <= cap
 
 
 def sample(transformer: Any, steps: Any, cond_tokens: torch.Tensor, coords: torch.Tensor, index: int, total: int,
-           generator: torch.Generator, device: str, tick: Any) -> tuple[torch.Tensor, torch.Tensor]:
+           generator: torch.Generator, device: str, tick: Any, kv_cache: bool = False
+           ) -> tuple[torch.Tensor, torch.Tensor]:
     """Pass `index`'s latents on the voxels `coords` [N, 3]: (coords [N, 4], feats [N, 32] float32) on the CPU.
-    `tick(step, steps)` after every scheduler update."""
+    `tick(step, steps)` after every scheduler update; `kv_cache`: the blocks keep the context's K/V through the pass
+    (_kv_cache_fits)."""
+    from sparc3d.nn import accel
+
     accelerate(device)
     pipe = _pipeline(transformer, steps, device)
     pipe.progress_callback = lambda event: tick(event.step, event.num_inference_steps)
-    latents = pipe._sample_latents(transformer, cond_tokens, coords, STRUCTURES[index], STEPS, generator,
-                                   pass_index=index, num_passes=total)
+    accel.KV_CACHE = bool(kv_cache)
+    try:
+        latents = pipe._sample_latents(transformer, cond_tokens, coords, STRUCTURES[index], STEPS, generator,
+                                       pass_index=index, num_passes=total)
+    finally:
+        accel.KV_CACHE = False
     return latents.coords.cpu(), latents.feats.float().cpu()
 
 
@@ -446,8 +488,9 @@ def encode_mesh(encoder: Any, fine: torch.Tensor, dual: torch.Tensor, intersecte
 
 def cond(ctx: Any, prop: Any, mode: str) -> None:
     """The picture's conditioning and the first pass's voxels from the coarse occupancy."""
-    store, device = ctx.store, ctx.device
-    tokens = condition(_parts()._network(ctx, "hi3d_cond"), store.get_small(prop.id, "cutout"))
+    store, device, parts = ctx.store, ctx.device, _parts()
+    tokens = condition(parts._network(ctx, "hi3d_dino"), parts._network(ctx, "hi3d_clip"),
+                       store.get_small(prop.id, "cutout"))
     vertices, faces = coarse_mesh(store.get_small(prop.id, "hi3d_ss64")["coords"])
     coords, fit = voxelize(vertices, faces, STRUCTURES[0], BUDGETS[0], device)
     generator = torch.Generator("cpu").manual_seed(int(prop.req.seed))
@@ -462,9 +505,10 @@ def _sample(ctx: Any, prop: Any, mode: str, index: int) -> None:
     transformer = _parts()._network(ctx, TRANSFORMERS[index])
     generator = torch.Generator("cpu")
     generator.set_state(store.get_small(prop.id, "hi3d_rng")["state"])
-    coords, feats = sample(transformer, ctx.engine.hi3d_scheduler, ctx.take(prop, "hi3d_cond")["c"],
-                           store.get_small(prop.id, "hi3d_coords")["coords"], index, passes(prop.req), generator,
-                           ctx.device, _parts()._steps(ctx, prop, SAMPLE_PARTS[index], mode))
+    coords = store.get_small(prop.id, "hi3d_coords")["coords"]
+    coords, feats = sample(transformer, ctx.engine.hi3d_scheduler, ctx.take(prop, "hi3d_cond")["c"], coords, index,
+                           passes(prop.req), generator, ctx.device, _parts()._steps(ctx, prop, SAMPLE_PARTS[index], mode),
+                           kv_cache=_kv_cache_fits(ctx, int(coords.shape[0])))
     store.put_small(prop.id, "hi3d_lat", {"coords": coords, "feats": feats})
     store.put_small(prop.id, "hi3d_rng", {"state": generator.get_state()})
 
@@ -508,8 +552,57 @@ def _decoded(ctx: Any, prop: Any, mode: str, index: int) -> None:
         store.put_device(prop.id, "hi3d_mesh", {"vertices": torch.from_numpy(coarse.astype(np.float32)),
                                                 "faces": torch.from_numpy(faces.astype(np.int32))})
         store.put_small(prop.id, "hi3d_frames", frames)
-        _grid_ahead(store, prop, int(prop.req.resolution))
+        _grid_ahead(store, prop, _resolution_ahead(ctx, prop, coarse, faces))
     ctx.emit(_parts().Event("step", part, prop.id, 2, 2))
+
+
+ENCODER_MIB = 720       # the shape encoder's weights on the card (encode's room is measured beside them) and
+DECODER_MIB = 380       # Hi3D's mesh decoder's (on the card while the last decode foresees encode's room)
+
+
+def surface_count(vertices: np.ndarray, faces: np.ndarray, resolution: int, device: str) -> tuple[int, int]:
+    """The cells of the `resolution` grid over Pixal3D's cube that the mesh's surface crosses, and the texture's
+    tokens over them (the occupied cells of the resolution / 16 grid), by sparc3d's GPU voxelizer: within a few per
+    cent of the dual grid's fine voxels and tokens (o_voxel, CPU seconds) in a fraction of a second. Two vertices at
+    the cube's corners (no face) hold the voxelizer's frame to the cube."""
+    from sparc3d.ops.voxelize import MeshVoxelizer
+
+    corners = np.array([[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]], dtype=np.float32)
+    v = torch.as_tensor(np.concatenate([np.asarray(vertices, dtype=np.float32), corners]), device=device)
+    f = torch.as_tensor(np.asarray(faces), dtype=torch.int32, device=device)
+    coords = MeshVoxelizer(v, f, resolution=resolution, pad=0).voxelize()["voxel_coords"].int()
+    tokens = int(torch.unique(_keys(coords >> 4, resolution >> 4)).shape[0])
+    return int(coords.shape[0]), tokens
+
+
+def _resolution_ahead(ctx: Any, prop: Any, vertices: np.ndarray, faces: np.ndarray) -> int:
+    """The texture resolution `encode` will most likely settle on, so that the dual grid made ahead (_grid_ahead)
+    is the one it takes: the request's, lowered as encode lowers it (_refused: the token cap, the card's room for
+    the encoder) from the surface's count at that resolution (surface_count; the lower resolutions' counts scaled as
+    the resolution squared, as _foreseen scales them). encode decides for real, and makes another grid when this
+    guess was wrong - the CPU seconds it spent anyway before. The request's own resolution when no count can be
+    made."""
+    request = prop.req
+    resolution = int(request.resolution)
+    try:
+        voxels, tokens = surface_count(vertices, faces, resolution, ctx.device)
+    except Exception:  # noqa: BLE001 - a guess only: the card's memory, the voxelizer's limits
+        return resolution
+    # encode's room (encoder_room_mib: the cap less what the card holds then) as it will be, the encoder's weights
+    # standing where the mesh decoder's are now, the rest of the card's content the same
+    room = encoder_room_mib(ctx)
+    if room is not None:
+        size = getattr(ctx.loader, "size_mib", None)
+        decoder = (size("hi3d_vae") if size is not None else None) or DECODER_MIB
+        room -= ENCODER_MIB - int(decoder)
+    while resolution > 1024:
+        refused = _refused(ctx, request, tokens, voxels, resolution, room)
+        if refused is None:
+            break
+        lower = resolution - 128 if refused == "tokens" else _foreseen(ctx, request, tokens, voxels, resolution, room)
+        scale = (lower / resolution) ** 2
+        voxels, tokens, resolution = int(voxels * scale), int(tokens * scale), lower
+    return resolution
 
 
 _grids: concurrent.futures.ThreadPoolExecutor | None = None
@@ -589,6 +682,29 @@ def _tokens(fine: torch.Tensor, resolution: int) -> int:
     return int(torch.unique(_keys(fine >> 4, resolution >> 4)).shape[0])
 
 
+def _counted(store: Any, prop: Any, mesh: dict, resolution: int, device: str) -> tuple[int, int]:
+    """(fine voxels, tokens) of the mesh at `resolution` for encode's decision: the dual grid's own when the one
+    made ahead is this resolution's, else the surface's count on the card (within 0.1 % of it, a second instead
+    of the grid's 5-15 s on the CPU: the grid is made for the resolution encode settles on, not for every one it
+    weighs); the dual grid itself where the card cannot count (a CPU run)."""
+    pending = getattr(store, "hi3d_grids", None)
+    ahead = (pending or {}).get(prop.id)
+    if ahead is not None and ahead[0] == resolution:
+        fine = ahead[1].result()[0].int()           # looked at, not taken: _grid takes it when encode settles here
+        return fine.shape[0], _tokens(fine, resolution)
+    try:
+        return surface_count(mesh["vertices"].cpu().numpy(), mesh["faces"].cpu().numpy(), resolution, device)
+    except Exception:  # noqa: BLE001 - no card, or the voxelizer's limits: the grid counts
+        pass
+    grid = dual_grid(mesh["vertices"], mesh["faces"], resolution)
+    if pending is not None:                         # kept for _grid, should encode settle on this resolution
+        done: concurrent.futures.Future = concurrent.futures.Future()
+        done.set_result(grid)
+        pending[prop.id] = (resolution, done)
+    fine = grid[0].int()
+    return fine.shape[0], _tokens(fine, resolution)
+
+
 def encode(ctx: Any, prop: Any, mode: str) -> None:
     """The mesh into the texture's shape latent at the request's resolution, lowered by 128 at a time (down to
     1024) while its tokens reach the request's cap or the memory this PC leaves would not take it (_refused), as
@@ -600,9 +716,7 @@ def encode(ctx: Any, prop: Any, mode: str) -> None:
     room = encoder_room_mib(ctx)
     resolution, unbounded, why = int(request.resolution), None, None
     while True:
-        fine, dual, intersected = _grid(store, prop, mesh, resolution)
-        fine = fine.int()
-        voxels, tokens = fine.shape[0], _tokens(fine, resolution)
+        voxels, tokens = _counted(store, prop, mesh, resolution, device)
         ctx.check()
         refused = _refused(ctx, request, tokens, voxels, resolution, room)
         if refused == "tokens" and resolution > 1024:
@@ -613,6 +727,10 @@ def encode(ctx: Any, prop: Any, mode: str) -> None:
             why = why or refused
             resolution = _foreseen(ctx, request, tokens, voxels, resolution, room)
             continue
+        fine, dual, intersected = _grid(store, prop, mesh, resolution)
+        fine = fine.int()
+        voxels, tokens = fine.shape[0], _tokens(fine, resolution)
+        ctx.check()
         try:
             slat = encode_mesh(encoder, fine, dual, intersected, resolution, device)
             subs = guide_subs(slat.coords[:, 1:], fine.to(device), resolution)

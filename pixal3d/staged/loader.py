@@ -301,23 +301,26 @@ class NetworkLoader:
 
     # ------------------------------------------------------------------------------------------------- any thread
 
-    def prefetch(self, name: str | None) -> None:
-        """Start reading that network's file in the background, in place of whatever was being read; None stops.
-        The bytes are thrown away: the point is that the operating system keeps the file in its cache while RAM
-        is free. For a checkpoint whose copy was made from its file as it is now, the copy is what a load will
-        read, so it is the copy that is read ahead (deciding that takes a look at two headers, here). Nothing is
-        read for a network that is loaded or has no file."""
+    def prefetch(self, name: str | None, *more: str) -> None:
+        """Start reading those networks' files in the background, one after the other, in place of whatever was
+        being read; None stops. The bytes are thrown away: the point is that the operating system keeps the files
+        in its cache while RAM is free. For a checkpoint whose copy was made from its file as it is now, the copy is
+        what a load will read, so it is the copy that is read ahead (deciding that takes a look at two headers,
+        here). Nothing is read for a network that is loaded or has no file."""
         if self._prefetcher is None:
             return
-        file = None
-        if name is not None:
-            source = self._source(name)
+        requests = []
+        for each in (name, *more):
+            if each is None or each in self._modules:
+                continue
+            source = self._source(each)
             file = source.file
-            if name in self._modules:
-                file = None
-            elif isinstance(source, _Checkpoint):
-                file = weights.current_copy(source.file) or file
-        self._prefetcher.read(name, file)
+            if file is None:
+                continue
+            if isinstance(source, _Checkpoint):
+                file = weights.current_copy(file) or file
+            requests.append((each, file))
+        self._prefetcher.read(requests)
 
     def close(self) -> None:
         """Stop the prefetch thread and give the readers' page-locked RAM back to the system. Loaded networks
@@ -802,23 +805,23 @@ def _staging_buffer(pinned: bool) -> torch.Tensor:
 
 
 class _Prefetcher:
-    """One daemon thread that reads a file from end to end and throws the bytes away, one file at a time. A new
-    request replaces the running one between two reads."""
+    """One daemon thread that reads files from end to end and throws the bytes away, one file at a time, the files
+    of one request in turn. A new request replaces the running one between two reads."""
 
     def __init__(self) -> None:
         self._wake = threading.Condition()
         self._thread: threading.Thread | None = None
-        self._request: tuple[str, Path] | None = None
+        self._request: list[tuple[str, Path]] | None = None
         self._serial = 0
         self._closed = False
         self._status: dict | None = None
 
-    def read(self, name: str | None, file: Path | None) -> None:
+    def read(self, requests: list[tuple[str, Path]]) -> None:
         with self._wake:
             if self._closed:
                 return
             self._serial += 1
-            self._request = (name, file) if name is not None and file is not None else None
+            self._request = list(requests) or None
             if self._request is not None and self._thread is None:
                 self._thread = threading.Thread(target=self._run, name="p3d-net-prefetch", daemon=True)
                 self._thread.start()
@@ -845,10 +848,17 @@ class _Prefetcher:
                     self._wake.wait()
                 if self._closed:
                     return
-                (name, file), serial = self._request, self._serial
+                requests, serial = self._request, self._serial
                 self._request = None
-                self._status = {"name": name, "state": "reading", "bytes_read": 0, "bytes": 0}
-            self._tell(state=self._read_through(file, serial, view))
+            for name, file in requests:
+                with self._wake:
+                    if self._serial != serial:
+                        break
+                    self._status = {"name": name, "state": "reading", "bytes_read": 0, "bytes": 0}
+                state = self._read_through(file, serial, view)
+                self._tell(state=state)
+                if state == "stopped":
+                    break
 
     def _read_through(self, file: Path, serial: int, view: memoryview) -> str:
         """Read the file unless RAM is short: "done", "stopped" (another request came), "skipped" or "failed"."""
