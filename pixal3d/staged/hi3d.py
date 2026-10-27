@@ -393,7 +393,8 @@ def accelerate(device: str) -> None:
     from sparc3d.nn.sparse.attention import int8_attention
 
     if int8_attention.install(device=card):
-        print("[HI3D] the transformer's self-attention runs int8 (q, k) with fp16 P.V (PIXAL3D_SAGE)", flush=True)
+        print("[HI3D] the transformer's self- and cross-attention run int8 (q, k) with fp16 P.V (PIXAL3D_SAGE)",
+              flush=True)
     else:
         print(f"[HI3D] int8 self-attention is off on this card: {int8_attention.state().get('why')}", flush=True)
 
