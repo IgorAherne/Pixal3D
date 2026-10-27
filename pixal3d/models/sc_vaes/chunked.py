@@ -220,11 +220,13 @@ def norm_silu(norm: Any, feats: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool) -> sp.SparseTensor:
+def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool, window: Optional[int] = None) -> sp.SparseTensor:
     """SparseConvNeXtBlock3d: conv, then LayerNorm and the MLP on windows of rows, in place in the conv's output
-    (`rowwise`; a box's windows are BOX_WINDOW rows), then the input added in place."""
+    (`rowwise`; a box's windows are BOX_WINDOW rows, a whole level's COARSE_SLAB_BYTES of hidden rows unless
+    `window` says how many), then the input added in place."""
     h = conv(block.conv, x)
-    window = BOX_WINDOW if boxed else _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
+    if window is None:
+        window = BOX_WINDOW if boxed else _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
     rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed,
             into=lambda rows, out: mlp_into(block, rows, out))
     h.add_(x.feats)

@@ -7,6 +7,7 @@ from ...modules.utils import convert_module_to_f16, convert_module_to_f32, zero_
 from ...modules import sparse as sp
 from ...modules.norm import LayerNorm32
 from . import chunked
+from . import lean_encode
 
 
 NORM_ROWS = 2 ** 18     # a table above this many rows is normalised a slab of rows at a time
@@ -407,7 +408,9 @@ class SparseUnetVaeEncoder(nn.Module):
         self.model_channels = model_channels
         self.num_blocks = num_blocks
         self.dtype = torch.float16 if use_fp16 else torch.float32
-        self.dtype = torch.float16 if use_fp16 else torch.float32
+        # > 0: without gradients, the fine level is encoded in boxes of about this many voxels and the other levels
+        # on slabs - the same latent in a memory that does not grow with the prop (lean_encode.py). 0: the loop below.
+        self.box_voxels = lean_encode.BOX_VOXELS
 
         self.input_layer = sp.SparseLinear(in_channels, model_channels[0])
         self.to_latent = sp.SparseLinear(model_channels[-1], 2 * latent_channels)
@@ -464,15 +467,22 @@ class SparseUnetVaeEncoder(nn.Module):
         self.apply(_basic_init)
 
     def forward(self, x: sp.SparseTensor, sample_posterior=False, return_raw=False):
+        if lean_encode.applies(self, x):
+            return lean_encode.forward_lean(self, x.coords, lambda g: x.feats[g], x.dtype, sample_posterior, return_raw)
         h = self.input_layer(x)
         h = h.type(self.dtype)
         for i, res in enumerate(self.blocks):
             for j, block in enumerate(res):
                 h = block(h)
-        h = h.type(x.dtype)
+        return self.latent(h, x.dtype, sample_posterior, return_raw)
+
+    def latent(self, h: sp.SparseTensor, dtype: torch.dtype, sample_posterior=False, return_raw=False):
+        """The tail: the last level's rows `h` in `dtype` (the input's), normalised, through to_latent, and the
+        posterior's mean (or a sample of it)."""
+        h = h.type(dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))
         h = self.to_latent(h)
-        
+
         # Sample from the posterior distribution
         mean, logvar = h.feats.chunk(2, dim=-1)
         if sample_posterior:
@@ -481,7 +491,7 @@ class SparseUnetVaeEncoder(nn.Module):
         else:
             z = mean
         z = h.replace(z)
-            
+
         if return_raw:
             return z, mean, logvar
         else:

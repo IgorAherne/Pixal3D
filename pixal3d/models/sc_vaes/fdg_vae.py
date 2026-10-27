@@ -20,6 +20,7 @@ from .sparse_unet_vae import (
 from ...representations import Mesh
 from o_voxel.convert import flexible_dual_grid_to_mesh
 from . import chunked
+from . import lean_encode
 
 
 DC_SLAB_ROWS = 1 << 20      # voxels whose quads are made at a time by dual_grid_faces
@@ -99,6 +100,12 @@ class FlexiDualGridVaeEncoder(SparseUnetVaeEncoder):
         )
         
     def forward(self, vertices: sp.SparseTensor, intersected: sp.SparseTensor, sample_posterior=False, return_raw=False):
+        if lean_encode.applies(self, vertices):
+            # The input rows made a box at a time (lean_encode.py): the same two operations on the rows alone.
+            def rows(g):
+                return torch.cat([vertices.feats[g] - 0.5, intersected.feats[g].float() - 0.5], dim=1)
+
+            return lean_encode.forward_lean(self, vertices.coords, rows, vertices.dtype, sample_posterior, return_raw)
         x = vertices.replace(torch.cat([
             vertices.feats - 0.5,
             intersected.feats.float() - 0.5,

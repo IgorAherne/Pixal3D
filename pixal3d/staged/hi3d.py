@@ -635,8 +635,10 @@ def _grid(store: Any, prop: Any, mesh: dict, resolution: int) -> tuple[torch.Ten
     return dual_grid(mesh["vertices"], mesh["faces"], resolution)
 
 
-ENCODE_BYTES_PER_VOXEL = 1024       # the shape encoder's peak on the card per fine voxel beside its weights (0.91
-#                                     KB measured on the knight at 1536 and 1024: its float32 norms, neighbour tables)
+ENCODE_BYTES_PER_VOXEL = 256        # the shape encoder's peak on the card per fine voxel beside its weights: 203-216
+#                                     bytes measured with the fine level encoded in boxes (models/sc_vaes/lean_encode.py)
+#                                     on the boy (4.0 M voxels), the knight (6.9 M) and the dragon (9.4 M) at 1536;
+#                                     the whole-table forward took 958
 
 
 def encode_mib(voxels: int) -> float:
