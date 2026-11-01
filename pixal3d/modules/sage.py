@@ -69,6 +69,16 @@ the install's calibration record (pixal3d/calibration.py); a process then takes 
 nothing. The record serves only for the card and the wheel it was made with: another card or wheel races at first
 use as an uncalibrated install does.
 
+The int8 P.V twin of that kernel (wheel post6 on, Spellcast3D round K: INT8PV_OP; the same q / k quantisation,
+Q.K^T and online softmax, then P as 8-bit integers per row and 64-key block relative to the block's maximum times
+v as int8 per 64-key block and channel with its mean subtracted, on the int8 tensor cores: -18 to -20 % a call on
+an RTX 3060, a different rounding) serves the detail flows' blocks that `mark_int8pv` marks (INT8PV_FLOWS,
+INT8PV_SKIP: the hr flow's block 0 keeps the fp16 kernel, where its attention is nearly uniform and the integer
+code's one step loses the small weights), judged end to end on the five test props (meshes 0.03-0.06 % of the
+bounding-box diagonal from the fp16 kernel's, the int8 GEMMs' class). It is chosen by a timing of the whole call
+against the fp16 one (the calibration record, else the first use: `_race_int8pv`, INT8PV_MARGIN), so that no card
+gets slower; PIXAL3D_INT8PV=off keeps the fp16 kernel for every block.
+
 Before the first SageAttention call of a process each kernel the card may use runs once on a small random table
 against an fp32 reference (`_check`; the Triton kernels compile there); a kernel that fails or answers wrongly is
 left out (the CUDA kernel then serves every length), and a card older than sm_80, a missing or broken wheel or no
@@ -152,6 +162,20 @@ _warned: set = set()
 _state: Optional[bool] = None       # None: not tried yet; True: passed its self-check on this card; False: off
 _kernel: Optional[Callable] = None
 KERNEL = ""                         # the kernel in use, for reports
+_kernel_int8pv: Optional[Callable] = None   # the int8 P.V kernel where the self-check accepted it (INT8PV below)
+KERNEL_INT8PV = ""
+# The int8 P.V kernel (int8 Q.K^T as before, P as 8-bit integers per row and 64-key block, v as int8 per 64-key
+# block and channel with its mean subtracted; round K) serves the detail flows' blocks only, and not the blocks
+# whose attention it measurably hurts: block 0 of the hr flow attends nearly uniformly to value tokens with
+# outliers, where an integer code with one step loses the small weights (its error there is ~10x the fp16
+# kernel's against ~1.1x elsewhere, measured on captured passes). ss and lr keep the fp16 P.V kernel: their
+# attention is a small share of a pass and their samples flip the most.
+INT8PV_FLOWS = ("hr", "tex")
+INT8PV_SKIP = {"hr": (0,), "tex": ()}
+INT8PV_OP = "qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d"   # torch.ops.sageattention_qattn_sm80.<this>, wheel post6 on
+INT8PV_MARGIN = 0.05        # the int8 P.V kernel serves only where it is at least this much faster than the fp16 P.V
+#                             kernel at every size timed (the user's rule: no card may get slower; the two round
+#                             differently, so a card that gains nothing keeps the fp16 kernel's numbers)
 
 
 def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
@@ -169,14 +193,35 @@ def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     return bool(_state)
 
 
-def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaled: bool = False) -> torch.Tensor:
+def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaled: bool = False,
+              int8pv: bool = False) -> torch.Tensor:
     """Softmax(q k^T / sqrt(D)) v for q, k, v [B, N, H, D] (last dimension contiguous), not causal: [B, N, H, D] in
     q's dtype. Call only where usable() said True. `scaled`: v already carries the 2^-V_SHIFT (the weights were
-    folded, `fold`): the answer keeps it, and the folded to_out undoes it."""
+    folded, `fold`): the answer keeps it, and the folded to_out undoes it. `int8pv`: the block was marked for the
+    int8 P.V kernel (mark_int8pv), which serves where the self-check accepted it; the fp16 P.V kernel otherwise."""
+    kernel = _kernel_int8pv if int8pv and _kernel_int8pv is not None else _kernel
     if scaled:
-        return _kernel(q, k, v)
-    out = _kernel(q, k, v * 2.0 ** -V_SHIFT)
+        return kernel(q, k, v)
+    out = kernel(q, k, v * 2.0 ** -V_SHIFT)
     return out.mul_(2.0 ** V_SHIFT)
+
+
+def mark_int8pv(model: torch.nn.Module, kind: str) -> int:
+    """Mark the full self-attention modules of a flow network of `kind` (ss, lr, hr, tex) that may run the int8 P.V
+    kernel: every block's of the flows INT8PV_FLOWS names, except the blocks INT8PV_SKIP lists for that kind.
+    Done once per loaded network by the engine; harmless without the kernel (attention() then runs the fp16 P.V
+    kernel for every block). Returns how many modules were marked."""
+    count = 0
+    skip = set(INT8PV_SKIP.get(kind, ()))
+    allowed = kind in INT8PV_FLOWS
+    for index, block in enumerate(getattr(model, "blocks", ())):
+        for module in block.modules():
+            if (type(module).__name__ not in ("SparseMultiHeadAttention", "MultiHeadAttention")
+                    or getattr(module, "_type", None) != "self" or getattr(module, "attn_mode", None) != "full"):
+                continue
+            module.sage_int8pv = allowed and index not in skip
+            count += int(module.sage_int8pv)
+    return count
 
 
 def fold(model: torch.nn.Module) -> int:
@@ -381,6 +426,16 @@ def calibrate(device: torch.device) -> dict:
     found["summary"] = ", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
                                  for n, a, b in rows) or "not timed"
     found["why"] = line
+    # the int8 P.V kernel against the fp16 one chosen above (the whole calls), the same way
+    op8 = _int8pv_op() if int8pv_switch() != "off" else None
+    if op8 is not None:
+        fp16 = _wheel_call(op) if wins else _candidates(device, "wheel")["wheel"][0]
+        wins8, line8, rows8 = _race_int8pv(device, fp16, _int8pv_call(op8), CALIBRATION_RACE)
+        found["int8pv"] = wins8
+        found["int8pv_timings"] = [{"tokens": n, "fp16_ms": round(a, 3), "int8_ms": round(b, 3)} for n, a, b in rows8]
+        found["int8pv_summary"] = ", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
+                                            for n, a, b in rows8) or "not timed"
+        found["int8pv_why"] = line8
     return found
 
 
@@ -450,6 +505,136 @@ def _choose(device: torch.device, cands: dict, tried: dict[str, Optional[torch.T
     return _by_length(cuda[0], triton[0], ranges), f"{cuda[1]}; at {text} tokens {triton[1]}"
 
 
+def int8pv_switch() -> str:
+    """PIXAL3D_INT8PV: "on" / unset (the int8 P.V kernel where the wheel has it, after its self-check and the
+    race), "off" (never), "force" (developers: without the race)."""
+    text = os.environ.get("PIXAL3D_INT8PV", "").strip().lower()
+    if text in _OFF:
+        return "off"
+    return "force" if text == "force" else "on"
+
+
+def _int8pv_op() -> Optional[Callable]:
+    """The wheel's int8 P.V op (INT8PV_OP), or None for a wheel without it (post5 and older)."""
+    import sageattention.core  # noqa: F401  (loads _qattn_sm80, which registers torch.ops.sageattention_qattn_sm80)
+
+    try:
+        return getattr(torch.ops.sageattention_qattn_sm80, INT8PV_OP)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _int8pv_call(op: Callable) -> Callable:
+    """The int8 P.V attention as the fork calls it ([B, N, H, 128] NHD bf16 -> the same): the wheel's per_warp_int8
+    for q and k (as the fp16 kernel's call, _wheel_call), per_block_int8_v for v (its mean per channel subtracted,
+    int8 per 64-token block and channel, transposed), then `op`."""
+    from sageattention.quant import per_block_int8_v, per_warp_int8
+
+    def run(q, k, v):
+        torch.cuda.set_device(v.device)
+        km = k.mean(dim=1, keepdim=True)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8(q, k, km, tensor_layout="NHD", BLKQ=128, WARPQ=16, BLKK=64)
+        v_int8, v_scale, v_mean = per_block_int8_v(v, tensor_layout="NHD", smooth_v=True)
+        o = torch.empty(q.size(), dtype=q.dtype, device=q.device)
+        op(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, v_mean, 0, 0, 2, q.size(-1) ** -0.5, 0)
+        return o
+
+    return run
+
+
+def _race_int8pv(device: torch.device, fp16: Callable, int8pv: Callable,
+                 plan: tuple = RACE_TOKENS) -> tuple[bool, str, list]:
+    """The fp16 P.V call in use and the int8 P.V call timed on this card, whole calls (their quantisers included)
+    on the same random bf16 q, k, v at each of `plan`'s sizes, 12 heads x 128, interleaved ABBA, CUDA events, the
+    medians compared: the int8 one serves only where it is at least INT8PV_MARGIN faster at every size. Returns
+    (the int8 call serves, the [SAGE] line, the rows (tokens, fp16 ms, int8 ms)). A size whose tables do not fit
+    is left out."""
+    fns = {"fp16": fp16, "int8": int8pv}
+    heads, began = 12, time.perf_counter()
+    rows, skipped = [], []
+    torch.cuda.synchronize(device)
+    for n, calls in plan:
+        need = n * heads * HEAD_DIM * 2 * 6                # q, k, v, their int8 / fp16 copies, the output
+        free = torch.cuda.mem_get_info(device)[0]
+        spare = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        if need * 1.25 > free + spare:
+            skipped.append(n)
+            continue
+        g = torch.Generator(device=device).manual_seed(n)
+        q = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
+        k = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
+        v = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
+        events: dict = {name: [] for name in fns}
+        for i in range(calls):
+            for name in (("fp16", "int8") if i % 2 == 0 else ("int8", "fp16")):
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                fns[name](q, k, v)
+                end.record()
+                events[name].append((start, end))
+        torch.cuda.synchronize(device)
+        ms = {name: statistics.median(a.elapsed_time(b) for a, b in pairs) for name, pairs in events.items()}
+        rows.append((n, ms["fp16"], ms["int8"]))
+        del q, k, v, events
+    seconds = time.perf_counter() - began
+    if not rows:
+        return False, (f"[SAGE] the fp16 P.V kernel serves every block: the int8 one was not timed (no room for "
+                       f"the tables of {', '.join(f'{n:,}' for n in skipped)} tokens)"), rows
+    wins = all(b <= a * (1 - INT8PV_MARGIN) for _, a, b in rows)
+    text = ", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)" for n, a, b in rows)
+    if wins:
+        return True, (f"[SAGE] the int8 P.V kernel serves the detail flows' blocks (hr's block 0 excepted), timed "
+                      f"against the fp16 P.V one: {text} ({seconds:.2f} s)"), rows
+    return False, (f"[SAGE] the fp16 P.V kernel serves every block: the int8 one is not {100 * INT8PV_MARGIN:.0f} % "
+                   f"faster at every size timed: {text} ({seconds:.2f} s)"), rows
+
+
+def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor,
+                  want_out: torch.Tensor) -> None:
+    """The int8 P.V kernel beside the chosen fp16 one (`_kernel_int8pv`): where the wheel has the op, the switch
+    allows it and the card is sm_8x, it runs once on the self-check's table against fp32 attention (the 3 % bar
+    of _check; it measures ~1.5 % there, the fp16 kernel ~1.2 %), then serves where the calibration record says
+    so, or where it wins the race against the fp16 call (PIXAL3D_INT8PV=force: without the race). Off, or any
+    failure, keeps the fp16 kernel for every block (the numbers as before)."""
+    global _kernel_int8pv, KERNEL_INT8PV
+    _kernel_int8pv, KERNEL_INT8PV = None, ""
+    switch = int8pv_switch()
+    if switch == "off" or _kernel is None:
+        return
+    try:
+        major, _minor = torch.cuda.get_device_capability(device)
+        op = _int8pv_op() if major == 8 else None
+        if op is None:
+            return
+        call = _int8pv_call(op)
+        got = call(q, k, vs)
+        torch.cuda.synchronize(device)
+        rel = float((got.float() * 2.0 ** V_SHIFT - want_out).norm() / want_out.norm())
+        if got.shape != want_out.shape or not bool(torch.isfinite(got).all()) or not rel <= 0.03:
+            print(f"[SAGE] the int8 P.V kernel is left out: its answer differs from fp32 attention (relative L2 "
+                  f"{rel:.3g}); the fp16 P.V kernel serves every block", flush=True)
+            return
+        del got
+        if switch == "force":
+            wins, line = True, "[SAGE] the int8 P.V kernel serves the detail flows' blocks (PIXAL3D_INT8PV=force)"
+        else:
+            stored = _stored(device)
+            if stored is not None and "int8pv" in stored:
+                wins = bool(stored["int8pv"])
+                line = (f"[SAGE] the {'int8' if wins else 'fp16'} P.V kernel serves the detail flows' blocks, as "
+                        f"timed on this card when Spellcast3D was installed ({stored.get('int8pv_summary', 'record')})")
+            else:
+                wins, line, _rows = _race_int8pv(device, _kernel, call)
+        print(line, flush=True)
+        if wins:
+            _kernel_int8pv = call
+            KERNEL_INT8PV = f"{INT8PV_OP} (int8 P.V: u8 P per 64-key block, v per block and channel)"
+    except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the fp16 kernel serves
+        _kernel_int8pv, KERNEL_INT8PV = None, ""
+        print(f"[SAGE] the int8 P.V kernel is left out ({type(exc).__name__}: {str(exc)[:200]}); the fp16 P.V "
+              f"kernel serves every block", flush=True)
+
+
 def _check_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """The self-check's table (see _check): q, k, v * 2^-V_SHIFT [1, 1000, 12, 128] bf16 and the fp32 answer."""
     g = torch.Generator(device=device).manual_seed(0)
@@ -489,6 +674,7 @@ def _check(device: torch.device) -> bool:
         if notes:
             print(f"[SAGE] left out after the self-check: {'; '.join(notes)}", flush=True)
         _kernel, KERNEL = _choose(device, cands, tried)
+        _setup_int8pv(device, q, k, vs, want_out)
     except Exception as exc:        # noqa: BLE001 - whatever the wheel, the card or Triton raises: flash_attn serves
         _state, _kernel = False, None
         print(f"[SAGE] SageAttention does not run on this card ({type(exc).__name__}: {str(exc)[:300]}); the "

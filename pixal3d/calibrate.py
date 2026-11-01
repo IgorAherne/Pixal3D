@@ -461,6 +461,15 @@ def _shapes_lacking(earlier: dict, record: dict) -> Optional[dict]:
     return {shape: span for shape, span in calibrate_conv.GRID.items() if calibrate_conv.family(*shape) not in held}
 
 
+def _sage_stands(earlier: dict) -> bool:
+    """Whether the earlier record's attention section was made with the installed SageAttention wheel (the fork
+    reads the section only then: modules/sage.py `_stored`); a section of another wheel is measured again."""
+    from pixal3d.modules import sage
+
+    section = earlier.get("sage") or {}
+    return bool(section) and section.get("wheel") == sage._wheel_version()
+
+
 def _merged(earlier: dict, added: dict) -> dict:
     """The earlier convolution section with the added shapes' keys and grid."""
     old = earlier["flex_gemm"]
@@ -512,10 +521,15 @@ def main(argv: Optional[list[str]] = None) -> int:
         + (f", attempt {attempts}" if attempts > 1 else ""))
     lacking = _shapes_lacking(earlier, record)
     if lacking is not None:         # the record stands; the shapes it lacks are added, the other steps kept
-        skip |= {"triton", "sage"}
-        record.update({key: earlier[key] for key in ("triton", "sage") if key in earlier})
+        skip |= {"triton"}
+        record["triton"] = earlier.get("triton")
+        if _sage_stands(earlier):   # the attention timings belong to the wheel they were made with
+            skip |= {"sage"}
+            record["sage"] = earlier["sage"]
         say(f"the earlier calibration stands: {len(lacking)} new convolution shapes are measured"
             if lacking else "the earlier calibration stands: no new convolution shapes to measure")
+        if "sage" not in skip:
+            say("the SageAttention wheel changed since: its kernels are timed again")
     began = time.monotonic()
     if "triton" not in skip:
         progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 4)")

@@ -102,6 +102,7 @@ def sparse_scaled_dot_product_attention(q: torch.Tensor, k: VarLenTensor, v: Var
 
 def sparse_scaled_dot_product_attention(*args, **kwargs):
     v_scaled = kwargs.pop("v_scaled", False)     # v carries SageAttention's 2^-8 already (modules/sage.py fold)
+    int8pv = kwargs.pop("int8pv", False)         # this block may run the int8 P.V kernel (modules/sage.py)
     arg_names_dict = {
         1: ['qkv'],
         2: ['q', 'kv'],
@@ -196,7 +197,7 @@ def sparse_scaled_dot_product_attention(*args, **kwargs):
             v = v.reshape(N * L, H, CO)     # [T_KV, H, Co]
 
     if one_self and config.SAGE and sage.usable(q, k, v):
-        out = sage.attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), scaled=v_scaled)[0]
+        out = sage.attention(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), scaled=v_scaled, int8pv=int8pv)[0]
     elif config.ATTN == 'xformers':
         if 'xops' not in globals():
             import xformers.ops as xops

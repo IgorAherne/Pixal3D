@@ -77,6 +77,7 @@ class SparseMultiHeadAttention(nn.Module):
             
         self.to_out = nn.Linear(channels, channels)
         self.sage_folded = False        # sage.fold: v's 2^-8 and the answer's 2^8 live in to_qkv / to_out
+        self.sage_int8pv = False        # sage.mark_int8pv: this block's self-attention may run the int8 P.V kernel
 
         if use_rope:
             self.rope = SparseRotaryPositionEmbedder(self.head_dim, rope_freq=rope_freq)
@@ -140,7 +141,8 @@ class SparseMultiHeadAttention(nn.Module):
                 else:
                     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))
             if self.attn_mode == "full":
-                h = (sparse_scaled_dot_product_attention(*apart, v_scaled=self.sage_folded) if apart
+                h = (sparse_scaled_dot_product_attention(*apart, v_scaled=self.sage_folded, int8pv=self.sage_int8pv)
+                     if apart
                      else sparse_scaled_dot_product_attention(qkv))
             elif self.attn_mode == "windowed":
                 h = sparse_windowed_scaled_dot_product_self_attention(

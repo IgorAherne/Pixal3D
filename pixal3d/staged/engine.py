@@ -59,6 +59,9 @@ def _prepare_flow(model: Any, kind: str = "", checkpoint: str = "") -> Any:
 
         if sparse_config.SAGE:
             sage.fold(model)
+            marked = sage.mark_int8pv(model, kind)
+            if marked and sage._kernel_int8pv is not None:
+                print(f"[SAGE] {kind}: {marked} of {len(model.blocks)} blocks on the int8 P.V kernel", flush=True)
     except Exception as exc:        # noqa: BLE001 - a network that cannot be folded runs as before
         print(f"[SAGE] the fold of {type(model).__name__} failed ({type(exc).__name__}: {str(exc)[:200]}); the "
               f"network runs unfolded", flush=True)

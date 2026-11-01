@@ -192,6 +192,25 @@ samplers amplify into a different sample of the same quality (Chamfer distance 0
 diagonal on the five test props, the class of the fused kernels' own change). The cross-attention (5 context tokens)
 and every other call keep their backend.
 
+The detail flows' blocks (hr and tex) run that kernel's int8 P.V twin where the card is sm_8x and the wheel has it
+(post6 on; round K): the same q / k quantisation, Q.K^T and online softmax, then P as 8-bit integers per row and
+64-key block (relative to the block's own maximum) times v as int8 per 64-key block and channel (its mean per
+channel subtracted and added back after the normalisation) on the int8 tensor cores, which halves the tensor-core
+work of the P.V half: a call at 21.5k tokens 50.4 -> 40.4 ms on an RTX 3060 (-18 to -20 % at every length), an
+hr or tex pass about 12 % faster, the five test props' batch 660 -> 597 s. It rounds differently from the fp16
+kernel - judged first by an emulation on captured passes (1.02-1.42x the fp16 kernel's error against fp32
+attention on every block but the hr flow's block 0, where the attention is nearly uniform and an integer code
+with one step loses the small weights: 7-13x), then end to end: the five props' meshes 0.03-0.06 % of the
+bounding-box diagonal from the fp16 kernel's (sampling floors 0.02-0.04 %; the int8 GEMMs' accepted change
+0.03-0.08 %, SageAttention's own 0.17-0.24 %), the base colour at matched surface points 3-12 levels (the int8
+GEMMs' 3-11, SageAttention's 13-31), renders alike. So the hr flow's block 0 keeps the fp16 kernel
+(`sage.INT8PV_SKIP`), ss and lr keep it everywhere (`sage.INT8PV_FLOWS`; a small share of their passes, and the
+samples that flip the most), and the engine marks each block's self-attention module once a flow is loaded
+(`sage.mark_int8pv`, with the fold). The choice per card is a timing: the install's calibration (or, without a
+record of this wheel, the first use) races the whole int8 call against the fp16 one and keeps it only where it is
+5 % faster at every size (`sage._race_int8pv`, `INT8PV_MARGIN`; the record's "sage" section carries "int8pv"),
+so no card gets slower; `PIXAL3D_INT8PV=off` keeps the fp16 kernel for every block, `force` skips the race.
+
 Two savings around the attention change no bit. A guided sampling runs the flow once on the prop's conditioning
 and once on an all-zero conditioning per step inside the guidance interval (hr and lr: 9 of 21 passes, ss: 10 of
 22). On the zero one, every block's cross-attention branch (norm2, to_q, the q/k norms, the attention over the five
