@@ -23,7 +23,9 @@ process times or tunes anything while the artist works:
      artist waits (every configuration gives the same values; only the time differs).
   5. Where Hi3D's code is on this PC (code/hi3d beside the fork, or SPELLCAST_HI3D_CODE): spconv's kernel choice
      for every sparse convolution Hi3D runs (sparc3d.ops.spconv_tuning), which spconv otherwise times again in
-     every process on the first prop's own input, and which could differ between sessions.
+     every process on the first prop's own input, and which could differ between sessions. Spellcast3D's installer
+     leaves this step out (--skip spconv) while Hi3D's AI models are not on the PC, and their download runs it alone
+     afterwards (--only spconv: the other sections of the record stand).
 
 Nothing here changes a result: every choice is between kernels that give the same numbers (the convolutions' split-K
 choice aside, which flex_gemm has always timed per install). A step that fails is recorded and the others go on; the
@@ -497,10 +499,17 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--quiet-wait", type=float, default=900.0, help="seconds to wait for a quiet card at most")
     ap.add_argument("--skip", default="",
                     help="comma-separated steps to leave out: triton, sage, convolutions, spconv")
+    ap.add_argument("--only", default="",
+                    help="comma-separated steps to run alone, the earlier record's other sections standing (spconv "
+                         "once Hi3D's models arrived, say)")
     args = ap.parse_args(argv)
     if args.record:
         os.environ["PIXAL3D_CALIBRATION_FILE"] = args.record
+    steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm", "spconv": "spconv"}  # step -> section
     skip = {part.strip() for part in args.skip.split(",") if part.strip()}
+    only = {part.strip() for part in args.only.split(",") if part.strip()}
+    if only:
+        skip |= set(steps) - only
 
     progress(SHARE["start"], "checking that the graphics card is free (close heavy programs: Blender, games, videos, "
                               "Photoshop)")
@@ -598,13 +607,14 @@ def main(argv: Optional[list[str]] = None) -> int:
             found = _timed("spconv", lambda: _spconv(device, quiet), record)
             if found:
                 say(f"spconv: {found.get('summary') or found.get('skipped')}")
+    for step, key in steps.items():     # a step left out keeps the earlier record's section (--only: all the others)
+        if step in skip and key not in record and key in earlier:
+            record[key] = earlier[key]
     record["seconds"] = round(time.monotonic() - began, 1)
     record["quiet"] = quiet.record()
-    # --skip name -> record section
-    steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm", "spconv": "spconv"}
     failed = [key for step, key in steps.items() if step not in skip and not (record.get(key) or {}).get("ok", False)]
     record["failed"] = failed
-    record["complete"] = not failed and not quiet.busy_during
+    record["complete"] = not failed and not quiet.busy_during and (not only or bool(earlier.get("complete", True)))
     where = calibration.save(record)
     if record["complete"]:
         progress(SHARE["done"], f"done in {record['seconds'] / 60:.1f} minutes; kept in {where}")
