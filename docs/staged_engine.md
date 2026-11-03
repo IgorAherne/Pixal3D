@@ -476,7 +476,7 @@ an RTX 2060 Super and a GTX 1080):
 |---|---|---|---|---|---|---|---|
 | ampere | sm_80+ | bf16 | flash_attn / SageAttention | Triton (group + per-row scales) | flex_gemm, fp16 | natten | yes |
 | turing | sm_70 - sm_79 | fp16 | torch SDPA (the wheel's Turing kernel after the calibration's trial) | pixal3d_kernels (int8 tensor cores; group + per-row scales) | spconv, fp16 (flex_gemm after the calibration's check) | torch | elementwise only, after self-checks |
-| pascal | below sm_70 | fp32 | torch SDPA, fp32 (the wheel's Pascal kernel after the calibration's trial) | pixal3d_kernels (dp4a; group + per-row scales) | spconv, fp32 | torch | no |
+| pascal | below sm_70 | fp32 | torch SDPA, fp32 (the wheel's Pascal kernel after the calibration's trial) | pixal3d_kernels (dp4a; group + per-row scales) | spconv, fp16 (fp32 decoders ran the dragon at 1024 out of a GTX 1080's 8 GB in finish) | torch | no |
 
 Turing has no bf16 arithmetic (torch emulates it at a seventh of the fp16 rate and no bf16 attention kernel
 exists); consumer Pascal runs fp16 at a 64th of the fp32 rate (an fp16 attention call takes 14 s there against

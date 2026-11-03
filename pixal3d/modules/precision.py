@@ -18,7 +18,8 @@ and a GTX 1080):
              emulated, so the torso is fp32 (its weights 0.9 GB: the token-sized linears are int8), the int8 GEMMs go
              through torch._int_mm (cuBLASLt's dp4a kernels: exact, 12-22 TOPS on a GTX 1080 against 6-7 TFLOPS of
              fp32), attention through torch SDPA in fp32 (its fp16 kernel takes 20 times longer there), the decoders
-             in fp32 on spconv, NAF in plain torch, and no Triton at all (Triton does not support Pascal).
+             on spconv (in fp16, as their checkpoints say: fp32 decoders ran the biggest prop out of an 8 GB card), NAF in
+             plain torch, and no Triton at all (Triton does not support Pascal).
 
 The profile follows the card (torch.cuda.get_device_capability) unless the environment says otherwise:
 PIXAL3D_PRECISION = ampere | turing | pascal forces one (developers, tests); PIXAL3D_CARD_SM = 75 (and the like)
@@ -105,7 +106,9 @@ def _make(name: str, cc: Optional[tuple[int, int]]) -> Profile:
     if name == "turing":
         return Profile(name, cc, torch.float16, _attention_for(cc or (7, 5)), _recorded_conv(), _triton_allowed(),
                        True, True)
-    return Profile(name, cc, torch.float32, "sdpa", "spconv", False, False, True)
+    # the decoders in fp16 as on Turing (their checkpoints' dtype; Pascal computes fp16 in fp32 inside): in fp32 the
+    # biggest prop's texture decode at 1024 ran a GTX 1080 out of memory (NVML 7.46 of 8 GB), in fp16 it fits (5.9 GB)
+    return Profile(name, cc, torch.float32, "sdpa", "spconv", False, True, True)
 
 
 def _triton_allowed() -> bool:
