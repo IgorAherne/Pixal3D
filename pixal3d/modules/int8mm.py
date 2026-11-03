@@ -857,7 +857,9 @@ def self_check(device: torch.device) -> Tuple[bool, str]:
             return False, "quantize_rows differs from the torch reference"
         wq, ws = quantize_weight(w)
         exact = reference_int(xq, wq)
-        triton_gemm = has_group_gemm()
+        # the Triton GEMM's checks only where it serves: below sm_80 Triton cannot compile an int8 product at all
+        # (a real RTX 2060 Super: "PassManager::run failed"), which would leave pixal3d_kernels out for nothing
+        triton_gemm = _state["gemm"] == "triton"
         if triton_gemm:
             tri = gemm(xq, xs, wq, ws, None, out="int32", cfg=(64, 64, 64, 8, 3, 4))
             if not torch.equal(tri.to(torch.int64), exact):

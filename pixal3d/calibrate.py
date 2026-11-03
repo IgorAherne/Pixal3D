@@ -549,10 +549,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         record["triton"] = {"ok": True, "skipped": f"no Triton on this card ({card.name} profile)"}
         skip |= {"triton"}
     if "convolutions" not in skip and card.conv != "flex_gemm":
-        # Below sm_80 the decoders run on spconv unless flex_gemm's Triton kernels prove themselves on this card
-        # (conv/backend_check.py; the record's "conv_backend", which the precision profile reads at start)
+        # Below sm_80 the decoders run on spconv. flex_gemm's Triton kernels give spconv's answers on an RTX 2060
+        # Super, but its tile tuning (the step below) took 25-95 minutes a shape there (13 shapes: hours of an
+        # install; Spellcast3D round L), so a card tries them only on request (PIXAL3D_TURING_FLEX_GEMM=on,
+        # developers; conv/backend_check.py, the record's "conv_backend", which the precision profile reads)
         chosen = None
-        if card.triton:
+        if card.triton and os.environ.get("PIXAL3D_TURING_FLEX_GEMM", "").strip().lower() in ("1", "on", "true", "yes"):
             progress(SHARE["triton"], "trying flex_gemm's convolution kernels on this card")
             chosen = _timed("conv_backend", lambda: _conv_backend(device), record)
             if chosen:

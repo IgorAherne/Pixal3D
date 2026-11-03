@@ -485,10 +485,11 @@ stream, the running sum over the 30 blocks, reaches 1.1e5 at the late steps of t
 sub-layer's output times its modulation gate passes 65,504 too, while the sub-layers' own outputs stay below
 5,000 (round L's `fp16probe.py`); the blocks cast the normalised, modulated input to the torso's dtype for the
 sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream's dtype - no-ops on a bf16 torso.
-The decoders' backend below sm_80 is spconv (CUDA kernels from sm_61) unless the install's calibration found
-flex_gemm's Triton convolutions giving spconv's answers on the card (`modules/sparse/conv/backend_check.py`, the
-record's `conv_backend` section; Triton's Windows builds are untested on Turing, so nothing depends on them
-without that check): flex_gemm decodes in boxes (`chunked.py`) and is 3-30x faster per part on the turing profile.
+The decoders' backend below sm_80 is spconv (CUDA kernels from sm_61). flex_gemm's Triton convolutions give
+spconv's answers on an RTX 2060 Super and decode in boxes (`chunked.py`), but their tile tuning at the install's
+calibration took 25-95 minutes a shape there (13 shapes), so they are tried only on request:
+`PIXAL3D_TURING_FLEX_GEMM=on` at the calibration runs `modules/sparse/conv/backend_check.py` and records the
+`conv_backend` section the profile reads (Triton's Windows builds are untested on Turing besides).
 Where the levels are decoded whole (spconv) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
 `WHOLE_LEVEL_1536_MIB`: the knight's texture decode ran an RTX 2060 Super out of memory at 1536). The int8 GEMMs
 are pixal3d_kernels' (`int8mm.cuda_linear`: the fork's W8A8 kernel with the scaling, bias and GELU in its epilogue,
