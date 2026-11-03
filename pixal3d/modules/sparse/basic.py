@@ -393,7 +393,9 @@ class SparseTensor(VarLenTensor):
             if config.CONV == 'torchsparse':
                 self.data = self.SparseTensorData(feats, coords, **kwargs)
             elif config.CONV == 'spconv':
-                spatial_shape = list(coords.max(0)[0] + 1)
+                # as ints, once: spconv's constructor compares the batch size at every replace(), which is a
+                # host sync for a tensor (27,000 of them in one sampling of the lr flow)
+                spatial_shape = (coords.max(0)[0] + 1).tolist()
                 self.data = self.SparseTensorData(feats.reshape(feats.shape[0], -1), coords, spatial_shape[1:], spatial_shape[0], **kwargs)
                 self.data._features = feats
             else:

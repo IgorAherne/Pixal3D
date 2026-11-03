@@ -553,7 +553,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         # (conv/backend_check.py; the record's "conv_backend", which the precision profile reads at start)
         chosen = None
         if card.triton:
-            progress(SHARE["convolutions"], "trying flex_gemm's convolution kernels on this card")
+            progress(SHARE["triton"], "trying flex_gemm's convolution kernels on this card")
             chosen = _timed("conv_backend", lambda: _conv_backend(device), record)
             if chosen:
                 say(f"convolutions: {chosen.get('backend')} ({chosen.get('why', '')})")
@@ -571,7 +571,10 @@ def main(argv: Optional[list[str]] = None) -> int:
         progress(SHARE["sage"], "timing the attention kernels (step 2 of 4)")
         quiet.wait(quick=True)
         found = _timed("sage", lambda: _sage(device), record)
-        if found:
+        if found and found.get("candidate"):       # a card below sm_80: its one kernel, tried in a child process
+            say(f"attention: the {found['candidate']} kernel {'serves' if found.get('candidate_ok') else 'is not used'} "
+                f"({found.get('why', '')})")
+        elif found:
             say(f"attention: the {'tuned' if found.get('tuned') else 'shipped'} kernel ({found.get('summary', '')})")
     if "convolutions" not in skip:
         progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 4, the longest: "

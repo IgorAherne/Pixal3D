@@ -1,12 +1,12 @@
 {
   "wheel": "sageattention-2.2.0+cu128torch2.8.0.post7-cp39-abi3-win_amd64.whl",
-  "sha256": "39887c4479cec80884d2b0e3334ca0d17f638f37389a548142db9367fa397e8b",
-  "size_bytes": 20894694,
-  "built": "2026-11-03T07:41:15+00:00",
-  "build_seconds": 565,
+  "sha256": "e208586ba86c90096a81a0756860d9f422d71eac081ffd396a2c8051d96513a6",
+  "size_bytes": 20962472,
+  "built": "2026-11-03T10:49:35+00:00",
+  "build_seconds": 652,
   "source": {
     "path": "C:\\_myDrive\\repos\\spellcast3d\\temp_code\\SageAttention-roundl",
-    "commit": "95ff53d0cbaf54e8076a1261d756ef224490531e",
+    "commit": "135263532720876f1864cf9ea6b28f793dbfec30",
     "branch": "spellcast3d-round-l"
   },
   "what_for": "post6 plus the Turing (sm_75: _qattn_sm75, the tuned sm80 kernel's twin on Turing's mma shapes without cp.async, the fused quantisers built for 7.5 too) and Pascal (sm_61: _qattn_sm61, int8 Q.K^T and P.V by dp4a) kernels of Spellcast3D round L; every earlier extension built as before",

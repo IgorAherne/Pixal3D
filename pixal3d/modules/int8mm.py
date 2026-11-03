@@ -30,21 +30,24 @@ Paths (`path=`; None = the table PATHS, chosen from the round-I measurements on 
 The whole block (3 norms + 7 token-sized linears + GELU) runs 2.67-2.83x faster than bf16 (README.md).
 
 Capability gate (`capability()`): the Triton GEMM needs Triton's int8 mma.sync (m16n8k32), which Triton emits for
-sm_80+ (Ampere and up; only sm_86, an RTX 3060, was measured). Below sm_80 the GEMMs are torch._int_mm's (cuBLASLt:
-the IMMA tensor-core kernels from sm_75, dp4a from sm_61 - exact, 82 TOPS on an RTX 2060 Super, 12-22 on a GTX
-1080; Spellcast3D round L) with per-row scales only, so the layers the policy gives group scales keep the torso's
-dtype there (modules/int8.py); the quantiser and the epilogue are the torch ops (`quantize_rows_torch`,
-`epilogue_torch`), or their Triton twins where Triton runs on the card and gives the same bits at the self-check
-(`_triton_elementwise`; Triton has no int8 MMA for sm_75 but its elementwise kernels run there). The outputs come
-in the torso's dtype (`out_dtype`: bf16, fp16 or fp32; modules/precision.py). Below sm_61, or when the first-use
-self-check (`self_check`) fails, every call runs F.linear on the dequantised weight (the fallback) and says so once.
+sm_80+ (Ampere and up; only sm_86, an RTX 3060, was measured). Below sm_80 (Turing, Pascal; Spellcast3D round L) the
+GEMMs are pixal3d_kernels' (`cuda_linear`: the fork's own W8A8 kernel with the scaling, bias and GELU in its
+epilogue, per-row or group scales on either operand - Turing's int8 tensor cores at 48-57 TOPS on an RTX 2060 Super
+against 24-26 TFLOPS of fp16, Pascal's dp4a; the same sums as `reference`), or, where that package is not installed
+or fails its self-check, torch._int_mm's (cuBLASLt: exact, per-row scales only, so the layers the policy gives
+group scales then keep the torso's dtype - modules/int8.py) with the epilogue in torch ops (`epilogue_torch`) or
+their Triton twin where Triton runs on the card and gives the same bits at the self-check (`_triton_elementwise`;
+Triton has no int8 MMA for sm_75 but its elementwise kernels run there). The quantisers likewise (`quantize_rows_torch`
+or the Triton kernel). The outputs come in the torso's dtype (`out_dtype`: bf16, fp16 or fp32; modules/precision.py).
+Below sm_61, or when the first-use self-check (`self_check`) fails, every call runs F.linear on the dequantised
+weight (the fallback) and says so once.
 """
 
 from __future__ import annotations
 
 import math
 import os
-from typing import Optional, Tuple, Union
+from typing import Callable, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -95,8 +98,8 @@ def capability(device: Optional[torch.device] = None) -> Tuple[bool, bool, str]:
 
 
 def gemm_path() -> str:
-    """"triton" (sm_80+), "cuda" (pixal3d_kernels' group-scaled GEMM, Turing and Pascal) or "intmm" (torch._int_mm,
-    per-row scales only) once ready() has decided ("" before)."""
+    """"triton" (sm_80+), "cuda" (pixal3d_kernels' GEMM, Turing and Pascal) or "intmm" (torch._int_mm, per-row
+    scales only) once ready() has decided ("" before)."""
     return str(_state["gemm"])
 
 
@@ -132,10 +135,11 @@ def cuda_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torc
 
 def kernel_name() -> str:
     gemm_how = {"triton": "Triton int8 GEMMs, the epilogue fused",
-                "cuda": "pixal3d_kernels' group-scaled int8 GEMM, torch._int_mm (cuBLASLt) for the per-row layers",
+                "cuda": "pixal3d_kernels' int8 GEMM, the epilogue fused",
                 "intmm": "torch._int_mm (cuBLASLt)"}.get(str(_state["gemm"]), "int8 GEMMs")
     if _state["gemm"] in ("intmm", "cuda"):
-        gemm_how += f", the quantiser and epilogue in {'Triton' if _state['elementwise'] == 'triton' else 'torch'}"
+        what = "quantiser" if _state["gemm"] == "cuda" else "quantiser and epilogue"
+        gemm_how += f", the {what} in {'Triton' if _state['elementwise'] == 'triton' else 'torch'}"
     return f"int8mm: {gemm_how}"
 
 
@@ -646,7 +650,7 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
     """y = x @ W^T + b [GELU tanh] with W = w_q * w_s[:, None]; x: [..., K] in the torso's dtype or a pre-quantised
     (x_q [M, K], x_s) pair (x_s [M]: per row; x_s [M, K / 128]: group scales, the "group" path). Returns out_dtype
     [..., N], or (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M]
-    per row). w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the
+    per row; "cuda": the input's grain). w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the
     "group" path. inv_smooth: 1 / s [K] applied to x as it is quantised (the weight holds W * s). Where the card has
     no group GEMM (has_group_gemm), group scales take the fallback."""
     pre = isinstance(x, tuple)
@@ -685,14 +689,14 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
         xq, xs = quantize_rows(x, group, inv_smooth)
     if path == "triton" and out_dtype not in _OUT_NAME:       # the Triton GEMM writes bf16 / fp16 (or int8)
         path = "intmm"
-    if _state["gemm"] == "cuda":                                 # pixal3d_kernels for group scales, cuBLASLt per row
-        path = "cuda" if group else "intmm"
+    if _state["gemm"] == "cuda":                                 # pixal3d_kernels, per-row or group scales alike
+        path = "cuda"
     if path == "intmm":
         y = intmm_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, out_dtype=out_dtype)
     elif path == "cuda":
         y = cuda_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_dtype=out_dtype)
         if out_int8:
-            y = quantize_rows(y, GROUP)
+            y = quantize_rows(y, group)
     else:
         y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else _OUT_NAME[out_dtype], group=group)
     if out_int8 or pre:
@@ -716,6 +720,13 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
     "intmm": torch._int_mm, fc1's epilogue quantises each full row for fc2's torch._int_mm: 16.6 ms."""
     if inv_smooth2 is not None and path != "group":
         raise ValueError("fc2's smoothing is applied in the group path's fc1 epilogue only")
+    if _state["gemm"] == "cuda" and path in ("rows", "group"):
+        # pixal3d_kernels: fc1 with its GELU in the epilogue, the hidden layer quantised again for fc2 with the
+        # scales fc1's input had (per row, or per row and group)
+        group = GROUP if path == "group" else 0
+        xq, xs = x if isinstance(x, tuple) else quantize_rows(x, group)
+        h = cuda_linear(xq, xs, *w1, gelu=True, out_dtype=out_dtype)
+        return cuda_linear(*quantize_rows(h, group, inv_smooth2), *w2, out_dtype=out_dtype)
     if path == "rows" and out_dtype not in _OUT_NAME:
         path = "intmm"
     if path == "rows":
@@ -729,10 +740,6 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
             xq, xs = quantize_rows(x)
         hq, hs = intmm_linear(xq, xs, *w1, gelu=True, out_int8=True)
         return intmm_linear(hq, hs, *w2, out_dtype=out_dtype)
-    if _state["gemm"] == "cuda":
-        xq, xs = x if isinstance(x, tuple) else quantize_rows(x, GROUP)
-        h = cuda_linear(xq, xs, *w1, gelu=True, out_dtype=out_dtype)
-        return cuda_linear(*quantize_rows(h, GROUP, inv_smooth2), *w2, out_dtype=out_dtype)
     if out_dtype not in _OUT_NAME:
         raise ValueError(f"the group path's fc2 GEMM writes bf16 or fp16, not {out_dtype}")
     if isinstance(x, tuple):
@@ -863,6 +870,8 @@ def self_check(device: torch.device) -> Tuple[bool, str]:
             got_by = {"intmm": intmm_linear(xq, xs, wq, ws, b, gelu=gelu, out_dtype=dt)}
             if triton_gemm:
                 got_by["triton"] = gemm(xq, xs, wq, ws, b, gelu=gelu, cfg=(64, 64, 64, 8, 3, 4))
+            if _state["gemm"] == "cuda":
+                got_by["pixal3d_kernels' per-row GEMM"] = cuda_linear(xq, xs, wq, ws, b, gelu=gelu, out_dtype=dt)
             for name, got in got_by.items():
                 worst, _ = within(got, want, mag, gelu=gelu)
                 if worst > 1.0:

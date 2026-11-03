@@ -75,9 +75,12 @@ def _import_ahead() -> None:
     names = list(KERNEL_LIBRARIES)
     try:
         from ..modules.attention import config
+        from ..modules.sparse import config as sparse_config
 
         if config.SAGE:
             names.append("sageattention")
+        if sparse_config.CONV == "spconv":     # 2-4 s of libraries, else paid inside the first flow's first step
+            names.append("spconv.pytorch")
     except Exception:       # noqa: BLE001 - the first pass imports what it needs as before
         pass
     for name in names:

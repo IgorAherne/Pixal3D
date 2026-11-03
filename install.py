@@ -61,7 +61,7 @@ DOWNLOAD_WHEELS = [
         "name": "flash_attn",
         "filename": "flash_attn-2.8.3+cu128torch2.8-cp311-cp311-win_amd64.whl",
         "min_cc": MIN_CC_FOR_FLASH_ATTN,
-        "skip_reason": "GPU is pre-Ampere; xformers will be used for attention instead",
+        "skip_reason": "never: the wheel is installed on every card (it imports without its kernels)",
         "urls": [
             f"{SPZ_WHEEL_MIRROR}/flash_attn-2.8.3%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
             "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flash_attn-latest/flash_attn-2.8.3%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
@@ -73,7 +73,7 @@ DOWNLOAD_WHEELS = [
         "name": "natten",
         "filename": "natten-0.21.6+cu128torch2.8-cp311-cp311-win_amd64.whl",
         "min_cc": MIN_CC_FOR_NATTEN,
-        "skip_reason": "NATTEN has no pre-Ampere kernels; NAF upsampling will not run on this GPU",
+        "skip_reason": "never: the wheel is installed on every card (it imports without its kernels)",
         "urls": [
             f"{SPZ_WHEEL_MIRROR}/natten-0.21.6%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
             "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/natten-latest/natten-0.21.6%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",

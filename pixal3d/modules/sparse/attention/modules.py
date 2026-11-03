@@ -134,9 +134,11 @@ class SparseMultiHeadAttention(nn.Module):
                         k = self.k_rms_norm(k)
                     if self.use_rope:
                         q, k = self.rope(q, k)
-                if self.attn_mode == "full" and config.ATTN == 'flash_attn':
+                if self.attn_mode == "full" and config.ATTN in ('flash_attn', 'sdpa'):
                     # flash_attn's packed call only slices q, k and v back out of the stack and runs the kernel
-                    # of the unpacked call with the same arguments, so the stack would be a copy for nothing.
+                    # of the unpacked call with the same arguments, so the stack would be a copy for nothing;
+                    # torch's SDPA takes them apart as well. The call with the three is also the only one that
+                    # offers one sequence's self-attention to SageAttention (full_attn.py one_self).
                     apart = (q, k, v)
                 else:
                     qkv = qkv.replace(torch.stack([q.feats, k.feats, v.feats], dim=1))

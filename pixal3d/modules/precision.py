@@ -24,7 +24,10 @@ The profile follows the card (torch.cuda.get_device_capability) unless the envir
 PIXAL3D_PRECISION = ampere | turing | pascal forces one (developers, tests); PIXAL3D_CARD_SM = 75 (and the like)
 names the card's compute capability for a process that cannot see the card (Spellcast3D's installer makes the
 flows' faster-loading copies with the card hidden: the copies hold the torso's dtype, so they must know it). Without
-a card and without either variable the profile is ampere, as the code always was (the CPU tests).
+a card and without either variable the profile is ampere, as the code always was (the CPU tests). PIXAL3D_TRITON =
+off keeps every Triton kernel off on the turing profile (each is optional there, behind a self-check that catches
+what the compiler raises - not a compiler that takes the process down, which Windows builds for Turing could do:
+nobody has run one; this is the way out), as the pascal profile always is.
 
 Every network's constructor arguments from its checkpoint's json pass through `model_args` (the staged loader and
 the copies): a flow's "dtype" becomes the torso's, a decoder's "use_fp16" is turned off where fp16 is slow. The
@@ -100,8 +103,14 @@ def _make(name: str, cc: Optional[tuple[int, int]]) -> Profile:
     if name == "ampere":
         return Profile(name, cc, torch.bfloat16, "flash_attn", "flex_gemm", True, True, False)
     if name == "turing":
-        return Profile(name, cc, torch.float16, _attention_for(cc or (7, 5)), _recorded_conv(), True, True, True)
+        return Profile(name, cc, torch.float16, _attention_for(cc or (7, 5)), _recorded_conv(), _triton_allowed(),
+                       True, True)
     return Profile(name, cc, torch.float32, "sdpa", "spconv", False, False, True)
+
+
+def _triton_allowed() -> bool:
+    """Whether the turing profile may try Triton kernels at all: PIXAL3D_TRITON=off says no."""
+    return os.environ.get("PIXAL3D_TRITON", "").strip().lower() not in ("off", "0", "false", "no")
 
 
 def _recorded_conv() -> str:

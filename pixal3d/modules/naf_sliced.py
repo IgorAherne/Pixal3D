@@ -29,7 +29,7 @@ from typing import Any, Callable, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from . import naf_torch
+from . import naf_torch, precision
 
 # The natten wheel Spellcast3D installs (0.21.6) carries kernels for this compute capability and newer only: below
 # it natten's na2d raises, and the heads go through naf_torch.na2d instead: natten's windows, its answers within
@@ -85,7 +85,8 @@ def _attention_of(naf) -> Optional[Callable]:
 
 def _kernel(na2d: Callable, device: torch.device) -> Callable:
     """The attention to call the way natten's na2d is called: `na2d` itself where natten serves the card, else
-    naf_torch's (one line printed the first time in a process)."""
+    naf_torch's (one line printed the first time in a process). The card is the precision profile's (a forced
+    profile runs its code path on any card, as the flows do)."""
     global _torch_said
     if na2d is naf_torch.natten_na2d:
         reason = "natten cannot be imported"
@@ -96,10 +97,11 @@ def _kernel(na2d: Callable, device: torch.device) -> Callable:
     elif device.type != "cuda":
         reason = f"the tensors are on the {device.type}"
     else:
-        capability = torch.cuda.get_device_capability(device)
-        if capability >= NATTEN_MIN_CAPABILITY:
+        card = precision.profile()
+        if not card.naf_torch:
             return na2d
-        reason = (f"compute capability {capability[0]}.{capability[1]}, natten's kernels need "
+        cc = card.capability or (0, 0)
+        reason = (f"compute capability {cc[0]}.{cc[1]} ({card.name} profile), natten's kernels need "
                   f"{NATTEN_MIN_CAPABILITY[0]}.{NATTEN_MIN_CAPABILITY[1]}")
     if not _torch_said:
         _torch_said = True
@@ -175,7 +177,7 @@ def _fused_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: in
 def warm_rope(device: Any, side: int, channels: int = 256, heads: int = 4) -> bool:
     """Compile the fused rotation for a guide map of `side` x `side` (the install's calibration: the kernel is then
     in Triton's cache for the artist's first prop). False when the kernel is off or cannot run (rope_apply serves)."""
-    if not FUSED_ROPE or _rope_state is False:
+    if not FUSED_ROPE or _rope_state is False or not precision.profile().triton:
         return False
     d = channels // heads
     x = torch.zeros(1, channels, side, side, device=device, dtype=torch.float32)
@@ -192,9 +194,10 @@ def warm_rope(device: Any, side: int, channels: int = 256, heads: int = 4) -> bo
 
 
 def _fused_rope_ok(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, heads: int, rope_apply: Callable) -> bool:
-    """Whether the fused kernel applies to this map (and, at its first use, gives rope_apply's values)."""
+    """Whether the fused kernel applies to this map (and, at its first use, gives rope_apply's values); never where
+    the card's profile allows no Triton (modules/precision.py)."""
     global _rope_state
-    if not FUSED_ROPE or _rope_state is False or not x.is_cuda:
+    if not FUSED_ROPE or _rope_state is False or not x.is_cuda or not precision.profile().triton:
         return False
     batch, channels, height, width = x.shape
     d = channels // heads

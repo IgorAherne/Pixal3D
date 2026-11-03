@@ -81,8 +81,16 @@ gets slower; PIXAL3D_INT8PV=off keeps the fp16 kernel for every block.
 
 Before the first SageAttention call of a process each kernel the card may use runs once on a small random table
 against an fp32 reference (`_check`; the Triton kernels compile there); a kernel that fails or answers wrongly is
-left out (the CUDA kernel then serves every length), and a card older than sm_80, a missing or broken wheel or no
-kernel left turns SageAttention off with a `[SAGE]` warning, and the flows keep flash_attn.
+left out (the CUDA kernel then serves every length), and a missing or broken wheel or no kernel left turns
+SageAttention off with a `[SAGE]` warning, and the flows keep their attention backend.
+
+Cards below sm_80 (Spellcast3D round L; the wheel from post7): one candidate each - the Turing op TURING_OP on sm_7x
+(fp16, the tuned sm80 kernel's twin) and the Pascal op PASCAL_OP on sm_6x (fp32 in and out, int8 Q.K^T by dp4a,
+with an int8 P.V twin raced as on sm_8x). Neither runs in a process until the install's calibration has run it on
+this card at the flows' sizes and recorded so (`calibrate` -> `_old_card_trial`, in a child process: a kernel
+that faults takes its process's CUDA context with it, which must never happen to the engine; the record's
+"candidate_ok"); without that record the card's SDPA serves, except under a forced profile (PIXAL3D_PRECISION: a
+developer's test of another card's path).
 """
 
 from __future__ import annotations
@@ -90,6 +98,7 @@ from __future__ import annotations
 import os
 import statistics
 import time
+from pathlib import Path
 from typing import Callable, Optional
 
 import torch
@@ -117,6 +126,8 @@ PASCAL_OP = "sageattn_pascal"   # torch.ops.sageattention_qattn_sm61.<this> (Spe
 #                     and out (the pascal profile's torso); its int8 P.V is the round K scheme with 32-key blocks
 TUNED_OP = "qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d"    # torch.ops.sageattention_qattn_sm80.<this>: the tuned
 #                     kernel (Spellcast3D's wheel post5 on; the shipped op's arguments, the same bits)
+OLD_CARD = {6: "pascal", 7: "turing"}   # the candidate kernel of a card below sm_80, by the capability's major
+TRIAL_SECONDS = 600                     # the calibration's child process trying that kernel: its time limit
 RACE_TOKENS = ((21504, 4), (8192, 6))   # the shipped and the tuned op timed at first use: (tokens, calls of each)
 #                     - an hr / tex pass's size and a smaller one; 12 heads x 128, interleaved ABBA (an even count:
 #                     drift weighs on both alike), the median; ~0.5 s on an RTX 3060
@@ -268,26 +279,27 @@ def _scale_rows(linear: torch.nn.Module, rows: slice, factor: float, bias: bool 
         linear.bias[rows].mul_(factor)
 
 
-def _candidates(device: torch.device, want: str) -> dict[str, tuple[Callable, str]]:
+def _candidates(device: torch.device, want: str, trial: bool = False) -> dict[str, tuple[Callable, str]]:
     """The kernels to try on this card for the preference `want` (preference()): {name: (kernel(q, k, v), label)},
-    each [B, N, H, 128] NHD bf16 -> the same. "wheel" always; on sm_8x "tuned" where the wheel has TUNED_OP and
-    the choice is automatic or asks for it, "cuda" where FUSED_PREP or asked for, and "triton" where TRITON_TOKENS
-    lists this architecture or it is asked for (a kernel not needed is not compiled)."""
+    each [B, N, H, 128] NHD in the torso's dtype -> the same. "wheel" always; on sm_8x "tuned" where the wheel has
+    TUNED_OP and the choice is automatic or asks for it, "cuda" where FUSED_PREP or asked for, and "triton" where
+    TRITON_TOKENS lists this architecture or it is asked for (a kernel not needed is not compiled). Below sm_80 the
+    card's one candidate (OLD_CARD), where the install's calibration has run it on this card (`trial`: the
+    calibration's own run of it)."""
     import sageattention as sa
 
     major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
-    if major == 6:
-        op = _pascal_op()
-        if op is None:
-            raise RuntimeError(f"the card is sm_{major}{minor}; the installed wheel has no Pascal kernel ({PASCAL_OP})")
-        return {"pascal": (_pascal_call(op, False), f"{PASCAL_OP} (int8 Q.K^T by dp4a, fp32 P.V)")}
-    if major == 7:
-        op = _turing_op()
-        if op is None:
-            raise RuntimeError(f"the card is sm_{major}{minor}; the installed wheel has no Turing kernel (_qattn_sm75)")
-        return {"turing": (_wheel_call(op), f"{TURING_OP} for sm_75 (per_warp, fp16+fp32)")}
     if major < 8:
-        raise RuntimeError(f"the card is sm_{major}{minor}; SageAttention's kernels serve sm_61, sm_75 and sm_80 and newer")
+        if major not in OLD_CARD:
+            raise RuntimeError(f"the card is sm_{major}{minor}; SageAttention's kernels serve sm_61, sm_75 and sm_80 "
+                               f"and newer")
+        name, call, label = _old_card_candidate(major)
+        if call is None:
+            raise RuntimeError(f"the card is sm_{major}{minor}; the installed wheel has no {name} kernel")
+        why = None if trial else _old_card_unchecked(device, name)
+        if why is not None:
+            raise RuntimeError(f"the {name} kernel is not used: {why}")
+        return {name: (call, label)}
 
     def wheel_cuda(q, k, v):
         return sa.sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout="NHD", is_causal=False,
@@ -313,6 +325,135 @@ def _candidates(device: torch.device, want: str) -> dict[str, tuple[Callable, st
     if want == "triton" or (want == "auto" and _triton_ranges(device)):
         found["triton"] = (sage_triton.triton, "the wheel's Triton kernel, unspecialised, preprocessing fused")
     return found
+
+
+def _old_card_candidate(major: int) -> tuple[str, Optional[Callable], str]:
+    """(name, the call - None where the wheel lacks the extension -, label) of the kernel a card below sm_80 may run:
+    the Pascal op on sm_6x, the Turing op on sm_7x (OLD_CARD)."""
+    if major == 6:
+        op = _pascal_op()
+        call = _pascal_call(op, False) if op is not None else None
+        return "pascal", call, f"{PASCAL_OP} (int8 Q.K^T by dp4a, fp32 P.V)"
+    op = _turing_op()
+    return "turing", (_wheel_call(op) if op is not None else None), f"{TURING_OP} for sm_75 (per_warp, fp16+fp32)"
+
+
+def _old_card_unchecked(device: torch.device, name: str) -> Optional[str]:
+    """Why the kernel `name` of a card below sm_80 may not run in this process: None where the install's calibration
+    ran it on this card at the flows' sizes and recorded so (the record's "candidate_ok"), or where the profile is
+    forced (PIXAL3D_PRECISION: a developer's test of another card's path); else the reason, for the [SAGE] line."""
+    stored = _stored(device)
+    if stored is not None and stored.get("candidate") == name:
+        if stored.get("candidate_ok"):
+            return None
+        return f"the install's calibration found it wanting on this card ({stored.get('why', 'no reason recorded')})"
+    if os.environ.get("PIXAL3D_PRECISION", "").strip():
+        return None
+    return "the install's calibration has not run it on this card (python -m pixal3d.calibrate)"
+
+
+def _old_card_trial(device: torch.device) -> dict:
+    """The kernel of a card below sm_80 tried on this card, as the calibration's child process runs it: the
+    self-check's table (the 3 % bar of _check), then calls at RACE_TOKENS' sizes, timed (the flows' sizes: a kernel
+    that faults does so here, not in the engine), and on sm_6x the int8 P.V call against the fp32 P.V one on the
+    table and in the race (_race_int8pv, CALIBRATION_RACE). Returns the record's fields: "candidate",
+    "candidate_ok", "why", "timings", "summary", and on sm_6x "int8pv", "int8pv_timings", "int8pv_summary",
+    "int8pv_why"."""
+    major, _minor = precision.profile().capability or torch.cuda.get_device_capability(device)
+    name, call, label = _old_card_candidate(major)
+    found: dict = {"candidate": name, "candidate_ok": False}
+    if call is None:
+        found["why"] = f"the installed wheel has no {name} kernel"
+        return found
+    try:
+        return {**found, **_old_card_trial_run(device, major, call, label)}
+    except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: recorded, SDPA serves
+        found["why"] = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}"
+        return found
+
+
+def _old_card_trial_run(device: torch.device, major: int, call: Callable, label: str) -> dict:
+    found: dict = {}
+    q, k, vs, want_out = _check_table(device)
+
+    def off(got: torch.Tensor) -> Optional[str]:
+        rel = float((got.float() * 2.0 ** V_SHIFT - want_out).norm() / want_out.norm())
+        if got.shape != want_out.shape or not bool(torch.isfinite(got).all()) or not rel <= 0.03:
+            return f"its answer differs from fp32 attention (relative L2 {rel:.3g})"
+        return None
+
+    got = call(q, k, vs)
+    torch.cuda.synchronize(device)
+    why = off(got)
+    if why is not None:
+        found["why"] = why
+        return found
+    del got
+    heads, dt, rows = 12, precision.torso(), []
+    for n, calls in RACE_TOKENS:
+        g = torch.Generator(device=device).manual_seed(n)
+        tables = [torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g) for _ in range(3)]
+        events = []
+        for _ in range(calls):
+            start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            start.record()
+            call(*tables)
+            end.record()
+            events.append((start, end))
+        torch.cuda.synchronize(device)
+        rows.append((n, statistics.median(a.elapsed_time(b) for a, b in events)))
+        del tables, events
+    found.update(candidate_ok=True, why=f"{label} ran at the flows' sizes",
+                 timings=[{"tokens": n, "ms": round(ms, 3)} for n, ms in rows],
+                 summary=", ".join(f"{n:,} tokens {ms:.2f} ms" for n, ms in rows))
+    if major == 6 and int8pv_switch() != "off":
+        int8 = _pascal_call(_pascal_op(), True)
+        got = int8(q, k, vs)
+        torch.cuda.synchronize(device)
+        why = off(got)
+        del got
+        if why is not None:
+            found.update(int8pv=False, int8pv_summary="not timed",
+                         int8pv_why=f"the int8 P.V kernel is left out: {why}")
+        else:
+            wins, line, rows8 = _race_int8pv(device, call, int8, CALIBRATION_RACE)
+            found.update(int8pv=wins, int8pv_why=line,
+                         int8pv_timings=[{"tokens": n, "fp32_ms": round(a, 3), "int8_ms": round(b, 3)}
+                                         for n, a, b in rows8],
+                         int8pv_summary=", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
+                                                  for n, a, b in rows8) or "not timed")
+    return found
+
+
+def _old_card_trial_in_child(major: int, minor: int) -> dict:
+    """`_old_card_trial` in a child process with this process's environment and the fork on its path: a kernel
+    that faults takes its process's CUDA context with it, so the parent (the calibration) stays up and records the
+    failure, and the engine never tries that kernel on this card. The child's last line of JSON is the result."""
+    import json
+    import subprocess
+    import sys
+
+    name = OLD_CARD.get(major, f"sm_{major}{minor}")
+    code = ("import json, torch\nfrom pixal3d.modules import sage\n"
+            "print(json.dumps(sage._old_card_trial(torch.device('cuda'))), flush=True)")
+    try:
+        run = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]),
+                             env=os.environ.copy(), capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=TRIAL_SECONDS)
+    except subprocess.TimeoutExpired:
+        return {"candidate": name, "candidate_ok": False, "summary": "not run",
+                "why": f"the trial did not finish in {TRIAL_SECONDS} s"}
+    lines = [line for line in run.stdout.splitlines() if line.startswith("{")]
+    if run.returncode == 0 and lines:
+        try:
+            found = json.loads(lines[-1])
+            found.setdefault("summary", found.get("why", ""))
+            return found
+        except ValueError:
+            pass
+    tail = " | ".join((run.stderr or run.stdout).strip().splitlines()[-3:])
+    return {"candidate": name, "candidate_ok": False, "summary": "the trial failed",
+            "why": f"the trial process ended with code {run.returncode}: {tail[:300]}"}
 
 
 def _tuned_op() -> Optional[Callable]:
@@ -457,9 +598,14 @@ def calibrate(device: torch.device) -> dict:
     """The install's calibration of the choice between the wheel's two CUDA kernels (`python -m pixal3d.calibrate`
     calls it once, the card quiet): both ops on the self-check's table (they must give the same bits, else the
     shipped one is recorded), then the race with CALIBRATION_RACE. Returns the record's "sage" section: {"wheel",
-    "capability", "tuned": bool, "summary", "timings": [{"tokens", "shipped_ms", "tuned_ms"}], "why"}."""
+    "capability", "tuned": bool, "summary", "timings": [{"tokens", "shipped_ms", "tuned_ms"}], "why"}. A card below
+    sm_80 records its one candidate's trial instead (`_old_card_trial`, in a child process: "candidate",
+    "candidate_ok", and on sm_6x the int8 P.V race)."""
     major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
     found = {"wheel": _wheel_version(), "capability": [major, minor], "tuned": False, "timings": []}
+    if major in OLD_CARD:
+        found.update(_old_card_trial_in_child(major, minor))
+        return found
     if major != 8:
         found.update(why=f"sm_{major}{minor}: the CUDA kernels are used on sm_8x only", summary="not sm_8x")
         return found

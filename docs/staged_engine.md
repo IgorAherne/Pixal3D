@@ -475,8 +475,8 @@ an RTX 2060 Super and a GTX 1080):
 | profile | cards | flows' torso | attention | int8 GEMMs | decoders | NAF | Triton |
 |---|---|---|---|---|---|---|---|
 | ampere | sm_80+ | bf16 | flash_attn / SageAttention | Triton (group + per-row scales) | flex_gemm, fp16 | natten | yes |
-| turing | sm_70 - sm_79 | fp16 | torch SDPA (xformers on request) | torch._int_mm, per-row layers only | spconv, fp16 | torch | elementwise only, after self-checks |
-| pascal | below sm_70 | fp32 | torch SDPA, fp32 | torch._int_mm (dp4a), per-row layers only | spconv, fp32 | torch | no |
+| turing | sm_70 - sm_79 | fp16 | torch SDPA (the wheel's Turing kernel after the calibration's trial) | pixal3d_kernels (int8 tensor cores; group + per-row scales) | spconv, fp16 (flex_gemm after the calibration's check) | torch | elementwise only, after self-checks |
+| pascal | below sm_70 | fp32 | torch SDPA, fp32 (the wheel's Pascal kernel after the calibration's trial) | pixal3d_kernels (dp4a; group + per-row scales) | spconv, fp32 | torch | no |
 
 Turing has no bf16 arithmetic (torch emulates it at a seventh of the fp16 rate and no bf16 attention kernel
 exists); consumer Pascal runs fp16 at a 64th of the fp32 rate (an fp16 attention call takes 14 s there against
@@ -488,9 +488,23 @@ sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream
 The decoders' backend below sm_80 is spconv (CUDA kernels from sm_61) unless the install's calibration found
 flex_gemm's Triton convolutions giving spconv's answers on the card (`modules/sparse/conv/backend_check.py`, the
 record's `conv_backend` section; Triton's Windows builds are untested on Turing, so nothing depends on them
-without that check): flex_gemm decodes in boxes (`chunked.py`) and is 3-30x faster per part on the turing profile. torch._int_mm (cuBLASLt) multiplies over the whole K with one scale per row, so the layers the
-int8 policy gives group scales (to_qkv and the MLP) keep the torso's dtype on those cards; the three 1536 -> 1536
-layers run int8. Every network's constructor arguments pass through `precision.model_args` (the loader and the
+without that check): flex_gemm decodes in boxes (`chunked.py`) and is 3-30x faster per part on the turing profile.
+Where the levels are decoded whole (spconv) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
+`WHOLE_LEVEL_1536_MIB`: the knight's texture decode ran an RTX 2060 Super out of memory at 1536). The int8 GEMMs
+are pixal3d_kernels' (`int8mm.cuda_linear`: the fork's W8A8 kernel with the scaling, bias and GELU in its epilogue,
+per-row and group scales alike, so the whole int8 policy applies; self-checked at first use against the fp64
+reference); without that package torch._int_mm serves the per-row layers and the group-scaled ones keep the
+torso's dtype. The attention kernels of those cards (SageAttention's `_qattn_sm75` / `_qattn_sm61`, `sage.py`
+OLD_CARD) serve only after the install's calibration ran them at the flows' sizes on the card in a child process
+and recorded so (the record's `sage.candidate_ok`; a faulting kernel takes its process down, which must never be
+the engine's); until then torch's SDPA serves. NAF's attention follows the profile too (`naf_sliced._kernel`).
+Under SDPA the sparse self-attention takes q, k and v apart like flash_attn's (`sparse/attention/modules.py`:
+the call with the three is the only one that offers one sequence's attention to SageAttention and it saves the
+stack); a SparseTensor on spconv keeps its spatial shape as ints (`sparse/basic.py`: spconv compared a tensor
+batch size at every `replace()`, a host sync 27,000 times in one lr sampling), and `engine._import_ahead` loads
+spconv before the first flow (2-4 s that the lr flow's first step paid). On the RTX 3060 with the turing
+profile forced those three took the boy's lr from 9.1 to 4.6 s.
+Every network's constructor arguments pass through `precision.model_args` (the loader and the
 copies): a flow's `dtype` becomes the torso's, a decoder's `use_fp16` is turned off on Pascal; the copies of the
 flows (above) then hold fp16 on Turing and are not made on Pascal (fp32 is the file's own dtype). `PIXAL3D_CARD_SM`
 tells a process that cannot see the card (the installer's copies) which card it is; `PIXAL3D_PRECISION` forces a
