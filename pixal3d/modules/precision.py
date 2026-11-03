@@ -144,6 +144,12 @@ def profile() -> Profile:
         if forced and name_for(cc) != forced:
             cc = ASSUMED[forced]        # a forced profile on another card (or none): the backends follow the profile
         _profile = _make(forced or name_for(cc), cc)
+        if _profile.name == "pascal":
+            # torch's fused linear-with-bias (gemm_and_bias) goes through cuBLASLt, whose fp32 SGEMM reads out of
+            # bounds on a GTX 1080 (compute-sanitizer: maxwell_sgemm_64x64_tn; cuBLAS 12.6 and 12.8): an illegal
+            # memory access a few seconds into the ss flow. torch reads this at its first addmm; the hub sets it for
+            # the card's processes too (gpu.pixal3d_card_env)
+            os.environ.setdefault("DISABLE_ADDMM_CUDA_LT", "1")
         if _profile.name != "ampere" or forced:
             sm = f"sm_{cc[0]}{cc[1]}" if cc else "no card"
             print(f"[PRECISION] {_profile.name} profile ({sm}{', PIXAL3D_PRECISION' if forced else ''}): the flows' "

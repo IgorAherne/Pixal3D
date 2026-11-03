@@ -490,7 +490,11 @@ only: on another card (a GTX 10xx is sm_61) spconv compiles them at run time thr
 the wheel (no headers shipped, no include path given: a GTX 1080 failed its first decoder convolution so), and such
 a card runs spconv's Native algorithm with the products on torch.mm, one GEMM per kernel offset
 (`conv_spconv.indice_conv_torch`: spconv's kernels' sums to 4e-7, 1.2-1.6x their time on the RTX 3060's check,
-`round-l/spconv_products_check.py`; its index tables are spconv's own kernels still). flex_gemm's Triton convolutions give
+`round-l/spconv_products_check.py`; its index tables are spconv's own kernels still). On the pascal profile
+`DISABLE_ADDMM_CUDA_LT=1` (set by the profile and by the hub for the card's processes): torch's fused linear-with-bias
+goes through cuBLASLt, whose fp32 SGEMM reads out of bounds on a GTX 1080 (compute-sanitizer: `maxwell_sgemm_64x64_tn`,
+cuBLAS 12.6 and 12.8 alike; an illegal memory access a few seconds into the ss flow, which the first whole prop on
+that card needed off: 169 s for the boy at 1024). flex_gemm's Triton convolutions give
 spconv's answers on an RTX 2060 Super and decode in boxes (`chunked.py`), but their tile tuning at the install's
 calibration took 25-95 minutes a shape there (13 shapes), so they are tried only on request:
 `PIXAL3D_TURING_FLEX_GEMM=on` at the calibration runs `modules/sparse/conv/backend_check.py` and records the
