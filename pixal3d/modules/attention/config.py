@@ -19,7 +19,9 @@ def __from_env():
     if env_attn_debug is not None:
         DEBUG = env_attn_debug == '1'
 
-    from .. import sage
+    # a backend without kernels for this card is replaced by the card's (modules/precision.py)
+    from .. import precision, sage
+    BACKEND = precision.attention_backend(BACKEND)
     SAGE = sage.from_env()
 
     print(f"[ATTENTION] Using backend: {BACKEND}"

@@ -171,11 +171,19 @@ def build_dino(paths: ModelPaths, device: str) -> nn.Module:
 def build_naf(paths: ModelPaths, device: str) -> nn.Module:
     """DinoV3ProjFeatureExtractor._load_naf (image_conditioned_proj.py:514-523) and the checkout's hubconf.py:
     `NAF()`, then the state of naf_release.pth. The weights file is read here, from the path given, instead of
-    through torch.hub's cache folder (and as tensors only: nothing else in the file is executed)."""
-    naf_model = torch.hub.load(
-        _present(paths.naf_repo, "the NAF checkout"), "naf", pretrained=False, device="cpu", trust_repo=True,
-        source="local"
-    )
+    through torch.hub's cache folder (and as tensors only: nothing else in the file is executed).
+
+    Where natten cannot be imported (an install without it, a library that does not load), NAF's attention module
+    is given naf_torch's attention under natten's name while it loads (modules/naf_torch.py natten_stand_in)."""
+    from ..modules import naf_torch
+
+    with naf_torch.natten_stand_in() as missing:
+        if missing is not None:
+            print(f"[NAF] natten cannot be imported ({missing}): NAF is built with the torch attention", flush=True)
+        naf_model = torch.hub.load(
+            _present(paths.naf_repo, "the NAF checkout"), "naf", pretrained=False, device="cpu", trust_repo=True,
+            source="local"
+        )
     naf_model.load_state_dict(
         torch.load(_present(paths.naf_weights, "NAF's weights"), map_location="cpu", weights_only=True)
     )

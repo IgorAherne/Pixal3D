@@ -4,7 +4,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-from ..modules.utils import convert_module_to, manual_cast, str_to_dtype
+from ..modules.utils import convert_module_to, manual_cast, str_to_dtype, stream_dtype
 from ..modules.transformer import AbsolutePositionEmbedder
 from ..modules import sparse as sp
 from ..modules.sparse.transformer import ModulatedSparseTransformerCrossBlock
@@ -114,6 +114,8 @@ class SLatFlowModel(nn.Module):
         """
         self.dtype = dtype
         self.blocks.apply(partial(convert_module_to, dtype=dtype))
+        for block in self.blocks:
+            block.inner_dtype = dtype      # the sub-layers' dtype (the stream may be wider: stream_dtype)
 
     def initialize_weights(self) -> None:
         if self.initialization == 'vanilla':
@@ -213,7 +215,7 @@ class SLatFlowModel(nn.Module):
             x = sp.sparse_cat([x, concat_cond], dim=-1)
 
         h = self.input_layer(x)
-        h = manual_cast(h, self.dtype)
+        h = manual_cast(h, stream_dtype(self.dtype))
         t_emb = self.t_embedder(t)
         if self.share_mod:
             t_emb = self.adaLN_modulation(t_emb)

@@ -466,6 +466,33 @@ weights.make_copy(ckpt)                          # one checkpoint, its path with
   seconds. It exits 1 when a checkpoint got no copy, 0 otherwise. Spellcast3D runs it after its installer has
   downloaded the models and after the multi-view download (its `install/components.py` and `multiview.py`).
 
+## Cards below sm_80: the precision profile
+
+The engine was made for Ampere and newer (bf16 flows, Triton kernels, natten, flash_attn, SageAttention: all
+sm_80+). `modules/precision.py` decides once per process what an older card runs (Spellcast3D round L, measured on
+an RTX 2060 Super and a GTX 1080):
+
+| profile | cards | flows' torso | attention | int8 GEMMs | decoders | NAF | Triton |
+|---|---|---|---|---|---|---|---|
+| ampere | sm_80+ | bf16 | flash_attn / SageAttention | Triton (group + per-row scales) | flex_gemm, fp16 | natten | yes |
+| turing | sm_70 - sm_79 | fp16 | torch SDPA (xformers on request) | torch._int_mm, per-row layers only | spconv, fp16 | torch | elementwise only, after self-checks |
+| pascal | below sm_70 | fp32 | torch SDPA, fp32 | torch._int_mm (dp4a), per-row layers only | spconv, fp32 | torch | no |
+
+Turing has no bf16 arithmetic (torch emulates it at a seventh of the fp16 rate and no bf16 attention kernel
+exists); consumer Pascal runs fp16 at a 64th of the fp32 rate (an fp16 attention call takes 14 s there against
+0.7 s in fp32). An fp16 torso keeps the flows' residual stream in fp32 (`modules/utils.py` `stream_dtype`): the
+stream, the running sum over the 30 blocks, reaches 1.1e5 at the late steps of the lr and hr flows, and a
+sub-layer's output times its modulation gate passes 65,504 too, while the sub-layers' own outputs stay below
+5,000 (round L's `fp16probe.py`); the blocks cast the normalised, modulated input to the torso's dtype for the
+sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream's dtype - no-ops on a bf16 torso. torch._int_mm (cuBLASLt) multiplies over the whole K with one scale per row, so the layers the
+int8 policy gives group scales (to_qkv and the MLP) keep the torso's dtype on those cards; the three 1536 -> 1536
+layers run int8. Every network's constructor arguments pass through `precision.model_args` (the loader and the
+copies): a flow's `dtype` becomes the torso's, a decoder's `use_fp16` is turned off on Pascal; the copies of the
+flows (above) then hold fp16 on Turing and are not made on Pascal (fp32 is the file's own dtype). `PIXAL3D_CARD_SM`
+tells a process that cannot see the card (the installer's copies) which card it is; `PIXAL3D_PRECISION` forces a
+profile (a forced profile on another card runs that profile's code paths with the card's own kernels: the
+developer's test of the Turing and Pascal paths on an RTX 3060, `round-l/smoke_precision.py` in Spellcast3D).
+
 ## Extending it
 
 - **Another part.** Write `fn(ctx, prop, mode)` in `parts.py`, add it to `TABLE` and its key to `types.PARTS` at

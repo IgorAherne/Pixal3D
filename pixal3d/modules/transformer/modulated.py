@@ -7,6 +7,22 @@ from .. import fused
 from .blocks import FeedForwardNet
 
 
+def _inner(h, dtype):
+    """h in the sub-layers' dtype: a cast where the residual stream is wider than the torso (an fp16 torso keeps
+    its stream in fp32, modules/utils.py stream_dtype: the late steps of the lr and hr flows reach 1.1e5 there,
+    past fp16's range, while the sub-layers' own outputs stay below 5,000); h itself otherwise."""
+    if dtype is None or getattr(h, "feats", h).dtype == dtype:
+        return h
+    return h.type(dtype)
+
+
+def _stream(h, x):
+    """h in the residual stream's dtype before its gate is applied (an fp16 h times a gate reaches past fp16's
+    range where the stream is fp32); h itself where the two agree."""
+    hx, xx = getattr(h, "feats", h), getattr(x, "feats", x)
+    return h if hx.dtype == xx.dtype else h.type(xx.dtype)
+
+
 def _fused_rows(x: torch.Tensor) -> Optional[dict]:
     """How the fused kernels find each row's batch item (x is [B, L, C]: row // L), or None when the block runs
     its eager code (the switch is off, or the features are not what the kernels take)."""
@@ -75,15 +91,16 @@ class ModulatedTransformerBlock(nn.Module):
             h = fused.norm_modulate(x, self.norm2.eps, scale=scale_mlp, shift=shift_mlp, **rows)
             h = self.mlp(h)
             return fused.residual(x, h, gate=gate_mlp, **rows)
+        inner = getattr(self, "inner_dtype", None)
         h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = _inner(h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1), inner)
         h = self.attn(h, phases=phases)
-        h = h * gate_msa.unsqueeze(1)
+        h = _stream(h, x) * gate_msa.unsqueeze(1)
         x = x + h
         h = self.norm2(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        h = _inner(h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1), inner)
         h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
+        h = _stream(h, x) * gate_mlp.unsqueeze(1)
         x = x + h
         return x
 
@@ -204,12 +221,13 @@ class ModulatedTransformerCrossBlock(nn.Module):
         if rows is not None:
             return self._forward_fused(x, context, phases, rows, shift_msa, scale_msa, gate_msa, shift_mlp,
                                        scale_mlp, gate_mlp, zero, proj_cache)
+        inner = getattr(self, "inner_dtype", None)
         h = self.norm1(x)
-        h = h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1)
+        h = _inner(h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1), inner)
         h = self.self_attn(h, phases=phases)
-        h = h * gate_msa.unsqueeze(1)
+        h = _stream(h, x) * gate_msa.unsqueeze(1)
         x = x + h
-        h = self.norm2(x)
+        h = _inner(self.norm2(x), inner)
         if type(self.cross_attn) is ProjectAttention:
             # zero: the zero context's one row; proj_cache: proj_linear's kept answer (proj_attention.py)
             h = self.cross_attn(h, context, zero=zero, cache=proj_cache)
@@ -217,9 +235,9 @@ class ModulatedTransformerCrossBlock(nn.Module):
             h = self.cross_attn(h, context)
         x = x + h
         h = self.norm3(x)
-        h = h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        h = _inner(h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1), inner)
         h = self.mlp(h)
-        h = h * gate_mlp.unsqueeze(1)
+        h = _stream(h, x) * gate_mlp.unsqueeze(1)
         x = x + h
         return x
 

@@ -47,10 +47,13 @@ weight has been quantised). The weights take half the memory they did (a flow's 
 the loader's `size_mib` reports and the engine's room tests use.
 
 Before the first int8 GEMM of a process the kernels run once on small tables against an fp64 reference of the same
-int8 operands (int8mm.self_check); a card below sm_80 (Triton's int8 mma.sync path; the hub supports none older),
-a missing Triton or a wrong answer turns the path off with an `[INT8]` warning, and the flows keep their bf16
-layers. The kernels compile on first use (~6 s for the set with a cold Triton cache, 0.4 s warm; one compilation
-serves every token count).
+int8 operands (int8mm.self_check); a card below sm_61, or a wrong answer, turns the path off with an `[INT8]`
+warning, and the flows keep their torso's layers. On sm_80+ the GEMMs are Triton's (they compile on first use: ~6 s
+for the set with a cold Triton cache, 0.4 s warm; one compilation serves every token count). Below sm_80 (Turing,
+Pascal; Spellcast3D round L) they are torch._int_mm's, which take per-row scales only: the layers the policy gives
+group scales (to_qkv and the MLP) keep the torso's dtype there, fp16 or fp32 (modules/precision.py), and the
+per-row layers run int8 - a quarter of the gain, in the fused kernels' error class, until a group-scaled kernel
+exists for those cards.
 """
 
 from __future__ import annotations
@@ -64,14 +67,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from . import int8mm
+from . import int8mm, precision
 
 DEFAULT = True              # what an unset PIXAL3D_INT8 means: the policy DEFAULT_POLICY (round I: the five test props
 #                             at 1536 made with it against the bf16 run: Chamfer 0.03-0.08 % of the bounding-box diagonal,
 #                             at the sampling floor; the base colour at matched surface points 3-11 levels apart against
 #                             13-31 for the accepted SageAttention change; renders alike; the batch 954 -> 760 s)
 DEFAULT_POLICY = "detail"   # what "on" means
-MIN_CAPABILITY = (8, 0)
+MIN_CAPABILITY = (6, 1)     # torch._int_mm's dp4a kernels (cuBLASLt) run from sm_61; int8mm.capability decides the rest
 GROUP = int8mm.GROUP        # 128 input channels per group scale
 CALIB_DIR = Path(__file__).resolve().parent / "int8_calib"
 SHARE_INPUT = True          # a "shared.<type>" smoothing vector: the layer's input quantised once per pass (proj)
@@ -115,7 +118,8 @@ _OFF = {"0", "off", "false", "no"}
 _warned: set = set()
 _mode: Optional[str] = None         # set_mode's answer (a policy name or "off"), when it was called
 _state: Optional[bool] = None       # None: not tried yet; True: the kernels passed on this card; False: off
-KERNEL = "int8mm: Triton int8 GEMMs, the epilogue fused"
+KERNEL = "int8mm: Triton int8 GEMMs, the epilogue fused"   # what the sm_80+ cards run (int8mm.kernel_name() per card)
+_GROUP_HOWS = ("group", "cg", "cs")
 
 _ATTENTION = ("SparseMultiHeadAttention", "MultiHeadAttention")
 _FFN = ("SparseFeedForwardNet", "FeedForwardNet")
@@ -236,8 +240,8 @@ def _feats_in(x: Any) -> torch.Tensor:
     return x.feats if hasattr(x, "feats") else x
 
 
-def _usable(x: torch.Tensor, K: int) -> bool:
-    return (x.is_cuda and x.dtype == torch.bfloat16 and x.shape[-1] == K and x.numel() > 0
+def _usable(x: torch.Tensor, K: int, dtype: torch.dtype = torch.bfloat16) -> bool:
+    return (x.is_cuda and x.dtype == dtype and x.shape[-1] == K and x.numel() > 0
             and not torch.is_autocast_enabled() and not torch.is_grad_enabled() and bool(_state))
 
 
@@ -300,14 +304,16 @@ class Int8Linear(nn.Module):
         return self._forward(x)
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
-        if not _usable(x, self.in_features):
+        if not _usable(x, self.in_features, self.dtype):
             bias = self.bias.to(x.dtype) if self.bias is not None else None
             return F.linear(x, self.dequantized(), bias)
         if self.shared is not None:
-            y = int8mm.int8_linear(self.shared.quantized(x), self.weight_q, self.scale, self.bias)
+            y = int8mm.int8_linear(self.shared.quantized(x), self.weight_q, self.scale, self.bias,
+                                   out_dtype=self.dtype)
             return y.view(*x.shape[:-1], self.out_features)
         return int8mm.int8_linear(x, self.weight_q, self.scale, self.bias,
-                                  path="triton" if self.how == "rows" else "group", inv_smooth=self.inv_smooth)
+                                  path="triton" if self.how == "rows" else "group", inv_smooth=self.inv_smooth,
+                                  out_dtype=self.dtype)
 
 
 class Int8MLP(nn.Module):
@@ -360,7 +366,7 @@ class Int8MLP(nn.Module):
 
     def _forward(self, x: torch.Tensor) -> torch.Tensor:
         K = self.in_features
-        if not _usable(x, K):
+        if not _usable(x, K, self.dtype) or (self.how != "rows" and not int8mm.has_group_gemm()):
             w1 = _dequantized(self.w1_q, self.w1_s, self.inv_smooth1, x.dtype)
             w2 = _dequantized(self.w2_q, self.w2_s, self.inv_smooth2, x.dtype)
             h = F.gelu(F.linear(x, w1, self.b1.to(x.dtype) if self.b1 is not None else None), approximate="tanh")
@@ -370,12 +376,13 @@ class Int8MLP(nn.Module):
             flat = flat.contiguous()
         w1, w2 = (self.w1_q, self.w1_s, self.b1), (self.w2_q, self.w2_s, self.b2)
         if self.how == "rows":
-            y = int8mm.int8_mlp(flat, w1, w2, path="rows")
+            y = int8mm.int8_mlp(flat, w1, w2, path="rows" if int8mm.has_group_gemm() else "intmm",
+                                out_dtype=self.dtype)
         elif self.inv_smooth1 is None and self.inv_smooth2 is None:
-            y = int8mm.int8_mlp(int8mm.quantize_rows(flat, GROUP), w1, w2, path="group")
+            y = int8mm.int8_mlp(int8mm.quantize_rows(flat, GROUP), w1, w2, path="group", out_dtype=self.dtype)
         else:
             y = int8mm.int8_mlp(int8mm.quantize_rows(flat, GROUP, self.inv_smooth1), w1, w2, path="group",
-                                inv_smooth2=self.inv_smooth2)
+                                inv_smooth2=self.inv_smooth2, out_dtype=self.dtype)
         return y.view(*x.shape[:-1], self.out_features)
 
 
@@ -431,6 +438,12 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
         return model
     calib = load_calib(checkpoint) if "cs" in rules.values() else None
     effective = _resolve(rules, calib)
+    if not int8mm.has_group_gemm():
+        kept = sorted(layer for layer, how in effective.items() if how in _GROUP_HOWS)
+        effective = {layer: how for layer, how in effective.items() if how not in _GROUP_HOWS}
+        if kept:
+            print(f"[INT8] {kind}: the group-scaled layers ({', '.join(kept)}) keep {precision.profile().torso_name} "
+                  f"on this card (torch._int_mm takes per-row scales only); the per-row layers run int8", flush=True)
     if "cs" in rules.values() and calib is None:
         print(f"[INT8] no SmoothQuant calibration for {Path(str(checkpoint)).name or '(no checkpoint name)'} "
               f"({calib_file(checkpoint or '?').name} in {CALIB_DIR}): {kind} runs policy {name} without the "
@@ -487,7 +500,7 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
     if counts:
         print(f"[INT8] {type(model).__name__} ({kind}, policy {name}): "
               + ", ".join(f"{k} x{v}" for k, v in counts.items())
-              + f" as int8 GEMMs ({KERNEL}; PIXAL3D_INT8)"
+              + f" as int8 GEMMs ({int8mm.kernel_name()}; PIXAL3D_INT8)"
               + (f", {smoothed} smoothed ({calib_file(checkpoint).name})" if smoothed else "")
               + f", {before / 2**20:,.0f} -> {_bytes(model) / 2**20:,.0f} MiB of weights", flush=True)
     return model
@@ -520,11 +533,12 @@ def available(device: torch.device) -> bool:
             if not ok:
                 raise RuntimeError(why)
             torch.cuda.synchronize(device)
-        except Exception as exc:        # noqa: BLE001 - whatever the kernels, Triton or the card raise: bf16 serves
+        except Exception as exc:        # noqa: BLE001 - whatever the kernels, Triton or the card raise: the torso serves
             _state = False
             print(f"[INT8] the int8 GEMMs do not run on this card ({type(exc).__name__}: {str(exc)[:300]}); the "
-                  f"flows keep their bf16 layers", flush=True)
+                  f"flows keep their {precision.profile().torso_name} layers", flush=True)
             return False
         _state = True
-        print(f"[INT8] the flows' token-sized linears can run as int8 GEMMs: {KERNEL} (PIXAL3D_INT8)", flush=True)
+        print(f"[INT8] the flows' token-sized linears can run as int8 GEMMs: {int8mm.kernel_name()} (PIXAL3D_INT8)",
+              flush=True)
     return bool(_state)

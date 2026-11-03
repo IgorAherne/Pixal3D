@@ -678,7 +678,7 @@ def _check(device: torch.device) -> bool:
     except Exception as exc:        # noqa: BLE001 - whatever the wheel, the card or Triton raises: flash_attn serves
         _state, _kernel = False, None
         print(f"[SAGE] SageAttention does not run on this card ({type(exc).__name__}: {str(exc)[:300]}); the "
-              f"flows keep flash_attn", flush=True)
+              f"flows keep their attention backend", flush=True)
         return False
     _state = True
     print(f"[SAGE] the flows' full self-attention runs SageAttention: {KERNEL} (PIXAL3D_SAGE)", flush=True)

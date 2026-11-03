@@ -55,6 +55,7 @@ from typing import Any, Callable, Iterator
 import torch
 import torch.nn as nn
 
+from ..modules import precision
 from . import stfile, weights
 from .types import Cancelled
 
@@ -535,7 +536,7 @@ def _plan(config_file: Path, file: Path, config: dict | None = None) -> _Plan:
     the model needs, ValueError when one has another shape; nothing of the tensors is read."""
     config = _config(config_file) if config is None else config
     header = stfile.read_header(file)
-    cls, args = _model_class(config["name"]), config["args"]
+    cls, args = _model_class(config["name"]), precision.model_args(config["args"])
     computed = COMPUTED.get(cls.__name__, frozenset())
     model = _build_for_real(cls, args) if computed else _build_empty(cls, args)
     want = {key: (value.dtype, tuple(value.shape)) for key, value in model.state_dict().items()}

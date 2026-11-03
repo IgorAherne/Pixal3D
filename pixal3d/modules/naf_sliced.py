@@ -13,16 +13,29 @@ resize and the attention for one head, hands that head's map [B, C / heads, T, T
 through the attention VALUE_SLICE at a time (each output channel is a weighted sum of its own value channel, with
 weights made from the queries and keys alone), so the largest moment of a head there is the guide's map (1 GiB),
 that head's queries and keys (0.25 GiB each), a slice's values and output (0.5 GiB each).
+
+The attention kernel is natten's na2d where natten serves the card (compute capability NATTEN_MIN_CAPABILITY and
+newer), else naf_torch.na2d - natten's windows in plain torch, float32 (GTX 10xx, RTX 20xx, the CPU); the
+environment variable PIXAL3D_NAF_ATTENTION=natten / torch forces one.
 """
 
 from __future__ import annotations
 
 import math
+import os
 import sys
 from typing import Any, Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+
+from . import naf_torch
+
+# The natten wheel Spellcast3D installs (0.21.6) carries kernels for this compute capability and newer only: below
+# it natten's na2d raises, and the heads go through naf_torch.na2d instead: natten's windows, its answers within
+# float32 rounding (largest difference 3.5e-6 of the largest value), a head's call at T = 1024 1.8 times natten's
+# time on an RTX 3060 and 140 MiB more memory (Spellcast3D code/devtools/pixal3d-lowmem/round-l/naf).
+NATTEN_MIN_CAPABILITY = (8, 0)
 
 # Value channels per attention call. natten's cutlass-fna kernel gives a head's output channels bit for bit the
 # same whether it is handed the head's 256 value channels at once or in slices of 128 (checked on an RTX 3060,
@@ -48,11 +61,50 @@ _rope_kernel = None
 _rope_state: Optional[bool] = None      # None: not tried; True: checked; False: rope_apply from now on
 
 
+def _attention_switch() -> str:
+    """PIXAL3D_NAF_ATTENTION: "natten" or "torch" forces that kernel; unset or "auto": natten where its kernels
+    serve the card (NATTEN_MIN_CAPABILITY), naf_torch elsewhere."""
+    text = os.environ.get("PIXAL3D_NAF_ATTENTION", "").strip().lower()
+    if text in ("", "auto", "natten", "torch"):
+        return text or "auto"
+    print(f"[NAF] PIXAL3D_NAF_ATTENTION={text!r} is none of natten, torch, auto: auto", flush=True)
+    return "auto"
+
+
+ATTENTION = _attention_switch()         # read once, when this module is imported
+_torch_said = False
+
+
 def _attention_of(naf) -> Optional[Callable]:
-    """natten's `na2d` as NAF's own attention module holds it, or None when that module runs the two-call form of
-    older natten releases (src/layers/attentions.py:6-11)."""
+    """natten's `na2d` as NAF's own attention module holds it (naf_torch.natten_na2d where NAF was built without
+    natten: staged/builders.py build_naf), or None when that module runs the two-call form of older natten
+    releases (src/layers/attentions.py:6-11)."""
     module = sys.modules.get(type(naf.upsampler).__module__)
     return getattr(module, "na2d", None) if getattr(module, "NATTEN_RECENT", False) else None
+
+
+def _kernel(na2d: Callable, device: torch.device) -> Callable:
+    """The attention to call the way natten's na2d is called: `na2d` itself where natten serves the card, else
+    naf_torch's (one line printed the first time in a process)."""
+    global _torch_said
+    if na2d is naf_torch.natten_na2d:
+        reason = "natten cannot be imported"
+    elif ATTENTION == "natten":
+        return na2d
+    elif ATTENTION == "torch":
+        reason = "PIXAL3D_NAF_ATTENTION=torch"
+    elif device.type != "cuda":
+        reason = f"the tensors are on the {device.type}"
+    else:
+        capability = torch.cuda.get_device_capability(device)
+        if capability >= NATTEN_MIN_CAPABILITY:
+            return na2d
+        reason = (f"compute capability {capability[0]}.{capability[1]}, natten's kernels need "
+                  f"{NATTEN_MIN_CAPABILITY[0]}.{NATTEN_MIN_CAPABILITY[1]}")
+    if not _torch_said:
+        _torch_said = True
+        print(f"[NAF] the neighborhood attention runs in plain torch ({reason})", flush=True)
+    return naf_torch.natten_na2d
 
 
 def _rope_by_head(rope, x: torch.Tensor) -> torch.Tensor:
@@ -280,6 +332,7 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
     else:                                                                   # RoPE's heads are not the attention's
         x = rope(x)
 
+    attend = _kernel(na2d, x.device)
     d = channels // heads
     dv = lr_features.shape[1] // heads
     big = batch * height * width * dv * lr_features.element_size() > VALUE_SLICE_ABOVE_MIB << 20
@@ -300,7 +353,8 @@ def naf_sampled(naf, image: torch.Tensor, lr_features: torch.Tensor, target_size
             v = _heads_last(
                 F.interpolate(lr_features[:, c:c + step], size=(height, width), mode="nearest-exact")
             ).to(q.dtype)
-            o = na2d(q, k, v, kernel_size=attention.kernel_size, dilation=dilation, stride=1, backend="cutlass-fna")
+            o = attend(q, k, v, kernel_size=attention.kernel_size, dilation=dilation, stride=1,
+                       backend="cutlass-fna")
             del v
             rows = sample(o.reshape(batch, height, width, step).permute(0, 3, 1, 2))
             del o

@@ -214,9 +214,10 @@ def _triton(device: Any) -> dict:
     import torch
 
     done: dict[str, Any] = {}
-    from pixal3d.modules import fused, int8mm
+    from pixal3d.modules import fused, int8mm, precision
 
-    done["fused"] = bool(fused._check(device))
+    # the fused kernels serve bf16 torsos only (modules/fused.py active): nothing to compile for the others
+    done["fused"] = bool(fused._check(device)) if precision.torso() == torch.bfloat16 else "not used: the torso is "         + precision.profile().torso_name
     ok, why = int8mm.ready(device)
     done["int8"] = bool(ok) if ok else f"off: {why}"
     from pixal3d.modules.sparse.conv import codes
@@ -247,10 +248,11 @@ def _warm_int8(device: Any) -> int:
     import torch
     from torch import nn
 
-    from pixal3d.modules import int8
+    from pixal3d.modules import int8, precision
 
     if int8.policy() is None or not int8.available(device):
         return 0
+    dt = precision.torso()
     rules = int8.POLICIES[int8.policy()].get("hr") or {}
     shapes = {"qkv": (1536, 4608), "out": (1536, 1536), "xq": (1536, 1536), "xout": (1536, 1536),
               "proj": (2048, 1536)}
@@ -261,18 +263,18 @@ def _warm_int8(device: Any) -> int:
             how = rules.get(name)
             if how is None or how in ("cs",):           # a calibration vector it has not got: the engine's case
                 continue
-            layer = nn.Linear(k, n).to(device=device, dtype=torch.bfloat16)
+            layer = nn.Linear(k, n).to(device=device, dtype=dt)
             q = int8.Int8Linear(layer, how)
             for rows in WARM_ROWS:
-                q(torch.randn(rows, k, device=device, dtype=torch.bfloat16, generator=g))
+                q(torch.randn(rows, k, device=device, dtype=dt, generator=g))
                 calls += 1
         how = rules.get("fc1")
         if how is not None and how != "cs":
-            fc1 = nn.Linear(1536, 8192).to(device=device, dtype=torch.bfloat16)
-            fc2 = nn.Linear(8192, 1536).to(device=device, dtype=torch.bfloat16)
+            fc1 = nn.Linear(1536, 8192).to(device=device, dtype=dt)
+            fc2 = nn.Linear(8192, 1536).to(device=device, dtype=dt)
             mlp = int8.Int8MLP(fc1, fc2, how, rules.get("fc2") if rules.get("fc2") != "cs" else how)
             for rows in WARM_ROWS:
-                mlp(torch.randn(rows, 1536, device=device, dtype=torch.bfloat16, generator=g))
+                mlp(torch.randn(rows, 1536, device=device, dtype=dt, generator=g))
                 calls += 1
     return calls
 
@@ -531,6 +533,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         if "sage" not in skip:
             say("the SageAttention wheel changed since: its kernels are timed again")
     began = time.monotonic()
+    from pixal3d.modules import precision
+
+    card = precision.profile()
+    record["precision"] = card.name
+    if "triton" not in skip and not card.triton:
+        record["triton"] = {"ok": True, "skipped": f"no Triton on this card ({card.name} profile)"}
+        skip |= {"triton"}
+    if "convolutions" not in skip and card.conv != "flex_gemm":
+        record["flex_gemm"] = {"ok": True, "skipped": f"the sparse convolutions run on {card.conv} on this card"}
+        skip |= {"convolutions"}
     if "triton" not in skip:
         progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 4)")
         _timed("triton", lambda: _triton(device), record)

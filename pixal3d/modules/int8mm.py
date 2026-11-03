@@ -29,9 +29,14 @@ Paths (`path=`; None = the table PATHS, chosen from the round-I measurements on 
                [N, K / 128] (quantize_weight(group=128)) add one multiply per element and slab (round J).
 The whole block (3 norms + 7 token-sized linears + GELU) runs 2.67-2.83x faster than bf16 (README.md).
 
-Capability gate (`capability()`): int8 tensor-core MMA exists from sm_75 (Turing). torch._int_mm needs sm_75+ and
-cuBLASLt; the Triton kernel needs Triton's int8 mma.sync (m16n8k32), which Triton emits for sm_80+ (Ampere and up);
-only sm_86 (RTX 3060) was measured. Below sm_75, or without Triton for the Triton paths, or when the first-use
+Capability gate (`capability()`): the Triton GEMM needs Triton's int8 mma.sync (m16n8k32), which Triton emits for
+sm_80+ (Ampere and up; only sm_86, an RTX 3060, was measured). Below sm_80 the GEMMs are torch._int_mm's (cuBLASLt:
+the IMMA tensor-core kernels from sm_75, dp4a from sm_61 - exact, 82 TOPS on an RTX 2060 Super, 12-22 on a GTX
+1080; Spellcast3D round L) with per-row scales only, so the layers the policy gives group scales keep the torso's
+dtype there (modules/int8.py); the quantiser and the epilogue are the torch ops (`quantize_rows_torch`,
+`epilogue_torch`), or their Triton twins where Triton runs on the card and gives the same bits at the self-check
+(`_triton_elementwise`; Triton has no int8 MMA for sm_75 but its elementwise kernels run there). The outputs come
+in the torso's dtype (`out_dtype`: bf16, fp16 or fp32; modules/precision.py). Below sm_61, or when the first-use
 self-check (`self_check`) fails, every call runs F.linear on the dequantised weight (the fallback) and says so once.
 """
 
@@ -43,6 +48,8 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+
+from . import precision
 
 GROUP = 128                 # activation group size of the "group" path (= that kernel's BLOCK_K)
 CHUNK_ROWS = 8192           # "intmm": rows per torch._int_mm call (bounds the int32 temporary: 8192 x N x 4 B)
@@ -62,7 +69,9 @@ PATHS: dict = {}
 DEFAULT_PATH = "triton"
 
 _kernels = None
-_state = {"ok": None, "why": "", "warned": False}
+# gemm: "triton" (the fused GEMM, sm_80+) or "intmm" (torch._int_mm); elementwise: the quantiser and epilogue,
+# "triton" or "torch" (decided by ready(), before any self-check: quantize_rows / epilogue dispatch on it)
+_state = {"ok": None, "why": "", "warned": False, "gemm": "", "elementwise": ""}
 
 
 # =====================================================================================================================
@@ -70,19 +79,38 @@ _state = {"ok": None, "why": "", "warned": False}
 # =====================================================================================================================
 
 def capability(device: Optional[torch.device] = None) -> Tuple[bool, bool, str]:
-    """(int8 tensor cores usable at all [torch._int_mm], Triton int8 GEMM usable, the reason when not)."""
+    """(torch._int_mm usable [int8 GEMMs at all], the Triton int8 GEMM usable, the reason when not)."""
     if not torch.cuda.is_available():
         return False, False, "no CUDA device"
-    major, minor = torch.cuda.get_device_capability(device)
-    if (major, minor) < (7, 5):
-        return False, False, f"sm_{major}{minor}: no int8 tensor-core MMA below sm_75"
+    major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
+    if (major, minor) < (6, 1):
+        return False, False, f"sm_{major}{minor}: no int8 GEMM below sm_61 (dp4a)"
+    if major < 8:
+        return True, False, f"sm_{major}{minor}: Triton's int8 mma.sync path needs sm_80+; torch._int_mm serves"
     try:
         import triton  # noqa: F401
     except Exception as exc:        # noqa: BLE001
         return True, False, f"Triton not importable ({type(exc).__name__})"
-    if major < 8:
-        return True, False, f"sm_{major}{minor}: Triton's int8 mma.sync path needs sm_80+; torch._int_mm only"
     return True, True, ""
+
+
+def gemm_path() -> str:
+    """"triton" or "intmm" once ready() has decided ("" before)."""
+    return str(_state["gemm"])
+
+
+def has_group_gemm() -> bool:
+    """Whether group scales on the activations can be applied (the Triton GEMM rescales every 128-K slab;
+    torch._int_mm multiplies over the whole K and takes per-row scales only)."""
+    return _state["gemm"] == "triton"
+
+
+def kernel_name() -> str:
+    gemm_how = {"triton": "Triton int8 GEMMs, the epilogue fused", "intmm": "torch._int_mm (cuBLASLt)"}.get(
+        str(_state["gemm"]), "int8 GEMMs")
+    if _state["gemm"] == "intmm":
+        gemm_how += f", the quantiser and epilogue in {'Triton' if _state['elementwise'] == 'triton' else 'torch'}"
+    return f"int8mm: {gemm_how}"
 
 
 # =====================================================================================================================
@@ -300,7 +328,7 @@ def _build():
         if OUT == 2:
             quant_row(y, Y, QS, row, cols, mask, stride_y)
         else:
-            tl.store(Y + row * stride_y + cols, y.to(tl.bfloat16), mask=mask)
+            tl.store(Y + row * stride_y + cols, y.to(Y.dtype.element_ty), mask=mask)
 
     _kernels = {"quant": quant_rows_kernel, "norm_quant": norm_quant_kernel, "gemm": gemm_kernel,
                 "epilogue": epilogue_kernel, "next_pow2": triton.next_power_of_2, "cdiv": triton.cdiv}
@@ -324,7 +352,15 @@ def quantize_rows(x: torch.Tensor, group: int = 0,
     """bf16 (or fp16 / fp32) [..., K] -> (int8 [M, K], fp32 scales [M] or [M, K // group]); symmetric,
     q = round_half_even(x * (127 / absmax)), scale = absmax / 127 (absmax floored at TINY). inv_smooth: 1 / s
     (fp32 [K], computed once at load) for SmoothQuant's per-input-channel vector s, applied as x * (1 / s) in the
-    same pass (the weight was quantised as W * s: quantize_weight(w, smooth=s))."""
+    same pass (the weight was quantised as W * s: quantize_weight(w, smooth=s)). The Triton kernel where ready()
+    chose it, else the torch ops (the same bits)."""
+    if _state["elementwise"] != "triton":
+        return quantize_rows_torch(x, group, inv_smooth)
+    return quantize_rows_triton(x, group, inv_smooth)
+
+
+def quantize_rows_triton(x: torch.Tensor, group: int = 0,
+                         inv_smooth: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     k = _build()
     K = x.shape[-1]
     flat = x.reshape(-1, K)
@@ -483,12 +519,47 @@ def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tenso
 
 def epilogue(c32: torch.Tensor, xs: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor], *,
              gelu: bool = False, out_int8: bool = False, y: Optional[torch.Tensor] = None,
-             ys: Optional[torch.Tensor] = None):
-    """int32 [M, N] -> bf16 [M, N] (or int8 [M, N] + per-row scales [M]); y / ys: optional outputs to write."""
+             ys: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16):
+    """torch._int_mm's int32 [M, N] -> out_dtype [M, N] (or int8 [M, N] + per-row scales [M]); y / ys: optional
+    outputs to write. The Triton kernel where ready() chose it, else the torch ops."""
+    if _state["elementwise"] != "triton":
+        return epilogue_torch(c32, xs, w_s, bias, gelu=gelu, out_int8=out_int8, y=y, ys=ys, out_dtype=out_dtype)
+    return epilogue_triton(c32, xs, w_s, bias, gelu=gelu, out_int8=out_int8, y=y, ys=ys, out_dtype=out_dtype)
+
+
+def epilogue_torch(c32: torch.Tensor, xs: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor], *,
+                   gelu: bool = False, out_int8: bool = False, y: Optional[torch.Tensor] = None,
+                   ys: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16):
+    """The epilogue in torch ops: the kernel's arithmetic in fp32 in the same order (the scale products, the bias,
+    GELU(tanh)), then the rounding to out_dtype or the row quantiser."""
+    yf = c32.float()
+    yf.mul_(xs[:, None]).mul_(w_s[None, :])
+    if bias is not None:
+        yf.add_(bias[None, :])
+    if gelu:
+        yf = F.gelu(yf, approximate="tanh")
+    if out_int8:
+        q, s = quantize_rows_torch(yf)
+        if y is not None:
+            y.copy_(q)
+            q = y
+        if ys is not None:
+            ys.copy_(s)
+            s = ys
+        return q, s
+    if y is not None:
+        y.copy_(yf)
+        return y
+    return yf.to(out_dtype)
+
+
+def epilogue_triton(c32: torch.Tensor, xs: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor], *,
+                    gelu: bool = False, out_int8: bool = False, y: Optional[torch.Tensor] = None,
+                    ys: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16):
     k = _build()
     M, N = c32.shape
     if y is None:
-        y = torch.empty((M, N), dtype=torch.int8 if out_int8 else torch.bfloat16, device=c32.device)
+        y = torch.empty((M, N), dtype=torch.int8 if out_int8 else out_dtype, device=c32.device)
     if out_int8 and ys is None:
         ys = torch.empty((M,), dtype=torch.float32, device=c32.device)
     if M:
@@ -500,8 +571,8 @@ def epilogue(c32: torch.Tensor, xs: torch.Tensor, w_s: torch.Tensor, bias: Optio
 
 def intmm_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor,
                  bias: Optional[torch.Tensor], *, gelu: bool = False, out_int8: bool = False,
-                 chunk: Optional[int] = CHUNK_ROWS):
-    """torch._int_mm (rows in chunks: the int32 temporary is chunk x N x 4 B) + the Triton epilogue per chunk."""
+                 chunk: Optional[int] = CHUNK_ROWS, out_dtype: torch.dtype = torch.bfloat16):
+    """torch._int_mm (rows in chunks: the int32 temporary is chunk x N x 4 B) + the epilogue per chunk."""
     M, K = xq.shape
     N = w_q.shape[0]
     if M <= 16:                                     # torch._int_mm wants more than 16 rows
@@ -509,10 +580,10 @@ def intmm_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: tor
         pad[:M] = xq
         ps = torch.zeros((17,), dtype=xs.dtype, device=xs.device)
         ps[:M] = xs
-        r = intmm_linear(pad, ps, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, chunk=None)
+        r = intmm_linear(pad, ps, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, chunk=None, out_dtype=out_dtype)
         return (r[0][:M], r[1][:M]) if out_int8 else r[:M]
     wt = w_q.t()                                    # [K, N] column-major: the layout cuBLASLt's IMMA kernels take
-    y = torch.empty((M, N), dtype=torch.int8 if out_int8 else torch.bfloat16, device=xq.device)
+    y = torch.empty((M, N), dtype=torch.int8 if out_int8 else out_dtype, device=xq.device)
     ys = torch.empty((M,), dtype=torch.float32, device=xq.device) if out_int8 else None
     step = M if not chunk or chunk >= M else chunk
     buf = torch.empty((step, N), dtype=torch.int32, device=xq.device)
@@ -523,7 +594,7 @@ def intmm_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: tor
         c = buf[: r1 - r0]
         torch._int_mm(xq[r0:r1], wt, out=c)
         epilogue(c, xs[r0:r1], w_s, bias, gelu=gelu, out_int8=out_int8, y=y[r0:r1],
-                 ys=ys[r0:r1] if ys is not None else None)
+                 ys=ys[r0:r1] if ys is not None else None, out_dtype=out_dtype)
     return (y, ys) if out_int8 else y
 
 
@@ -536,34 +607,42 @@ def dequantize_rows(xq: torch.Tensor, xs: torch.Tensor) -> torch.Tensor:
 
 
 def _fallback(x2: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor],
-              gelu: bool) -> torch.Tensor:
-    w = dequantize_rows(w_q, w_s).to(x2.dtype if x2.dtype.is_floating_point else torch.bfloat16)
+              gelu: bool, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+    w = dequantize_rows(w_q, w_s).to(x2.dtype if x2.dtype.is_floating_point else out_dtype)
     y = F.linear(x2.to(w.dtype), w, bias.to(w.dtype) if bias is not None else None)
     return F.gelu(y, approximate="tanh") if gelu else y
 
 
 def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: torch.Tensor, w_s: torch.Tensor,
                 bias: Optional[torch.Tensor] = None, *, gelu: bool = False, path: Optional[str] = None,
-                out_int8: bool = False, inv_smooth: Optional[torch.Tensor] = None):
-    """y = x @ W^T + b [GELU tanh] with W = w_q * w_s[:, None]; x: bf16 [..., K] or a pre-quantised (x_q [M, K],
-    x_s) pair (x_s [M]: per row; x_s [M, K / 128]: group scales, the "group" path). Returns bf16 [..., N], or
-    (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M] per row).
-    w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the "group"
-    path. inv_smooth: 1 / s [K] applied to a bf16 x as it is quantised (the weight holds W * s)."""
+                out_int8: bool = False, inv_smooth: Optional[torch.Tensor] = None,
+                out_dtype: torch.dtype = torch.bfloat16):
+    """y = x @ W^T + b [GELU tanh] with W = w_q * w_s[:, None]; x: [..., K] in the torso's dtype or a pre-quantised
+    (x_q [M, K], x_s) pair (x_s [M]: per row; x_s [M, K / 128]: group scales, the "group" path). Returns out_dtype
+    [..., N], or (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M]
+    per row). w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the
+    "group" path. inv_smooth: 1 / s [K] applied to x as it is quantised (the weight holds W * s). Where the card has
+    no group GEMM (has_group_gemm), group scales take the fallback."""
     pre = isinstance(x, tuple)
     K = w_q.shape[1]
     N = w_q.shape[0]
     lead = None if pre else x.shape[:-1]
     if w_s.dim() == 2:
         path = "group"
-    if not enabled(x[0] if pre else x):
+    on = enabled(x[0] if pre else x)
+    if on and not has_group_gemm():
+        if path == "group" or (pre and x[1].dim() == 2):
+            on = False
+        else:
+            path = "intmm"
+    if not on:
         if pre:
-            x2 = dequantize_rows(*x).to(torch.bfloat16)
+            x2 = dequantize_rows(*x).to(out_dtype)
         else:
             x2 = x.reshape(-1, K)
             if inv_smooth is not None:
-                x2 = (x2.float() * inv_smooth.float()).to(torch.bfloat16)
-        y = _fallback(x2, w_q, w_s, bias, gelu)
+                x2 = (x2.float() * inv_smooth.float()).to(out_dtype)
+        y = _fallback(x2, w_q, w_s, bias, gelu, out_dtype)
         if out_int8:
             return quantize_rows_torch(y)
         return y if pre else y.view(*lead, N)
@@ -578,18 +657,23 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
     else:
         group = GROUP if path == "group" else 0
         xq, xs = quantize_rows(x, group, inv_smooth)
+    if path == "triton" and out_dtype not in _OUT_NAME:       # the Triton GEMM writes bf16 / fp16 (or int8)
+        path = "intmm"
     if path == "intmm":
-        y = intmm_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_int8=out_int8)
+        y = intmm_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, out_dtype=out_dtype)
     else:
-        y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else "bf16", group=group)
+        y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else _OUT_NAME[out_dtype], group=group)
     if out_int8 or pre:
         return y
     return y.view(*lead, N)
 
 
+_OUT_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}     # gemm()'s `out` for an output dtype
+
+
 def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tuple, w2: tuple, *,
              path: str = "rows", cfg1: Optional[tuple] = None,
-             inv_smooth2: Optional[torch.Tensor] = None) -> torch.Tensor:
+             inv_smooth2: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
     """fc2(GELU(fc1(x))): w1, w2 = (w_q, w_s, bias).
     "rows" (fastest measured: 15.5 ms at M = 21504 vs 41.4 bf16): fc1 Triton with GELU -> bf16, quantize_rows,
            fc2 Triton (per-row scales everywhere, like the other layers);
@@ -600,17 +684,21 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
     "intmm": torch._int_mm, fc1's epilogue quantises each full row for fc2's torch._int_mm: 16.6 ms."""
     if inv_smooth2 is not None and path != "group":
         raise ValueError("fc2's smoothing is applied in the group path's fc1 epilogue only")
+    if path == "rows" and out_dtype not in _OUT_NAME:
+        path = "intmm"
     if path == "rows":
         xq, xs = x if isinstance(x, tuple) else quantize_rows(x)
-        h = gemm(xq, xs, *w1, gelu=True, group=GROUP if xs.dim() == 2 else 0)
-        return gemm(*quantize_rows(h), *w2)
+        h = gemm(xq, xs, *w1, gelu=True, group=GROUP if xs.dim() == 2 else 0, out=_OUT_NAME[out_dtype])
+        return gemm(*quantize_rows(h), *w2, out=_OUT_NAME[out_dtype])
     if path == "intmm":
         if isinstance(x, tuple):
             xq, xs = x
         else:
             xq, xs = quantize_rows(x)
         hq, hs = intmm_linear(xq, xs, *w1, gelu=True, out_int8=True)
-        return intmm_linear(hq, hs, *w2)
+        return intmm_linear(hq, hs, *w2, out_dtype=out_dtype)
+    if out_dtype not in _OUT_NAME:
+        raise ValueError(f"the group path's fc2 GEMM writes bf16 or fp16, not {out_dtype}")
     if isinstance(x, tuple):
         xq, xs = x
     else:
@@ -623,7 +711,7 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
         cfg1 = (cfg1[0], GROUP) + tuple(cfg1[2:])
     hq, hs = gemm(xq, xs, *w1, gelu=True, out="int8", group=GROUP if xs.dim() == 2 else 0, cfg=cfg1,
                   out_smooth=inv_smooth2)
-    return gemm(hq, hs, *w2, group=GROUP, cfg=CFG_GROUP)
+    return gemm(hq, hs, *w2, group=GROUP, cfg=CFG_GROUP, out=_OUT_NAME[out_dtype])
 
 
 # =====================================================================================================================
@@ -710,34 +798,42 @@ def bf16_ulps(got: torch.Tensor, want64: torch.Tensor) -> Tuple[float, float]:
 
 
 def self_check(device: torch.device) -> Tuple[bool, str]:
-    """Every path once on small tables (M = 300: masked tails), against fp64 from the same int8 operands: the
-    integer part exactly, the bf16 outputs within the epilogue's fp32 rounding (within() <= 1). Done once per
-    process before the first int8 call."""
+    """Every path the card uses once on small tables (M = 300: masked tails), against fp64 from the same int8
+    operands: the integer part exactly, the outputs (in the torso's dtype) within the epilogue's fp32 rounding
+    (within() <= 1). Done once per process before the first int8 call."""
     try:
         g = torch.Generator(device=device).manual_seed(0)
+        dt = precision.torso()
         M, K, N = 300, 256, 384
-        x = torch.randn((M, K), device=device, dtype=torch.bfloat16, generator=g)
-        w = torch.randn((N, K), device=device, dtype=torch.bfloat16, generator=g) * 0.05
-        b = torch.randn((N,), device=device, dtype=torch.bfloat16, generator=g)
+        x = torch.randn((M, K), device=device, dtype=dt, generator=g)
+        w = torch.randn((N, K), device=device, dtype=dt, generator=g) * 0.05
+        b = torch.randn((N,), device=device, dtype=dt, generator=g)
         xq, xs = quantize_rows(x)
         rq, rs = quantize_rows_torch(x)
         if not (torch.equal(xq, rq) and torch.equal(xs, rs)):
             return False, "quantize_rows differs from the torch reference"
         wq, ws = quantize_weight(w)
         exact = reference_int(xq, wq)
-        tri = gemm(xq, xs, wq, ws, None, out="int32", cfg=(64, 64, 64, 8, 3, 4))
-        if not torch.equal(tri.to(torch.int64), exact):
-            return False, "the Triton int8 GEMM's integer product is wrong"
+        triton_gemm = has_group_gemm()
+        if triton_gemm:
+            tri = gemm(xq, xs, wq, ws, None, out="int32", cfg=(64, 64, 64, 8, 3, 4))
+            if not torch.equal(tri.to(torch.int64), exact):
+                return False, "the Triton int8 GEMM's integer product is wrong"
         if not torch.equal(torch._int_mm(xq, wq.t()).to(torch.int64), exact):
             return False, "torch._int_mm's integer product is wrong"
         mag = reference_mag(xq, xs, wq, ws, b)
         for gelu in (False, True):
             want = reference(xq, xs, wq, ws, b, gelu)
-            for name, got in (("triton", gemm(xq, xs, wq, ws, b, gelu=gelu, cfg=(64, 64, 64, 8, 3, 4))),
-                              ("intmm", intmm_linear(xq, xs, wq, ws, b, gelu=gelu))):
+            got_by = {"intmm": intmm_linear(xq, xs, wq, ws, b, gelu=gelu, out_dtype=dt)}
+            if triton_gemm:
+                got_by["triton"] = gemm(xq, xs, wq, ws, b, gelu=gelu, cfg=(64, 64, 64, 8, 3, 4))
+            for name, got in got_by.items():
                 worst, _ = within(got, want, mag, gelu=gelu)
                 if worst > 1.0:
                     return False, f"{name} (gelu={gelu}) is {worst:.2f}x the fp32-rounding bound off"
+        if not triton_gemm:
+            torch.cuda.synchronize(device)
+            return True, ""
         gq, gs = quantize_rows(x, GROUP)
         rq, rs = quantize_rows_torch(x, GROUP)
         if not (torch.equal(gq, rq) and torch.equal(gs, rs)):
@@ -793,14 +889,48 @@ def _check_group_weights(device: torch.device, g: torch.Generator, x: torch.Tens
     return True, ""
 
 
+def _triton_elementwise(device: torch.device) -> bool:
+    """Whether the Triton quantiser and epilogue run on this card and give the torch ops' bits (a card below sm_80:
+    Triton may run there, or not - Windows builds for Turing are untested - so nothing depends on it)."""
+    if not precision.profile().triton:
+        return False
+    try:
+        g = torch.Generator(device=device).manual_seed(1)
+        x = torch.randn((300, 256), device=device, dtype=precision.torso(), generator=g)
+        for group in (0, GROUP):
+            tq, ts = quantize_rows_triton(x, group)
+            rq, rs = quantize_rows_torch(x, group)
+            if not (torch.equal(tq, rq) and torch.equal(ts, rs)):
+                return False
+        c32 = torch.randint(-2 ** 20, 2 ** 20, (300, 384), device=device, dtype=torch.int32, generator=g)
+        xs = torch.rand((300,), device=device, generator=g) + 0.5
+        ws = torch.rand((384,), device=device, generator=g) + 0.5
+        b = torch.randn((384,), device=device, generator=g)
+        for gelu in (False, True):
+            got = epilogue_triton(c32, xs, ws, b, gelu=gelu, out_dtype=torch.float32)
+            want = epilogue_torch(c32, xs, ws, b, gelu=gelu, out_dtype=torch.float32)
+            if not bool(((got - want).abs() <= 2.0 ** -20 * want.abs() + 2.0 ** -20).all()):
+                return False
+        torch.cuda.synchronize(device)
+    except Exception:       # noqa: BLE001 - whatever Triton or the card raises: the torch ops serve
+        return False
+    return True
+
+
 def ready(device: torch.device) -> Tuple[bool, str]:
     """Whether the kernels run on this card (the capability gate, then the self-check once per process): (yes,
-    the reason when not). Cached."""
+    the reason when not). Cached. Decides the GEMM path (the Triton GEMM on sm_80+, torch._int_mm below) and the
+    elementwise kernels (Triton where it gives the torch ops' bits, else the torch ops) before the self-check."""
     if _state["ok"] is None:
         ok_mm, ok_triton, why = capability(device)
-        if not (ok_mm and ok_triton):
+        if not ok_mm:
             _state["ok"], _state["why"] = False, why
         else:
+            if ok_triton:
+                _state["gemm"], _state["elementwise"] = "triton", "triton"
+            else:
+                _state["gemm"] = "intmm"
+                _state["elementwise"] = "triton" if _triton_elementwise(device) else "torch"
             _state["ok"], _state["why"] = self_check(device)
     return bool(_state["ok"]), str(_state["why"])
 

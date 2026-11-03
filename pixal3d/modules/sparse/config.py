@@ -25,8 +25,11 @@ def __from_env():
         DEBUG = env_sparse_debug == '1'
     if env_sparse_attn_backend is not None and env_sparse_attn_backend in ['xformers', 'flash_attn', 'flash_attn_3', 'flash_attn_4', 'sdpa']:
         ATTN = env_sparse_attn_backend
-        
-    from .. import sage
+
+    # a backend without kernels for this card is replaced by the card's (modules/precision.py)
+    from .. import precision, sage
+    ATTN = precision.attention_backend(ATTN)
+    CONV = precision.conv_backend(CONV, explicit=env_sparse_conv_backend is not None)
     SAGE = sage.from_env()
 
     print(f"[SPARSE] Conv backend: {CONV}; Attention backend: {ATTN}"

@@ -36,6 +36,7 @@ from typing import Any, Callable
 
 import torch
 
+from ..modules import precision
 from ..modules.sparse import SparseTensor
 from . import hi3d
 from .runner import PartContext, PropState
@@ -586,9 +587,9 @@ def _bundle_mib(value: Any) -> float:
     return 0.0
 
 
-def _bf16(cond: dict) -> dict:
+def _torso(cond: dict) -> dict:
     """A conditioning as it is stored: the cast the denoisers make of it in every pass, made once."""
-    return {name: value.type(torch.bfloat16) for name, value in cond.items()}
+    return {name: value.type(precision.torso()) for name, value in cond.items()}
 
 
 def _as_reference_layout(cond: dict, multi: bool) -> dict:
@@ -678,7 +679,7 @@ def features(ctx: PartContext, prop: PropState, mode: str) -> None:
     source, view = _source(ctx, prop)
     z512 = proj_cond.encode(dino, proj_cond.image_tensor(source, 512, ctx.device))
     z1024 = proj_cond.encode(dino, proj_cond.image_tensor(source, 1024, ctx.device))
-    cond = _bf16(proj_cond.cond_dense(proj_cond.SPECS["ss"], z512, view))
+    cond = _torso(proj_cond.cond_dense(proj_cond.SPECS["ss"], z512, view))
     if geometry(prop) != "hi3d":            # cond_lr's: a Hi3D prop has no cond_lr
         ctx.store.put_device(prop.id, "dino512", {"z": z512})
     ctx.store.put_device(prop.id, "dino1024", {"z": z1024})
@@ -743,7 +744,7 @@ def cond_lr(ctx: PartContext, prop: PropState, mode: str) -> None:
     coords = ctx.store.get_small(prop.id, "coords_ss")["coords"].to(ctx.device)
     z512 = ctx.take(prop, "dino512")["z"]
     image = proj_cond.image_tensor(source, 512, ctx.device)
-    cond = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_512"], z512, image, naf, view, coords, 32))
+    cond = _torso(proj_cond.cond_tokens(proj_cond.SPECS["shape_512"], z512, image, naf, view, coords, 32))
     ctx.store.put_device(prop.id, "cond_lr", cond)
     _keep_bundle(ctx, prop, source)
 
@@ -829,7 +830,7 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     z1024 = ctx.take(prop, "dino1024")["z"]
     image = proj_cond.image_tensor(source, 1024, ctx.device)
     if geometry(prop) == "hi3d":
-        tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
+        tex = _torso(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
         ctx.store.put_device(prop.id, "cond_tex", tex)
         return
     together = mode == "normal"
@@ -838,15 +839,15 @@ def cond_hr(ctx: PartContext, prop: PropState, mode: str) -> None:
     if together and pair_fn is not None:
         try:
             pair = pair_fn(proj_cond.SPECS["shape_1024"], proj_cond.SPECS["tex_1024"], z1024, image, naf, view,
-                           coords, grid, first_dtype=torch.bfloat16)
+                           coords, grid, first_dtype=precision.torso())
         except ValueError:          # nothing to share for this NAF or picture: the two calls, as before
             pair = None
     if pair is not None:
-        shape, tex = _bf16(pair[0]), _bf16(pair[1])
+        shape, tex = _torso(pair[0]), _torso(pair[1])
     else:
-        shape = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["shape_1024"], z1024, image, naf, view, coords, grid))
+        shape = _torso(proj_cond.cond_tokens(proj_cond.SPECS["shape_1024"], z1024, image, naf, view, coords, grid))
         ctx.loader.trim()       # the texture conditioning is the widest moment of a prop: it starts from a clean cache
-        tex = _bf16(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
+        tex = _torso(proj_cond.cond_tokens(proj_cond.SPECS["tex_1024"], z1024, image, naf, view, coords, grid))
     ctx.store.put_device(prop.id, "cond_hr", shape)
     ctx.store.put_device(prop.id, "cond_tex", tex)
 

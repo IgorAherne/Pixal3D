@@ -43,9 +43,12 @@ TORCHVISION_VERSION = "0.23.0"
 TORCHAUDIO_VERSION = "2.8.0"
 TORCH_INDEX_URL = "https://download.pytorch.org/whl/cu128"
 
-# Flash-attention and NATTEN kernels are only built for Ampere and newer.
-MIN_CC_FOR_FLASH_ATTN = 8
-MIN_CC_FOR_NATTEN = 8
+# Flash-attention and NATTEN kernels are only built for Ampere and newer, but both wheels import on every card
+# (their kernels load lazily) and are installed on every card: the NAF checkout imports natten when it is built,
+# and the verification below imports flash_attn. Below sm_80 the engine's precision profile never calls them
+# (pixal3d/modules/precision.py: torch's SDPA for the attention, NAF's neighborhood attention in plain torch).
+MIN_CC_FOR_FLASH_ATTN = 0
+MIN_CC_FOR_NATTEN = 0
 
 # Mirror for the big wheels. Populate this release and it will be preferred over
 # the upstream community builds below.
@@ -709,8 +712,8 @@ def verify_installation():
                 import natten
                 print(f"[OK] natten {natten.__version__} detected (HAS_LIBNATTEN={getattr(natten, 'HAS_LIBNATTEN', '?')}).")
             except ImportError:
-                print("[WARNING] natten not found - NAF upsampling will fail. "
-                      "Expected on pre-Ampere GPUs (sm_75 and older).")
+                print("[WARNING] natten not found - NAF cannot be built without it (its attention module imports "
+                      "natten; below sm_80 the engine runs that attention in plain torch, but the import must work).")
 
         try:
             from PIL import Image

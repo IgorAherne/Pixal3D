@@ -34,6 +34,13 @@ def convert_module_to_f32(l):
             p.data = p.data.float()
 
 
+def stream_dtype(dtype):
+    """The dtype a flow's residual stream runs in for a torso of `dtype`: fp32 for an fp16 torso (the stream, the
+    running sum over the 30 blocks, reaches 1.1e5 at the late steps of the lr and hr flows - past fp16's 65,504 -
+    while the sub-layers' outputs stay below 5,000: Spellcast3D round L's probe), the torso's own dtype otherwise."""
+    return torch.float32 if dtype == torch.float16 else dtype
+
+
 def convert_module_to(l, dtype):
     """
     Convert primitive modules to the given dtype.

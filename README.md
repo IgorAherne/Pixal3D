@@ -78,9 +78,13 @@ included in `packages`, after which this check just passes.
 
 ### GPU requirements
 
-Ampere (RTX 30xx) or newer. `flash_attn` and `natten` have no pre-Ampere kernels — on older cards
-the installer skips both, `xformers` covers attention, but the NAF feature upsampler used by the
-shape and texture stages will not run.
+GTX 10xx (sm_61) or newer. On Ampere (RTX 30xx) and newer the flows run in bf16 with flash_attn, natten,
+SageAttention and the Triton kernels, as upstream. Below that the precision profile
+(`pixal3d/modules/precision.py`) runs the same networks with what the card has: the flows' torso in fp16
+(Turing: RTX 20xx, GTX 16xx) or fp32 (Pascal: GTX 10xx), attention on torch's SDPA (xformers on request), the int8 GEMMs
+through cuBLASLt (`torch._int_mm`), NAF's neighborhood attention in plain torch (`natten`'s wheel is sm_80+)
+and the decoders' sparse convolutions on spconv (flex_gemm's are Triton kernels). `PIXAL3D_PRECISION`
+forces a profile (developers).
 
 ---
 
