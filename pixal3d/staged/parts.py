@@ -412,6 +412,26 @@ def ram_available_mib() -> int | None:
         return None
 
 
+# Without the decode in boxes (models/sc_vaes/chunked.py: flex_gemm's masked kernel only), the decoders decode a
+# level whole: the texture decoder of a 1536 prop then ran out of an 8 GB card's memory (an RTX 2060 Super on spconv,
+# the knight; Spellcast3D round L), so such a card makes its props at 1024. A card with this much decodes 1536 whole.
+WHOLE_LEVEL_1536_MIB = 10 * 1024
+
+
+def _decodes_in_boxes() -> bool:
+    from ..modules.sparse import config as sparse_config
+    from ..modules.sparse.conv import config as conv_config
+
+    return sparse_config.CONV == "flex_gemm" and conv_config.FLEX_GEMM_ALGO == "masked_implicit_gemm_splitk"
+
+
+def _card_total_mib(ctx: PartContext) -> float:
+    try:
+        return torch.cuda.get_device_properties(ctx.device).total_memory / (1 << 20)
+    except Exception:       # noqa: BLE001 - no card to ask (the fakes): no cap from here
+        return float("inf")
+
+
 def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int,
                     voxels: int | None = None) -> str | None:
     """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
@@ -424,6 +444,8 @@ def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: in
     if limits is not None:
         finish_limit, cap_now = limits
         if finish_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens) > cap_now:
+            return "card"
+        if resolution > 1024 and not _decodes_in_boxes() and _card_total_mib(ctx) < WHOLE_LEVEL_1536_MIB:
             return "card"
     available = ram_available_mib()
     if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
