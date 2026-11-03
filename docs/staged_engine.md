@@ -485,7 +485,12 @@ stream, the running sum over the 30 blocks, reaches 1.1e5 at the late steps of t
 sub-layer's output times its modulation gate passes 65,504 too, while the sub-layers' own outputs stay below
 5,000 (round L's `fp16probe.py`); the blocks cast the normalised, modulated input to the torso's dtype for the
 sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream's dtype - no-ops on a bf16 torso.
-The decoders' backend below sm_80 is spconv (CUDA kernels from sm_61). flex_gemm's Triton convolutions give
+The decoders' backend below sm_80 is spconv. Its GEMM kernels are prebuilt for sm_60, 70, 75, 80, 86, 89 and 90
+only: on another card (a GTX 10xx is sm_61) spconv compiles them at run time through NVRTC, which cannot work from
+the wheel (no headers shipped, no include path given: a GTX 1080 failed its first decoder convolution so), and such
+a card runs spconv's Native algorithm with the products on torch.mm, one GEMM per kernel offset
+(`conv_spconv.indice_conv_torch`: spconv's kernels' sums to 4e-7, 1.2-1.6x their time on the RTX 3060's check,
+`round-l/spconv_products_check.py`; its index tables are spconv's own kernels still). flex_gemm's Triton convolutions give
 spconv's answers on an RTX 2060 Super and decode in boxes (`chunked.py`), but their tile tuning at the install's
 calibration took 25-95 minutes a shape there (13 shapes), so they are tried only on request:
 `PIXAL3D_TURING_FLEX_GEMM=on` at the calibration runs `modules/sparse/conv/backend_check.py` and records the

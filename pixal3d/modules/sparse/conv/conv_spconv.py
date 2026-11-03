@@ -6,12 +6,22 @@ them (`weight` [Co, Kd, Kh, Kw, Ci] - spconv's KRSC layout is the same - and `bi
 load unchanged whatever the backend. The spconv module is kept aside, unregistered (its parameters would otherwise
 appear under `conv.` in the state dict), and lent the parameters at every call: the loader replaces the Parameter
 objects when it assigns the weights (load_state_dict(assign=True)), so a one-off alias would go stale.
+
+spconv's GEMM kernels are prebuilt for sm_60, 70, 75, 80, 86, 89 and 90 only; on another card (a GTX 10xx is sm_61)
+spconv compiles them at run time through NVRTC, which cannot work from the wheel: no headers are shipped and no
+include path is given ("could not open source file tensorview/core/all.h", a GTX 1080). Such a card runs spconv's
+Native algorithm with the products on torch.mm, one GEMM per kernel offset (`indice_conv_torch`, put in place of
+spconv's ops.indice_conv, which its module reaches for subm, strided and inverse convolutions alike).
 """
+from typing import Optional
+
 import torch
 import torch.nn as nn
 from .. import SparseTensor
+from ... import precision
 from . import config
 import spconv.pytorch as spconv
+from spconv.pytorch import ops as spconv_ops
 
 
 def _own(self, conv) -> None:
@@ -38,8 +48,52 @@ def _lent(self):
     return conv
 
 
+def indice_conv_torch(features, filters, indice_pairs, indice_pair_num, num_activate_out, inverse=False, subm=False,
+                      algo=None, timer=None, bias=None, act_alpha=0.0, act_beta=0.0, act_type=None):
+    """spconv's gather - product - scatter convolution (ops.indice_conv, its Native algorithm) with the products on
+    torch.mm: for every kernel offset, the rows that offset pairs times the offset's [Ci, Co] slice of the KRSC
+    weight, summed into the output rows (fp32 rounding order apart, spconv's kernels' sums)."""
+    if act_type is not None and act_type != spconv_ops.tv.gemm.Activation.None_:
+        raise NotImplementedError("a fused activation")
+    co, ci = filters.shape[0], filters.shape[-1]
+    w = filters.reshape(co, -1, ci)                         # [Co, kv, Ci]
+    kv = w.shape[1]
+    centre = kv // 2
+    counts = indice_pair_num.tolist()                       # the host sync spconv's own path has
+    pair_in, pair_out = indice_pairs[int(inverse)], indice_pairs[int(not inverse)]
+    out = torch.mm(features, w[:, centre].t()) if subm else features.new_zeros((num_activate_out, co))
+    for i, n in enumerate(counts):
+        if subm and i == centre:
+            continue
+        if subm and i > centre:                             # a subm's far half mirrors the near half's pairs
+            n = counts[kv - i - 1]
+        if n <= 0:
+            continue
+        rows = features.index_select(0, pair_in[i, :n].long())
+        out.index_add_(0, pair_out[i, :n].long(), torch.mm(rows, w[:, i].t()))
+    if bias is not None:
+        out += bias
+    return out
+
+
+_torch_products: Optional[bool] = None
+
+
+def _products_in_torch() -> bool:
+    """True on a card whose spconv GEMM kernels are not prebuilt (the module's docstring): the first call puts
+    indice_conv_torch in place of spconv's ops.indice_conv, which spconv's functional module looks up at each call."""
+    global _torch_products
+    if _torch_products is None:
+        from spconv.core_cc.cumm.common import CompileInfo
+        cc = precision.profile().capability
+        _torch_products = cc is not None and not CompileInfo.arch_is_compiled_gemm(tuple(cc))
+        if _torch_products:
+            spconv_ops.indice_conv = indice_conv_torch
+    return _torch_products
+
+
 def _algo():
-    if config.SPCONV_ALGO == 'native':
+    if config.SPCONV_ALGO == 'native' or _products_in_torch():
         return spconv.ConvAlgo.Native
     if config.SPCONV_ALGO == 'implicit_gemm':
         return spconv.ConvAlgo.MaskImplicitGemm
