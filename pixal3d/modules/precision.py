@@ -100,8 +100,23 @@ def _make(name: str, cc: Optional[tuple[int, int]]) -> Profile:
     if name == "ampere":
         return Profile(name, cc, torch.bfloat16, "flash_attn", "flex_gemm", True, True, False)
     if name == "turing":
-        return Profile(name, cc, torch.float16, _attention_for(cc or (7, 5)), "spconv", True, True, True)
+        return Profile(name, cc, torch.float16, _attention_for(cc or (7, 5)), _recorded_conv(), True, True, True)
     return Profile(name, cc, torch.float32, "sdpa", "spconv", False, False, True)
+
+
+def _recorded_conv() -> str:
+    """The sparse convolutions' backend below sm_80: flex_gemm where the install's calibration found its Triton
+    kernels giving spconv's answers on this card (the record's "conv_backend" section, made by
+    modules/sparse/conv/backend_check.py), spconv otherwise - and always for a process that cannot see the card."""
+    try:
+        from .. import calibration
+
+        found = calibration.section("conv_backend")
+    except Exception:       # noqa: BLE001 - no record, no card: spconv
+        found = None
+    if found and found.get("ok", True) and found.get("backend") == "flex_gemm":
+        return "flex_gemm"
+    return "spconv"
 
 
 def _attention_for(cc: tuple[int, int]) -> str:

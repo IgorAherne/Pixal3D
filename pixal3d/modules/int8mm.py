@@ -95,20 +95,46 @@ def capability(device: Optional[torch.device] = None) -> Tuple[bool, bool, str]:
 
 
 def gemm_path() -> str:
-    """"triton" or "intmm" once ready() has decided ("" before)."""
+    """"triton" (sm_80+), "cuda" (pixal3d_kernels' group-scaled GEMM, Turing and Pascal) or "intmm" (torch._int_mm,
+    per-row scales only) once ready() has decided ("" before)."""
     return str(_state["gemm"])
 
 
 def has_group_gemm() -> bool:
-    """Whether group scales on the activations can be applied (the Triton GEMM rescales every 128-K slab;
-    torch._int_mm multiplies over the whole K and takes per-row scales only)."""
-    return _state["gemm"] == "triton"
+    """Whether group scales on the activations can be applied (the Triton GEMM and pixal3d_kernels' rescale every
+    128-K slab; torch._int_mm multiplies over the whole K and takes per-row scales only)."""
+    return _state["gemm"] in ("triton", "cuda")
+
+
+_cuda_op = None
+
+
+def cuda_gemm_op() -> Optional[Callable]:
+    """pixal3d_kernels' int8_gemm_group (Spellcast3D round L: W8A8 with group scales on Turing's tensor cores and
+    Pascal's dp4a; its README holds the contract), or None where the package is not installed."""
+    global _cuda_op
+    if _cuda_op is None:
+        try:
+            import pixal3d_kernels  # noqa: F401  (registers torch.ops.pixal3d_kernels)
+
+            _cuda_op = torch.ops.pixal3d_kernels.int8_gemm_group
+        except Exception:       # noqa: BLE001 - no package, or one that does not load: torch._int_mm serves
+            _cuda_op = False
+    return _cuda_op or None
+
+
+def cuda_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor,
+                bias: Optional[torch.Tensor], *, gelu: bool = False, out_dtype: torch.dtype = torch.float16):
+    """pixal3d_kernels' GEMM: int8 [M, K] with per-row or group scales x int8 [N, K] with per-channel or
+    per-channel-and-group scales -> out_dtype [M, N], the bias and GELU in its epilogue (int8mm.reference's sums)."""
+    return cuda_gemm_op()(xq, xs, w_q, w_s, bias, gelu, out_dtype, 0, 0)
 
 
 def kernel_name() -> str:
-    gemm_how = {"triton": "Triton int8 GEMMs, the epilogue fused", "intmm": "torch._int_mm (cuBLASLt)"}.get(
-        str(_state["gemm"]), "int8 GEMMs")
-    if _state["gemm"] == "intmm":
+    gemm_how = {"triton": "Triton int8 GEMMs, the epilogue fused",
+                "cuda": "pixal3d_kernels' group-scaled int8 GEMM, torch._int_mm (cuBLASLt) for the per-row layers",
+                "intmm": "torch._int_mm (cuBLASLt)"}.get(str(_state["gemm"]), "int8 GEMMs")
+    if _state["gemm"] in ("intmm", "cuda"):
         gemm_how += f", the quantiser and epilogue in {'Triton' if _state['elementwise'] == 'triton' else 'torch'}"
     return f"int8mm: {gemm_how}"
 
@@ -659,8 +685,14 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
         xq, xs = quantize_rows(x, group, inv_smooth)
     if path == "triton" and out_dtype not in _OUT_NAME:       # the Triton GEMM writes bf16 / fp16 (or int8)
         path = "intmm"
+    if _state["gemm"] == "cuda":                                 # pixal3d_kernels for group scales, cuBLASLt per row
+        path = "cuda" if group else "intmm"
     if path == "intmm":
         y = intmm_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, out_dtype=out_dtype)
+    elif path == "cuda":
+        y = cuda_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_dtype=out_dtype)
+        if out_int8:
+            y = quantize_rows(y, GROUP)
     else:
         y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else _OUT_NAME[out_dtype], group=group)
     if out_int8 or pre:
@@ -697,6 +729,10 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
             xq, xs = quantize_rows(x)
         hq, hs = intmm_linear(xq, xs, *w1, gelu=True, out_int8=True)
         return intmm_linear(hq, hs, *w2, out_dtype=out_dtype)
+    if _state["gemm"] == "cuda":
+        xq, xs = x if isinstance(x, tuple) else quantize_rows(x, GROUP)
+        h = cuda_linear(xq, xs, *w1, gelu=True, out_dtype=out_dtype)
+        return cuda_linear(*quantize_rows(h, GROUP, inv_smooth2), *w2, out_dtype=out_dtype)
     if out_dtype not in _OUT_NAME:
         raise ValueError(f"the group path's fc2 GEMM writes bf16 or fp16, not {out_dtype}")
     if isinstance(x, tuple):
@@ -831,6 +867,22 @@ def self_check(device: torch.device) -> Tuple[bool, str]:
                 worst, _ = within(got, want, mag, gelu=gelu)
                 if worst > 1.0:
                     return False, f"{name} (gelu={gelu}) is {worst:.2f}x the fp32-rounding bound off"
+        if _state["gemm"] == "cuda":
+            gq, gs = quantize_rows(x, GROUP)
+            for gelu in (False, True):
+                got = cuda_linear(gq, gs, wq, ws, b, gelu=gelu, out_dtype=dt)
+                worst, _ = within(got, reference(gq, gs, wq, ws, b, gelu), reference_mag(gq, gs, wq, ws, b),
+                                  c=4 + K // GROUP, gelu=gelu)
+                if worst > 1.0:
+                    return False, f"pixal3d_kernels' group GEMM (gelu={gelu}) {worst:.2f}x the fp32-rounding bound off"
+            wg, wgs = quantize_weight(w, group=GROUP)
+            got = cuda_linear(gq, gs, wg, wgs, b, out_dtype=dt)
+            worst, _ = within(got, reference(gq, gs, wg, wgs, b), reference_mag(gq, gs, wg, wgs, b),
+                              c=4 + 2 * K // GROUP)
+            if worst > 1.0:
+                return False, f"pixal3d_kernels' group-weight GEMM {worst:.2f}x the fp32-rounding bound off"
+            if not torch.equal(cuda_linear(xq, xs, wq, ws, None, out_dtype=torch.int32).to(torch.int64), exact):
+                return False, "pixal3d_kernels' integer product is wrong"
         if not triton_gemm:
             torch.cuda.synchronize(device)
             return True, ""
@@ -929,9 +981,14 @@ def ready(device: torch.device) -> Tuple[bool, str]:
             if ok_triton:
                 _state["gemm"], _state["elementwise"] = "triton", "triton"
             else:
-                _state["gemm"] = "intmm"
+                _state["gemm"] = "cuda" if cuda_gemm_op() is not None else "intmm"
                 _state["elementwise"] = "triton" if _triton_elementwise(device) else "torch"
             _state["ok"], _state["why"] = self_check(device)
+            if not _state["ok"] and _state["gemm"] == "cuda":       # the package's kernel failed: per-row layers only
+                print(f"[INT8] pixal3d_kernels' GEMM is left out ({_state['why']}); torch._int_mm serves the per-row "
+                      f"layers", flush=True)
+                _state["gemm"] = "intmm"
+                _state["ok"], _state["why"] = self_check(device)
     return bool(_state["ok"]), str(_state["why"])
 
 

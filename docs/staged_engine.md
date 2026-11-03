@@ -484,7 +484,11 @@ exists); consumer Pascal runs fp16 at a 64th of the fp32 rate (an fp16 attention
 stream, the running sum over the 30 blocks, reaches 1.1e5 at the late steps of the lr and hr flows, and a
 sub-layer's output times its modulation gate passes 65,504 too, while the sub-layers' own outputs stay below
 5,000 (round L's `fp16probe.py`); the blocks cast the normalised, modulated input to the torso's dtype for the
-sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream's dtype - no-ops on a bf16 torso. torch._int_mm (cuBLASLt) multiplies over the whole K with one scale per row, so the layers the
+sub-layers (`inner_dtype`, set by `convert_to`) and apply the gate in the stream's dtype - no-ops on a bf16 torso.
+The decoders' backend below sm_80 is spconv (CUDA kernels from sm_61) unless the install's calibration found
+flex_gemm's Triton convolutions giving spconv's answers on the card (`modules/sparse/conv/backend_check.py`, the
+record's `conv_backend` section; Triton's Windows builds are untested on Turing, so nothing depends on them
+without that check): flex_gemm decodes in boxes (`chunked.py`) and is 3-30x faster per part on the turing profile. torch._int_mm (cuBLASLt) multiplies over the whole K with one scale per row, so the layers the
 int8 policy gives group scales (to_qkv and the MLP) keep the torso's dtype on those cards; the three 1536 -> 1536
 layers run int8. Every network's constructor arguments pass through `precision.model_args` (the loader and the
 copies): a flow's `dtype` becomes the torso's, a decoder's `use_fp16` is turned off on Pascal; the copies of the

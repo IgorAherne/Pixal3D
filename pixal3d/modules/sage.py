@@ -95,6 +95,8 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
+from . import precision
+
 DEFAULT = True      # what an unset PIXAL3D_SAGE means: on, after the self-check (round G: the five test props at 1536
 #                     made with it are of the same quality as with flash_attn - Chamfer 0.17-0.24 % of the bounding-box
 #                     diagonal, the class of the fused kernels' own change - for -20 % of a batch)
@@ -106,6 +108,13 @@ _ON = {"1", "on", "true", "yes"}
 _OFF = {"0", "off", "false", "no"}
 _KERNELS = {"cuda", "triton", "wheel", "cuda-shipped", "cuda-tuned"}     # on, with the kernel forced (docstring)
 _ALIASES = {"cuda-shipped": "wheel", "cuda-tuned": "tuned"}             # PIXAL3D_SAGE spelling -> candidate name
+TURING_OP = "qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d"    # torch.ops.sageattention_qattn_sm75.<this>
+#                     (Spellcast3D round L, the wheel from post7): the tuned sm80 kernel's twin for sm_75 (RTX 20xx) on
+#                     Turing's mma shapes without cp.async, the same arguments and quantisers (the wheel's per_warp_int8,
+#                     whose kernels that wheel carries for sm_75 too), fp16 in and out (the turing profile's torso)
+PASCAL_OP = "sageattn_pascal"   # torch.ops.sageattention_qattn_sm61.<this> (Spellcast3D round L, the wheel from post7):
+#                     int8 Q.K^T by dp4a with fp32 or int8 P.V for sm_61 (GTX 10xx), the per_warp scheme, fp32 in
+#                     and out (the pascal profile's torso); its int8 P.V is the round K scheme with 32-key blocks
 TUNED_OP = "qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d"    # torch.ops.sageattention_qattn_sm80.<this>: the tuned
 #                     kernel (Spellcast3D's wheel post5 on; the shipped op's arguments, the same bits)
 RACE_TOKENS = ((21504, 4), (8192, 6))   # the shipped and the tuned op timed at first use: (tokens, calls of each)
@@ -181,7 +190,7 @@ INT8PV_MARGIN = 0.05        # the int8 P.V kernel serves only where it is at lea
 def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     """Whether this self-attention may run SageAttention (the caller has checked the switch and that it is the full
     self-attention of one sequence). The first time, the kernel is tried on the card (`_check`)."""
-    if (not q.is_cuda or q.dtype != torch.bfloat16 or k.dtype != q.dtype or v.dtype != q.dtype
+    if (not q.is_cuda or q.dtype != precision.torso() or k.dtype != q.dtype or v.dtype != q.dtype
             or torch.is_grad_enabled() or torch.is_autocast_enabled()):
         return False
     if q.shape[-1] != HEAD_DIM or k.shape[-1] != HEAD_DIM or v.shape[-1] != HEAD_DIM:
@@ -266,9 +275,19 @@ def _candidates(device: torch.device, want: str) -> dict[str, tuple[Callable, st
     lists this architecture or it is asked for (a kernel not needed is not compiled)."""
     import sageattention as sa
 
-    major, minor = torch.cuda.get_device_capability(device)
+    major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
+    if major == 6:
+        op = _pascal_op()
+        if op is None:
+            raise RuntimeError(f"the card is sm_{major}{minor}; the installed wheel has no Pascal kernel ({PASCAL_OP})")
+        return {"pascal": (_pascal_call(op, False), f"{PASCAL_OP} (int8 Q.K^T by dp4a, fp32 P.V)")}
+    if major == 7:
+        op = _turing_op()
+        if op is None:
+            raise RuntimeError(f"the card is sm_{major}{minor}; the installed wheel has no Turing kernel (_qattn_sm75)")
+        return {"turing": (_wheel_call(op), f"{TURING_OP} for sm_75 (per_warp, fp16+fp32)")}
     if major < 8:
-        raise RuntimeError(f"the card is sm_{major}{minor}; SageAttention's int8 kernels are used from sm_80 on")
+        raise RuntimeError(f"the card is sm_{major}{minor}; SageAttention's kernels serve sm_61, sm_75 and sm_80 and newer")
 
     def wheel_cuda(q, k, v):
         return sa.sageattn_qk_int8_pv_fp16_cuda(q, k, v, tensor_layout="NHD", is_causal=False,
@@ -304,6 +323,43 @@ def _tuned_op() -> Optional[Callable]:
         return getattr(torch.ops.sageattention_qattn_sm80, TUNED_OP)
     except (AttributeError, RuntimeError):
         return None
+
+
+def _turing_op() -> Optional[Callable]:
+    """The wheel's Turing op (TURING_OP, the extension _qattn_sm75), or None for a wheel without it."""
+    try:
+        import sageattention._qattn_sm75  # noqa: F401  (registers torch.ops.sageattention_qattn_sm75)
+    except Exception:       # noqa: BLE001 - a wheel without the extension: the op may still be registered by a build
+        pass
+    try:
+        return getattr(torch.ops.sageattention_qattn_sm75, TURING_OP)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _pascal_op() -> Optional[Callable]:
+    """The wheel's Pascal op (PASCAL_OP, the extension _qattn_sm61), or None for a wheel without it."""
+    try:
+        import sageattention._qattn_sm61  # noqa: F401  (registers torch.ops.sageattention_qattn_sm61)
+    except Exception:       # noqa: BLE001 - a wheel without the extension: the op may still be registered by a build
+        pass
+    try:
+        return getattr(torch.ops.sageattention_qattn_sm61, PASCAL_OP)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _pascal_call(op: Callable, int8pv: bool) -> Callable:
+    """The Pascal op on q, k, v [B, N, H, 128] NHD (fp32, fp16 or bf16; v may be a strided view): the kernel quantises
+    q and k itself (and v, for the int8 P.V); the answer in q's dtype. Its accumulators are fp32: the 2^-V_SHIFT
+    fold of v is exact and needs no care here."""
+    def run(q, k, v):
+        torch.cuda.set_device(v.device)
+        o = torch.empty(q.size(), dtype=q.dtype, device=q.device)
+        op(q, k, v, o, 0, q.size(-1) ** -0.5, 1 if int8pv else 0)
+        return o
+
+    return run
 
 
 def _wheel_call(op: Callable) -> Callable:
@@ -402,7 +458,7 @@ def calibrate(device: torch.device) -> dict:
     calls it once, the card quiet): both ops on the self-check's table (they must give the same bits, else the
     shipped one is recorded), then the race with CALIBRATION_RACE. Returns the record's "sage" section: {"wheel",
     "capability", "tuned": bool, "summary", "timings": [{"tokens", "shipped_ms", "tuned_ms"}], "why"}."""
-    major, minor = torch.cuda.get_device_capability(device)
+    major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
     found = {"wheel": _wheel_version(), "capability": [major, minor], "tuned": False, "timings": []}
     if major != 8:
         found.update(why=f"sm_{major}{minor}: the CUDA kernels are used on sm_8x only", summary="not sm_8x")
@@ -479,7 +535,7 @@ def _choose(device: torch.device, cands: dict, tried: dict[str, Optional[torch.T
     if want != "auto":
         print(f"[SAGE] PIXAL3D_SAGE={os.environ.get('PIXAL3D_SAGE', want).strip().lower()}: that kernel is not "
               f"available on this card or failed its self-check; the automatic choice serves", flush=True)
-    cuda = ok.get("cuda") or ok.get("wheel")
+    cuda = ok.get("cuda") or ok.get("wheel") or ok.get("turing") or ok.get("pascal")
     if "tuned" in ok:
         stored = _stored(device)
         if stored is not None:
@@ -561,9 +617,10 @@ def _race_int8pv(device: torch.device, fp16: Callable, int8pv: Callable,
             skipped.append(n)
             continue
         g = torch.Generator(device=device).manual_seed(n)
-        q = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
-        k = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
-        v = torch.randn((1, n, heads, HEAD_DIM), dtype=torch.bfloat16, device=device, generator=g)
+        dt = precision.torso()
+        q = torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g)
+        k = torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g)
+        v = torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g)
         events: dict = {name: [] for name in fns}
         for i in range(calls):
             for name in (("fp16", "int8") if i % 2 == 0 else ("int8", "fp16")):
@@ -602,11 +659,19 @@ def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: to
     if switch == "off" or _kernel is None:
         return
     try:
-        major, _minor = torch.cuda.get_device_capability(device)
-        op = _int8pv_op() if major == 8 else None
-        if op is None:
+        major, _minor = precision.profile().capability or torch.cuda.get_device_capability(device)
+        if major == 8:
+            op = _int8pv_op()
+            call = _int8pv_call(op) if op is not None else None
+            what = f"{INT8PV_OP} (int8 P.V: u8 P per 64-key block, v per block and channel)"
+        elif major == 6:
+            op = _pascal_op()
+            call = _pascal_call(op, True) if op is not None else None
+            what = f"{PASCAL_OP} (int8 P.V by dp4a: u8 P per 32-key block, v per block and channel)"
+        else:
+            call = None
+        if call is None:
             return
-        call = _int8pv_call(op)
         got = call(q, k, vs)
         torch.cuda.synchronize(device)
         rel = float((got.float() * 2.0 ** V_SHIFT - want_out).norm() / want_out.norm())
@@ -628,7 +693,7 @@ def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: to
         print(line, flush=True)
         if wins:
             _kernel_int8pv = call
-            KERNEL_INT8PV = f"{INT8PV_OP} (int8 P.V: u8 P per 64-key block, v per block and channel)"
+            KERNEL_INT8PV = what
     except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the fp16 kernel serves
         _kernel_int8pv, KERNEL_INT8PV = None, ""
         print(f"[SAGE] the int8 P.V kernel is left out ({type(exc).__name__}: {str(exc)[:200]}); the fp16 P.V "
@@ -639,7 +704,7 @@ def _check_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torc
     """The self-check's table (see _check): q, k, v * 2^-V_SHIFT [1, 1000, 12, 128] bf16 and the fp32 answer."""
     g = torch.Generator(device=device).manual_seed(0)
     n, heads = 1000, 12
-    qkv = torch.randn((1, n, 3, heads, HEAD_DIM), device=device, dtype=torch.bfloat16, generator=g)
+    qkv = torch.randn((1, n, 3, heads, HEAD_DIM), device=device, dtype=precision.torso(), generator=g)
     qkv[:, :, 2] *= 1000
     q, k, v = qkv[:, :, 0].contiguous(), qkv[:, :, 1].contiguous(), qkv[:, :, 2]
     want_out = F.scaled_dot_product_attention(q.float().transpose(1, 2), k.float().transpose(1, 2),

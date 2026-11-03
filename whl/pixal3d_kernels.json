@@ -1,0 +1,51 @@
+{
+  "wheel": "pixal3d_kernels-0.1.0-cp39-abi3-win_amd64.whl",
+  "sha256": "83ad18ae1f5c07b4a5a53981e4edf92eefc4758e041fc906d4313f190cc35d14",
+  "size_bytes": 601283,
+  "built": "2026-11-03T07:31:34+00:00",
+  "build_seconds": 28,
+  "source": {
+    "path": "C:\\_myDrive\\repos\\spellcast3d\\code\\pixal3d\\pixal3d_kernels",
+    "commit": "6b627477550acf27309e58b83801c6f6b9905263",
+    "branch": "the fork's branch hi3d (pixal3d_kernels/)"
+  },
+  "what_for": "Spellcast3D round L: the flows' W8A8 linear with group scales for the cards Triton's int8 GEMM does not serve (Turing's tensor cores, Pascal's dp4a); modules/int8mm.py's cuda path",
+  "build": {
+    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\kernels\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\round-l\\kernels\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\kernels\\wheel-out",
+    "env": {
+      "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+      "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
+      "DISTUTILS_USE_SDK": "1",
+      "MAX_JOBS": "6",
+      "NVCC_THREADS": "1",
+      "CUDA_VISIBLE_DEVICES": "-1",
+      "TORCH_CUDA_ARCH_LIST": "6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0+PTX"
+    },
+    "tools": {
+      "python": "3.11.9",
+      "torch": "2.8.0+cu128 (CUDA 12.8)",
+      "setuptools": "80.9.0",
+      "wheel": "0.45.1",
+      "nvcc": "12.8 V12.8.93",
+      "vctools": "14.44.35207"
+    }
+  },
+  "cuobjdump": {
+    "pixal3d_kernels/_C.pyd": {
+      "sass_sm": [
+        "sm_61",
+        "sm_70",
+        "sm_75",
+        "sm_80",
+        "sm_86",
+        "sm_89",
+        "sm_90",
+        "sm_120"
+      ],
+      "ptx_compute": [
+        "sm_120"
+      ]
+    }
+  },
+  "wheel_files": 6
+}

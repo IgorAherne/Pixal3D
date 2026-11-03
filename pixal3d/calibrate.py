@@ -429,6 +429,14 @@ def _convolutions(device: Any, quiet: Quiet, grid: Optional[dict] = None) -> dic
     return calibrate(device, say=tell, pause=lambda: quiet.wait(quick=True), grid=grid, drop=False)
 
 
+def _conv_backend(device: Any) -> dict:
+    """Below sm_80: whether flex_gemm's Triton convolutions give spconv's answers on this card (the record's
+    "conv_backend" section: {"backend", "rel", "<backend>_ms", "why"}; modules/sparse/conv/backend_check.py)."""
+    from pixal3d.modules.sparse.conv import backend_check
+
+    return backend_check.compare(device)
+
+
 def _hi3d_code() -> Optional[Path]:
     """Hi3D's checkout (sparc3d/ inside), as Spellcast3D's launcher finds it, or None."""
     code = Path(os.environ.get("SPELLCAST_HI3D_CODE") or FORK.parent / "hi3d")
@@ -541,8 +549,21 @@ def main(argv: Optional[list[str]] = None) -> int:
         record["triton"] = {"ok": True, "skipped": f"no Triton on this card ({card.name} profile)"}
         skip |= {"triton"}
     if "convolutions" not in skip and card.conv != "flex_gemm":
-        record["flex_gemm"] = {"ok": True, "skipped": f"the sparse convolutions run on {card.conv} on this card"}
-        skip |= {"convolutions"}
+        # Below sm_80 the decoders run on spconv unless flex_gemm's Triton kernels prove themselves on this card
+        # (conv/backend_check.py; the record's "conv_backend", which the precision profile reads at start)
+        chosen = None
+        if card.triton:
+            progress(SHARE["convolutions"], "trying flex_gemm's convolution kernels on this card")
+            chosen = _timed("conv_backend", lambda: _conv_backend(device), record)
+            if chosen:
+                say(f"convolutions: {chosen.get('backend')} ({chosen.get('why', '')})")
+        if chosen and chosen.get("backend") == "flex_gemm":
+            from pixal3d.modules.sparse import config as sparse_config
+
+            sparse_config.set_conv_backend("flex_gemm")        # the tuning step below works on flex_gemm's kernels
+        else:
+            record["flex_gemm"] = {"ok": True, "skipped": f"the sparse convolutions run on {card.conv} on this card"}
+            skip |= {"convolutions"}
     if "triton" not in skip:
         progress(SHARE["triton"], "compiling Pixal3D's GPU kernels (step 1 of 4)")
         _timed("triton", lambda: _triton(device), record)

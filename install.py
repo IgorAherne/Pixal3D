@@ -676,7 +676,7 @@ def verify_installation():
 
             # moge.model.v2 rather than plain `moge`: it's the only import that
             # actually exercises the utils3d_moge wiring.
-            required = ["cumesh", "flex_gemm", "o_voxel", "nvdiffrast", "nvdiffrec_render",
+            required = ["cumesh", "flex_gemm", "o_voxel", "nvdiffrast", "nvdiffrec_render", "pixal3d_kernels",
                         "utils3d", "moge.model.v2"]
             for mod in required:
                 try:
