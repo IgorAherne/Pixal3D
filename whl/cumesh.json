@@ -1,14 +1,14 @@
 {
-  "wheel": "cumesh-0.0.1.post4+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "983454292791df2503466c957a3369141c14320de8e88e8582a27af19bb78dcd",
-  "size_bytes": 13730764,
-  "built": "2026-10-16T06:51:28+00:00",
-  "build_seconds": 534,
+  "wheel": "cumesh-0.0.1.post5+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "b68d1cf333d7ae788cd17146fb5921f7c83c422d1687f44e8c49a98c9346590d",
+  "size_bytes": 13736646,
+  "built": "2026-11-04T19:51:57+00:00",
+  "build_seconds": 511,
   "sources": {
     "fork": {
       "repo": "https://github.com/IgorAherne/CuMesh.git",
       "branch": "spellcast3d",
-      "commit": "229384c42819b9024e0ce6023d1281023738536d",
+      "commit": "553a0043af0281a1b015af1b1975eb4e97e71f81",
       "license": "MIT (Microsoft TRELLIS.2's CuMesh)"
     },
     "upstream": {
@@ -36,7 +36,7 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "nothing at build time: the fork's commit is built as committed; the hunks are its commits' contents, and `patch_cumesh_win.py check` holds the commit equal to upstream + cubvh + the hunks",
-    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 31 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
+    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 33 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
     "why": "the version (0.0.1.post4+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
     "hunks": [
       {
@@ -47,7 +47,7 @@
       {
         "id": "local-version",
         "file": "pyproject.toml",
-        "commit": "Version 0.0.1.post4+cu128torch2.8; README: the Windows wheel build"
+        "commit": "cubvh: the tree built on several threads (post5; before it: Version 0.0.1.post4+cu128torch2.8)"
       },
       {
         "id": "gitignore-vs",
@@ -193,6 +193,16 @@
         "id": "remeshing-free-topology-d",
         "file": "cumesh/remeshing.py",
         "commit": "remeshing: Pixal3D's memory edits, without the chunked grid expansion"
+      },
+      {
+        "id": "cubvh-build-threads-includes",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the tree built on several threads, the same tree byte for byte; version 0.0.1.post5+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-build-threads",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the tree built on several threads, the same tree byte for byte; version 0.0.1.post5+cu128torch2.8"
       }
     ],
     "structure": [
@@ -304,7 +314,8 @@
       "api-ms-win-crt-environment-l1-1-0.dll",
       "api-ms-win-crt-string-l1-1-0.dll",
       "api-ms-win-crt-math-l1-1-0.dll",
-      "api-ms-win-crt-stdio-l1-1-0.dll"
+      "api-ms-win-crt-stdio-l1-1-0.dll",
+      "api-ms-win-crt-convert-l1-1-0.dll"
     ],
     "_cumesh_xatlas.cp311-win_amd64.pyd": [
       "c10.dll",
@@ -346,7 +357,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post4+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post5+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs-post4\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs\\cumesh-build.log"
 }
