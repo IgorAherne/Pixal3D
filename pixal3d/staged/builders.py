@@ -147,13 +147,42 @@ def build_rembg(paths: ModelPaths, device: str) -> nn.Module:
 
 
 def build_moge(paths: ModelPaths, device: str) -> nn.Module:
-    """app.py:113-117 (load_moge_model), with the checkpoint file given instead of the repository's name."""
+    """app.py:113-117 (load_moge_model), with the checkpoint file given instead of the repository's name, and the
+    checkpoint's tensors assigned straight from the file's mapping: MoGeModel.from_pretrained reads the 1.3 GB
+    file into RAM, draws random weights for every parameter (two seconds for its ViT-L) and copies the file's over
+    them; the checkpoint holds every parameter the model has, so the same weights reach the card either way."""
     from moge.model.v2 import MoGeModel
 
-    moge_model = MoGeModel.from_pretrained(_present(paths.moge, "MoGe-2's checkpoint")).to(device)
+    checkpoint = torch.load(_present(paths.moge, "MoGe-2's checkpoint"), map_location="cpu", weights_only=True,
+                            mmap=True)
+    with _no_initialisers():
+        moge_model = MoGeModel(**checkpoint["model_config"])
+    missing, unexpected = moge_model.load_state_dict(checkpoint["model"], strict=False, assign=True)
+    if missing or unexpected:
+        raise RuntimeError(f"MoGe-2's checkpoint does not match its model: {len(missing)} parameters missing, "
+                           f"{len(unexpected)} unexpected ({(missing + unexpected)[:3]})")
+    moge_model = moge_model.to(device)
     moge_model.eval()
     moge_model.requires_grad_(False)
     return moge_model
+
+
+_INITIALISERS = ("trunc_normal_", "normal_", "uniform_", "kaiming_uniform_", "kaiming_normal_", "xavier_uniform_",
+                 "xavier_normal_", "constant_", "zeros_", "ones_")
+
+
+class _no_initialisers:
+    """torch.nn.init's initialisers as no-ops while a model is built whose every parameter the checkpoint then
+    replaces (an nn.Module cannot be built on the meta device where its code reads a tensor's value)."""
+
+    def __enter__(self) -> None:
+        self.saved = {name: getattr(nn.init, name) for name in _INITIALISERS}
+        for name in _INITIALISERS:
+            setattr(nn.init, name, lambda tensor, *args, **kwargs: tensor)
+
+    def __exit__(self, *exc: Any) -> None:
+        for name, function in self.saved.items():
+            setattr(nn.init, name, function)
 
 
 def build_dino(paths: ModelPaths, device: str) -> nn.Module:

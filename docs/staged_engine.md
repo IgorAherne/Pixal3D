@@ -337,7 +337,14 @@ figures at the top of `parts.py`, measured on an RTX 3060):
 - **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
   down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
   AND whose finish (`finish_mib`: the decode, in boxes for a big shape, or the closing of the holes) fits the cap
-  `finish` will get, whose samplers fit the cap in force, and whose finish hook leaves the RAM a floor; at 1024 it
+  `finish` will get, whose samplers fit the cap in force (`sampler_mib`: the flow network's weights - the loader's
+  figure once it is loaded, else what the int8 policy and the torso give, `flow_weights_mib` - plus 50 MiB per
+  thousand tokens, with a quarter on top; until 2026-11-07 the base was the bf16 network's 2,700 MiB whatever
+  the policy, which on a card whose cap is ~4.6 GB made the dragon, knight and ork at 1152-1408 where 1536 fits
+  with the int8 networks), whose finish hook's GPU steps fit the cap they get (`steps_torch_mib` of the faces the
+  voxels foresee, beside `glb_reserve`: on a card that leaves Pixal3D 5.2 GB the ork at 1536, 21 M faces, was given
+  1,089 MiB and its geometry step ran out at about 1,100 - the one rule that lowers a prop there, since 2026-11-07),
+  and whose finish hook leaves the RAM a floor; at 1024 it
   stops whatever the figures say. When the memory, not the token cap, chose, the notes carry `memory_cap`. With
   the decode in boxes, every prop of the test set is made at 1536 on a card that leaves Pixal3D 7.2 GiB; what can
   still lower one there is the closing of the holes of a far bulkier shape, or the RAM.
@@ -353,10 +360,14 @@ Two rules use the room a big card leaves, and change nothing where it is short:
   stays through the prop's finish when, with it on the card, the decode with both decoders fits the cap the finish
   will set (with `decoders_fit`'s margin), the closing of the holes fits beside it, and the finish steps' GPU steps
   do within what their cap leaves the card: their native reserve (`glb_reserve` of the faces the voxels foresee -
-  `FACES_PER_VOXEL` 2.2 - or that of a prop in its steps) and what they reserve through PyTorch, for this prop
+  `FACES_PER_VOXEL` 2.2 - or that of a prop in its steps: `GLB_RESERVE_BASE_MIB` 1,600 and 60 MiB a million
+  faces since round M, when the card's use during the geometry steps less PyTorch's reserve measured 1,650-2,150
+  MiB at 12-18 M faces; the 2,300 base before left a 21 M-face prop on a 6 GB card 1,089 MiB of PyTorch while 4 GB
+  of the card were free, and its geometry step ran out) and what they reserve through PyTorch, for this prop
   and for every prop in its steps by its own faces (`steps_torch_mib`: the hook's figure, `HOOK_TORCH_MIB` 1,500
   for Spellcast3D's geometry and bake at the default 2048 texture, 1.0-1.4 GB measured on meshes of up to 15 M
-  faces, and `HOOK_TORCH_MIB_PER_MFACE` 120 a million faces beyond: in round I's 7.2 GiB run, with one flat 1,500
+  faces and 1,006-1,194 MiB reserved from 14 to 18 M on a card that keeps no tree, and
+  `HOOK_TORCH_MIB_PER_MFACE` 120 a million faces beyond `HOOK_TORCH_REF_MFACES` 20: in round I's 7.2 GiB run, with one flat 1,500
   counted, the geometry and the bake of a 21.5 M-face prop and the bake of an 18.3 M-face one ran out of memory
   beside the kept texture network and ran again with it gone; measured in isolation on golden meshes at 2048
   (round J): geometry 1,002 MiB at 14.9 M faces and 2,126 at 35.9 M, the bake 964 and 1,744, so the rule's

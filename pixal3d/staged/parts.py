@@ -125,7 +125,15 @@ CHUNK_MIB_PER_KVOXEL = 0.30
 # are off the card by then. Measured 0.129 / 0.138 MiB per thousand voxels above the mesh (sv1536 / big1536), kept
 # with the same margin as before. The decode in boxes is the finish part's widest moment again.
 FILL_MIB_PER_KVOXEL = 0.15
-SAMPLER_BASE_MIB = 2_700
+# The flow samplers at the 1024 grid: the network's weights (the loader's figure once it is loaded, else what this
+# card's torso and the int8 policy give: flow_weights_mib) and what a sampling allocates beyond them per thousand
+# tokens (40-45 MiB measured on the five test props' hr and tex at 1536 with the int8 networks and the proj_linear
+# answers counted out), with a quarter on top for the allocator's fragmentation under a cap. Until 2026-11-07 the
+# base was the bf16 network's 2,700 MiB whatever the policy, so on a card whose cap is ~4.6 GB the dragon, knight
+# and ork of the test set were made at 1152-1408 where 1536 fits.
+FLOW_BF16_MIB = 2_680               # a flow network's weights in bf16 (the loader reports 2,678-2,679 MiB)
+FLOW_INT8_CONVERTED_MIB = 1_121     # the token-sized linears as int8 (policy "detail"; 2,242 MiB in bf16)
+FLOW_REST_MIB = 436                 # what stays in the torso's dtype beside them, in bf16
 SAMPLER_MIB_PER_KTOKEN = 50
 SAMPLER_SLACK = 1.25
 PROJ_CACHE_SLACK = 1.1              # over the kept proj_linear answers' bytes (proj_cache_fits)
@@ -172,8 +180,10 @@ HOOK_TORCH_MIB = 1_500              # what Spellcast3D's GLB GPU steps reserve t
 #                                     (Hooks.gpu_torch_mib(req), hook_torch_mib below), so a larger texture keeps
 #                                     less rather than running out of memory beside what is kept (that would only
 #                                     cost the step a second run with it gone, runner._after_failure)
-HOOK_TORCH_REF_MFACES = 15          # the decoded faces (millions) that figure, and the hook's own, hold for: the
-#                                     golden sv1536 mesh (14.9 M faces) is the largest it was measured on
+HOOK_TORCH_REF_MFACES = 20          # the decoded faces (millions) that figure, and the hook's own, hold for: the
+#                                     golden sv1536 mesh (14.9 M faces) was the largest it was measured on; round M
+#                                     (2026-11-07) measured the geometry step's reserve on a card that keeps no tree
+#                                     flat at 1,006-1,194 MiB from 14 to 18 M faces and past 1,089 at 21 M
 HOOK_TORCH_MIB_PER_MFACE = 120      # what the GLB GPU steps reserve through PyTorch per million decoded faces
 #                                     beyond that: geometry and bake upload the decoded mesh, the bake the texture
 #                                     volume (36 B a voxel, about 2 faces a voxel) and grid_sample's tables. Round
@@ -218,18 +228,28 @@ def steps_torch_mib(hooks: Any, req: Any, faces: int) -> int:
     return hook_torch_mib(hooks, req) + int(HOOK_TORCH_MIB_PER_MFACE * beyond)
 
 
+# MiB of the card native code takes in the finish hook's GPU steps beside PyTorch's reserve (cumesh's remesh and
+# its tables, the tree uploaded for the remesh and the bake, nvdiffrast): measured on an RTX 3060 emulating a 6 GB
+# card (round M, 2026-11-07: the card's use during the geometry steps less PyTorch's reserve) 1,650-2,150 MiB at
+# 12-18 M faces, so GLB_RESERVE_BASE_MIB + 60 a million faces keeps 300 MiB over the widest. The 2,300 base used
+# until then left the ork at 1536 (21 M faces) 1,089 MiB of PyTorch under a 5.2 GB cap while 4 GB of the card
+# were free, and its geometry step ran out.
+GLB_RESERVE_BASE_MIB = 1_600
+GLB_RESERVE_MIB_PER_MFACE = 60
+
+
 def reserve_faces(native_mib: int) -> int:
     """The decoded faces glb_reserve gives `native_mib` for (its inverse): what a prop in its steps decoded."""
-    return max(0, (int(native_mib) - 2300) * 1_000_000 // 60)
+    return max(0, (int(native_mib) - GLB_RESERVE_BASE_MIB) * 1_000_000 // GLB_RESERVE_MIB_PER_MFACE)
 
 
-def next_sampler_mib(flow: Any, tokens: int, cap_mib: float) -> float:
+def next_sampler_mib(flow: Any, tokens: int, cap_mib: float, weights_mib: int | None = None) -> float:
     """MiB the next prop's texture sampling takes on the card beside what is kept for it: its sampler
-    (sampler_mib) and, where the cap in force leaves room for them beside it, the flow's kept proj_linear answers
-    (the same test as proj_cache_fits', so that the decoders the pair keeps never take that room: the sampling
-    would run out of memory and run again with them gone). A flow without such answers, or one that cannot say,
-    needs its sampler alone."""
-    sampler = sampler_mib(tokens)
+    (sampler_mib, with the flow's `weights_mib` where known) and, where the cap in force leaves room for them beside
+    it, the flow's kept proj_linear answers (the same test as proj_cache_fits', so that the decoders the pair keeps
+    never take that room: the sampling would run out of memory and run again with them gone). A flow without such
+    answers, or one that cannot say, needs its sampler alone."""
+    sampler = sampler_mib(tokens, weights_mib)
     try:
         proj = PROJ_CACHE_SLACK * proj_cache_mib(flow, tokens) if flow is not None else 0.0
     except Exception:           # noqa: BLE001 - no proj cache to make room for
@@ -274,7 +294,7 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
     steps = max([glb_reserve(faces) + steps_torch_mib(hooks, prop.req, faces),
                  *[int(mib) + steps_torch_mib(hooks, prop.req, reserve_faces(int(mib))) for mib in natives]])
     steps_room = finish_limit + NATIVE_RESERVE["finish"]
-    sampler = next_sampler_mib(loader.get(flow), tokens, cap_now)
+    sampler = next_sampler_mib(loader.get(flow), tokens, cap_now, flow_mib)
 
     def fits(decoders: bool) -> bool:
         after = flow_mib + (decoders_mib if decoders else 0)
@@ -310,9 +330,9 @@ def pair_order(ctx: PartContext, props: list) -> list:
 
 def glb_reserve(faces: int) -> int:
     """MiB of native memory the caller's finish hook needs for a decoded mesh of `faces` faces (to_glb: the
-    nvdiffrast context, one BVH at a time, cumesh). A starting figure: too small and the hook spills into
-    shared memory, too large and a big mesh is decoded with the cap lifted that would have fitted."""
-    return 2300 + 60 * faces // 1_000_000
+    nvdiffrast context, one BVH at a time, cumesh): GLB_RESERVE_BASE_MIB and GLB_RESERVE_MIB_PER_MFACE. Too small
+    and the hook spills into shared memory, too large and PyTorch is left too little for the steps themselves."""
+    return GLB_RESERVE_BASE_MIB + GLB_RESERVE_MIB_PER_MFACE * faces // 1_000_000
 
 
 def voxels_at(occupied: int, resolution: int) -> int:
@@ -347,9 +367,43 @@ def finish_mib(voxels: int, decoders: int = 1) -> float:
     return max(decode_mib(voxels, decoders, chunk_for(voxels)), fill_mib(voxels))
 
 
-def sampler_mib(tokens: int) -> float:
-    """MiB a 1024-grid flow sampler needs on the card for a prop of `tokens` tokens, fragmentation included."""
-    return SAMPLER_SLACK * (SAMPLER_BASE_MIB + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+def sampler_mib(tokens: int, weights_mib: int | None = None) -> float:
+    """MiB a 1024-grid flow sampler needs on the card for a prop of `tokens` tokens, fragmentation included:
+    the network's `weights_mib` (a bf16 network's when not known) and what the sampling allocates beyond them."""
+    weights = FLOW_BF16_MIB if weights_mib is None else weights_mib
+    return SAMPLER_SLACK * (weights + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+
+
+def flow_weights_mib(ctx: PartContext, kind: str) -> int:
+    """MiB the 1024-grid flow network of `kind` (hr, tex, lr) takes on the card: the loader's figure while it is
+    loaded, else what this card's torso and the int8 policy give (a converted flow keeps its token-sized linears as
+    int8 whatever the torso)."""
+    size_of = getattr(getattr(ctx, "loader", None), "size_mib", None)
+    if size_of is not None:
+        for name in (f"{kind}_flow.sv", f"{kind}_flow.mv"):
+            try:
+                mib = size_of(name)
+            except Exception:       # noqa: BLE001 - a loader that cannot say: the figures below
+                mib = None
+            if mib:
+                return int(mib)
+    scale = torch.finfo(precision.torso()).bits / 16          # 1 for a bf16 torso, 2 for fp32
+    if _int8_converts(kind):
+        return int(FLOW_INT8_CONVERTED_MIB + FLOW_REST_MIB * scale)
+    return int(FLOW_BF16_MIB * scale)
+
+
+def _int8_converts(kind: str) -> bool:
+    """Whether the int8 policy in force turns the flow of `kind` into int8 layers (modules/int8.py), as far as can
+    be known before it is loaded: the policy names it and the kernels have not been found wanting on this card."""
+    try:
+        from ..modules import int8
+    except Exception:           # noqa: BLE001 - no int8 module (fakes): bf16
+        return False
+    name = int8.policy()
+    if not name or not int8.POLICIES.get(name, {}).get(kind):
+        return False
+    return getattr(int8, "_state", None) is not False
 
 
 def proj_cache_mib(flow: Any, tokens: int) -> float:
@@ -365,7 +419,7 @@ def proj_cache_room(sampler: float, need: float, cap_mib: float) -> bool:
     return need > 0 and sampler + PROJ_CACHE_SLACK * need + PROJ_CACHE_MARGIN_MIB <= cap_mib
 
 
-def proj_cache_fits(ctx: PartContext, flow: Any, tokens: int) -> bool:
+def proj_cache_fits(ctx: PartContext, flow: Any, tokens: int, kind: str = "hr") -> bool:
     """Whether the flow may keep its blocks' proj_linear answers across a sampling's conditional steps for a prop
     of `tokens` tokens: the same bits one GEMM per block cheaper every pass after the first (157 ms of a 3.1 s
     detail pass at 21.5k tokens), for 1.9 GB on the card there - taken only where the cap in force has that room
@@ -374,7 +428,7 @@ def proj_cache_fits(ctx: PartContext, flow: Any, tokens: int) -> bool:
     limits = card_limits(ctx)
     if limits is None:
         return False
-    return proj_cache_room(sampler_mib(tokens), proj_cache_mib(flow, tokens), limits[1])
+    return proj_cache_room(sampler_mib(tokens, flow_weights_mib(ctx, kind)), proj_cache_mib(flow, tokens), limits[1])
 
 
 def _drop_proj_cache(ctx: PartContext, flow: Any, part: str, prop: PropState) -> None:
@@ -433,17 +487,25 @@ def _card_total_mib(ctx: PartContext) -> float:
 
 
 def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int,
-                    voxels: int | None = None) -> str | None:
+                    voxels: int | None = None, req: Any = None) -> str | None:
     """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
     "ram" - or None when it fits. The card: the widest moment of `finish` (finish_mib: the decode, in boxes for a
-    big shape, or the closing of the holes) under the cap it will get, and the 1024-grid samplers under the cap in
-    force; the RAM: what the finish hook needs beside the process. The voxels are foreseen from the `occupied`
-    cells of the 512 grid, or given (a Hi3D prop's mesh has them exactly)."""
+    big shape, or the closing of the holes) under the cap it will get, the 1024-grid samplers under the cap in
+    force, and the finish hook's GPU steps - what they reserve through PyTorch (steps_torch_mib, for the faces the
+    voxels foresee) under the cap they get beside their native reserve (glb_reserve: on a card that leaves Pixal3D
+    5.2 GB the ork of the test set at 1536, 21 M faces, got 1,089 MiB there and its geometry step ran out at about
+    1,100); the RAM: what the finish hook needs beside the process. The voxels are foreseen from the `occupied`
+    cells of the 512 grid, or given (a Hi3D prop's mesh has them exactly); `req`: the prop's request, for the
+    hook's own texture-size figure."""
     voxels = voxels_at(occupied, resolution) if voxels is None else voxels
     limits = card_limits(ctx)
     if limits is not None:
         finish_limit, cap_now = limits
-        if finish_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens) > cap_now:
+        if finish_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens, flow_weights_mib(ctx, "hr")) > cap_now:
+            return "card"
+        faces = int(FACES_PER_VOXEL * voxels)
+        steps_cap = finish_limit + NATIVE_RESERVE["finish"] - glb_reserve(faces)
+        if steps_torch_mib(getattr(ctx, "hooks", None), req, faces) > steps_cap:
             return "card"
         if resolution > 1024 and not _decodes_in_boxes() and _card_total_mib(ctx) < WHOLE_LEVEL_1536_MIB:
             return "card"
@@ -779,7 +841,7 @@ def _shape_latent(ctx: PartContext, prop: PropState, mode: str, part: str, coord
     flow = _network(ctx, f"{part}_flow.{prop.kind}")
     coords = store.get_small(prop.id, coords_key)["coords"].to(device)
     pair = _token_cond(ctx.take(prop, f"cond_{part}"), coords,
-                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0]))
+                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0], part))
     params = {**args.sampler_params["shape"], **prop.req.sampler_params.get("shape", {})}
     torch.set_rng_state(store.get_small(prop.id, rng_key)["state"])
     noise = SparseTensor(feats=torch.randn(coords.shape[0], flow.in_channels).to(device), coords=coords)
@@ -827,7 +889,7 @@ def upsample(ctx: PartContext, prop: PropState, mode: str) -> None:
         under_cap = unique.shape[0] < request.max_num_tokens
         if unbounded is None and (under_cap or resolution == 1024):
             unbounded = resolution
-        reason = resolution_fits(ctx, occupied, unique.shape[0], resolution) if under_cap else None
+        reason = resolution_fits(ctx, occupied, unique.shape[0], resolution, req=request) if under_cap else None
         why = why or reason
         if (under_cap and reason is None) or resolution == 1024:
             break
@@ -887,7 +949,7 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     params = {**args.sampler_params["tex"], **request.sampler_params.get("tex", {})}
     # A guidance strength of 1 runs only the positive pass: the zero conditioning would never be read.
     pair = _token_cond(ctx.take(prop, "cond_tex"), coords, negative=params.get("guidance_strength") != 1,
-                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0]))
+                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0], "tex"))
 
     std = torch.tensor(args.shape_normalization["std"])[None].to(device)
     mean = torch.tensor(args.shape_normalization["mean"])[None].to(device)
