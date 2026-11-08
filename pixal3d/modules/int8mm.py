@@ -26,7 +26,10 @@ Paths (`path=`; None = the table PATHS, chosen from the round-I measurements on 
                + one Triton epilogue kernel: 1.6-2.7x (the int32 round trip); ties "triton" only on fc2 at small M.
     "group"    quantize_rows(group=128) + the Triton GEMM with the accumulator rescaled every 128-K block:
                1.2-1.3x slower than "triton" (66-68 TOPS), for the quality study's finer scales; weight scales
-               [N, K / 128] (quantize_weight(group=128)) add one multiply per element and slab (round J).
+               [N, K / 128] (quantize_weight(group=128)) add one multiply per element and slab (round J). With
+               per-channel weight scales a layer form may run pixal3d_kernels' sm_80+ twin of that kernel instead
+               (the same bits, where the install's race found it faster: group_cuda_tile; RTX 3060: to_qkv -5 %,
+               fc1 -7 %, fc2 stays Triton's).
 The whole block (3 norms + 7 token-sized linears + GELU) runs 2.67-2.83x faster than bf16 (README.md).
 
 Capability gate (`capability()`): the Triton GEMM needs Triton's int8 mma.sync (m16n8k32), which Triton emits for
@@ -57,7 +60,8 @@ from . import precision
 GROUP = 128                 # activation group size of the "group" path (= that kernel's BLOCK_K)
 CHUNK_ROWS = 8192           # "intmm": rows per torch._int_mm call (bounds the int32 temporary: 8192 x N x 4 B)
 TINY = 1e-30                # absmax floor: an all-zero row quantises to zeros with a tiny scale, not to NaN
-NORM_WARPS = 4              # norm_quant's num_warps (C = 1536): 4 warps 0.461 ms, 8 warps 0.559 ms at M = 21504
+NORM_WARPS = 4              # norm_quant's num_warps (C = 1536): 4 warps 0.461 ms, 8 warps 0.559 ms at M = 21504;
+#                             the flows' blocks pass norm_modulate's 8, the warps that give its bits exactly
 
 # Triton GEMM configurations: (BLOCK_M, BLOCK_N, BLOCK_K, GROUP_M, num_stages, num_warps), from the sweep of
 # 14 configs x 6 shapes x M in {2024, 4096, 8192, 21504, 30000} on the RTX 3060 (bench_int8.py --parts triton):
@@ -139,7 +143,8 @@ def kernel_name() -> str:
                 "intmm": "torch._int_mm (cuBLASLt)"}.get(str(_state["gemm"]), "int8 GEMMs")
     if _state["gemm"] in ("intmm", "cuda"):
         what = "quantiser" if _state["gemm"] == "cuda" else "quantiser and epilogue"
-        gemm_how += f", the {what} in {'Triton' if _state['elementwise'] == 'triton' else 'torch'}"
+        gemm_how += (f", the {what} in "
+                     f"{ {'triton': 'Triton', 'cuda': 'pixal3d_kernels'}.get(_state['elementwise'], 'torch')}")
     return f"int8mm: {gemm_how}"
 
 
@@ -249,10 +254,14 @@ def _build():
             tl.store(S + row * stride_s + g, tl.div_rn(amax, tl.full([NG], 127.0, tl.float32)), mask=gmask)
 
     @triton.jit(do_not_specialize=["M", "stride_asm", "stride_qsm"])
-    def gemm_kernel(A, B, C, AS, BS, BIAS, QS, SMO, M, N, K, stride_am, stride_bn, stride_cm, stride_asm,
+    def gemm_kernel(A, B, C, AS, BS, BIAS, QS, SMO, RX, RG, R2, M, N, K, stride_am, stride_bn, stride_cm, stride_asm,
                     stride_qsm, stride_bsn, HAS_BIAS: tl.constexpr, GELU: tl.constexpr, OUT: tl.constexpr,
                     A_GROUP: tl.constexpr, B_GROUP: tl.constexpr, OUT_SMOOTH: tl.constexpr, MAGIC: tl.constexpr,
-                    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
+                    RESID: tl.constexpr, BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+                    GROUP_M: tl.constexpr):
+        # RESID (OUT 0): the block's residual kernel (fused.residual, rounded mode) in the epilogue - the result h,
+        # rounded to bf16 as it would be stored, goes into x + h (1: x + round(h * RG[col]), the gate one row; 2: x +
+        # round(R2 + h); 3: x + h), written to C instead of h; RX and R2 [M, N] with C's row stride
         # A: int8 [M, K] row-major; B: int8 [N, K] row-major (the weight as stored: both operands K-contiguous,
         # the "TN" layout int8 mma wants). OUT: 0 = bf16, 1 = the raw int32 accumulator (checks), 2 = int8 with one
         # fp32 scale per row and per BLOCK_N columns (QS [M, N / BLOCK_N]: the next layer's group-scaled input),
@@ -335,6 +344,15 @@ def _build():
                          tl.div_rn(amax, tl.full([BLOCK_M], 127.0, tl.float32)), mask=rm < M)
             elif OUT == 3:
                 tl.store(c_ptrs, y.to(tl.float16), mask=mask)
+            elif RESID:
+                h = round_bf16(y)
+                r_off = rm[:, None].to(tl.int64) * stride_cm + rn[None, :]
+                if RESID == 1:
+                    h = round_bf16(h * tl.load(RG + rbn).to(tl.float32)[None, :])
+                elif RESID == 2:
+                    h = round_bf16(tl.load(R2 + r_off, mask=mask, other=0.0).to(tl.float32) + h)
+                xr = tl.load(RX + r_off, mask=mask, other=0.0).to(tl.float32)
+                tl.store(c_ptrs, (xr + h).to(tl.bfloat16), mask=mask)
             else:
                 tl.store(c_ptrs, y.to(tl.bfloat16), mask=mask)
 
@@ -384,6 +402,10 @@ def quantize_rows(x: torch.Tensor, group: int = 0,
     (fp32 [K], computed once at load) for SmoothQuant's per-input-channel vector s, applied as x * (1 / s) in the
     same pass (the weight was quantised as W * s: quantize_weight(w, smooth=s)). The Triton kernel where ready()
     chose it, else the torch ops (the same bits)."""
+    if _state["elementwise"] == "cuda":           # below sm_80: pixal3d_kernels' quantiser (old_cards.py)
+        from . import old_cards
+
+        return old_cards.quantize_rows(x, group, inv_smooth)
     if _state["elementwise"] != "triton":
         return quantize_rows_torch(x, group, inv_smooth)
     return quantize_rows_triton(x, group, inv_smooth)
@@ -507,11 +529,20 @@ def pick_config(M: int, N: int, K: int, group: int = 0, w_group: bool = False) -
 
 def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Optional[torch.Tensor],
          *, gelu: bool = False, out: str = "bf16", group: int = 0, cfg: Optional[tuple] = None,
-         magic: bool = True, out_smooth: Optional[torch.Tensor] = None):
+         magic: bool = True, out_smooth: Optional[torch.Tensor] = None, resid: Optional[dict] = None,
+         kernel: Optional[str] = None):
     """The Triton int8 GEMM with the epilogue fused. out: "bf16" -> bf16 [M, N]; "fp16" -> fp16 [M, N]; "int32" ->
     the raw accumulator (per-row mode only); "int8" -> (int8 [M, N], fp32 scales [M, N // BLOCK_N]). w_s: fp32 [N]
     (one scale per output channel) or [N, K // group] (one per output channel and group of K: needs group scales on x too).
-    out_smooth: fp32 [N] that multiplies the result before an "int8" output is quantised (the next layer's 1 / s)."""
+    out_smooth: fp32 [N] that multiplies the result before an "int8" output is quantised (the next layer's 1 / s).
+    resid (bf16 out): {"x", "gate" or "second"} - the block's residual (fused.residual, rounded mode, a gate of one
+    row) done in the epilogue: returns x + round(h * gate) / x + round(second + h) / x + h, h the bf16 result.
+    kernel: None = the group layers on pixal3d_kernels' CUDA kernel where the install's race chose it for the layer
+    (group_cuda_tile: the same bits; cfg is then the Triton kernel's, unused), "triton" = the Triton kernel always."""
+    if group and kernel != "triton" and w_s.dim() == 1 and out_smooth is None:
+        tile = group_cuda_tile(xq, w_q, gelu, out, resid)
+        if tile is not None:
+            return group_cuda(xq, xs, w_q, w_s, bias, gelu=gelu, out=out, resid=resid, tile=tile)
     k = _build()
     M, K = xq.shape
     N = w_q.shape[0]
@@ -530,6 +561,19 @@ def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tenso
         raise ValueError("the raw int32 output is for per-row scales only")
     dtype = {0: torch.bfloat16, 1: torch.int32, 2: torch.int8, 3: torch.float16}[mode]
     y = torch.empty((M, N), dtype=dtype, device=xq.device)
+    rx = rg = r2 = None
+    how = 0
+    if resid is not None:
+        if mode != 0:
+            raise ValueError("the residual epilogue writes bf16 only")
+        rx, rg, r2 = resid["x"], resid.get("gate"), resid.get("second")
+        how = 1 if rg is not None else 2 if r2 is not None else 3
+        if rg is not None:
+            rg = rg.reshape(-1)
+        if (rx.shape != (M, N) or rx.stride() != y.stride() or (r2 is not None and r2.stride() != y.stride())
+                or (rg is not None and (rg.numel() != N or rg.stride(0) != 1))):
+            raise ValueError("the residual epilogue takes x (and second) of the output's shape and strides, a gate "
+                             "of one row")
     qs = None
     if mode == 2:
         if N % BN:
@@ -538,12 +582,13 @@ def gemm(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tenso
     if M:
         grid = (k["cdiv"](M, BM) * k["cdiv"](N, BN),)
         k["gemm"][grid](xq, w_q, y, xs, w_s, bias if bias is not None else w_s, qs if qs is not None else w_s,
-                        out_smooth if out_smooth is not None else w_s,
+                        out_smooth if out_smooth is not None else w_s, rx if rx is not None else w_s,
+                        rg if rg is not None else w_s, r2 if r2 is not None else w_s,
                         M, N, K, xq.stride(0), w_q.stride(0), y.stride(0), xs.stride(0) if group else 1,
                         qs.stride(0) if qs is not None else 1, w_s.stride(0) if b_group else 1,
                         HAS_BIAS=bias is not None, GELU=gelu, OUT=mode, A_GROUP=group, B_GROUP=b_group,
-                        OUT_SMOOTH=out_smooth is not None, MAGIC=magic, BLOCK_M=BM, BLOCK_N=BN, BLOCK_K=BK,
-                        GROUP_M=GM, num_stages=stages, num_warps=warps)
+                        OUT_SMOOTH=out_smooth is not None, MAGIC=magic, RESID=how, BLOCK_M=BM, BLOCK_N=BN,
+                        BLOCK_K=BK, GROUP_M=GM, num_stages=stages, num_warps=warps)
     return (y, qs) if mode == 2 else y
 
 
@@ -646,13 +691,14 @@ def _fallback(x2: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, bias: Opti
 def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: torch.Tensor, w_s: torch.Tensor,
                 bias: Optional[torch.Tensor] = None, *, gelu: bool = False, path: Optional[str] = None,
                 out_int8: bool = False, inv_smooth: Optional[torch.Tensor] = None,
-                out_dtype: torch.dtype = torch.bfloat16):
+                out_dtype: torch.dtype = torch.bfloat16, resid: Optional[dict] = None):
     """y = x @ W^T + b [GELU tanh] with W = w_q * w_s[:, None]; x: [..., K] in the torso's dtype or a pre-quantised
     (x_q [M, K], x_s) pair (x_s [M]: per row; x_s [M, K / 128]: group scales, the "group" path). Returns out_dtype
     [..., N], or (int8 [M, N], scales) with out_int8 (path "triton"/"group": [M, N / 128] group scales; "intmm": [M]
     per row; "cuda": the input's grain). w_s [N, K / 128] (weight scales per output channel and group: quantize_weight(group=GROUP)) takes the
     "group" path. inv_smooth: 1 / s [K] applied to x as it is quantised (the weight holds W * s). Where the card has
-    no group GEMM (has_group_gemm), group scales take the fallback."""
+    no group GEMM (has_group_gemm), group scales take the fallback. resid: the block's residual in the Triton GEMM's
+    epilogue (gemm), bf16 out: the result is then the new stream."""
     pre = isinstance(x, tuple)
     K = w_q.shape[1]
     N = w_q.shape[0]
@@ -691,6 +737,8 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
         path = "intmm"
     if _state["gemm"] == "cuda":                                 # pixal3d_kernels, per-row or group scales alike
         path = "cuda"
+    if resid is not None and (path in ("intmm", "cuda") or out_int8):
+        raise ValueError("the residual epilogue is the Triton GEMM's, bf16 out")
     if path == "intmm":
         y = intmm_linear(xq, xs, w_q, w_s, bias, gelu=gelu, out_int8=out_int8, out_dtype=out_dtype)
     elif path == "cuda":
@@ -698,7 +746,8 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
         if out_int8:
             y = quantize_rows(y, group)
     else:
-        y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else _OUT_NAME[out_dtype], group=group)
+        y = gemm(xq, xs, w_q, w_s, bias, gelu=gelu, out="int8" if out_int8 else _OUT_NAME[out_dtype], group=group,
+                 resid=resid)
     if out_int8 or pre:
         return y
     return y.view(*lead, N)
@@ -709,7 +758,8 @@ _OUT_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}     # gemm()'s `out`
 
 def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tuple, w2: tuple, *,
              path: str = "rows", cfg1: Optional[tuple] = None,
-             inv_smooth2: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
+             inv_smooth2: Optional[torch.Tensor] = None, out_dtype: torch.dtype = torch.bfloat16,
+             resid: Optional[dict] = None) -> torch.Tensor:
     """fc2(GELU(fc1(x))): w1, w2 = (w_q, w_s, bias).
     "rows" (fastest measured: 15.5 ms at M = 21504 vs 41.4 bf16): fc1 Triton with GELU -> bf16, quantize_rows,
            fc2 Triton (per-row scales everywhere, like the other layers);
@@ -720,6 +770,9 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
     "intmm": torch._int_mm, fc1's epilogue quantises each full row for fc2's torch._int_mm: 16.6 ms."""
     if inv_smooth2 is not None and path != "group":
         raise ValueError("fc2's smoothing is applied in the group path's fc1 epilogue only")
+    if resid is not None and (_state["gemm"] != "triton" or path not in ("rows", "group")
+                              or out_dtype not in _OUT_NAME):
+        raise ValueError("the residual epilogue is the Triton GEMM's")
     if _state["gemm"] == "cuda" and path in ("rows", "group"):
         # pixal3d_kernels: fc1 with its GELU in the epilogue, the hidden layer quantised again for fc2 with the
         # scales fc1's input had (per row, or per row and group)
@@ -732,7 +785,7 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
     if path == "rows":
         xq, xs = x if isinstance(x, tuple) else quantize_rows(x)
         h = gemm(xq, xs, *w1, gelu=True, group=GROUP if xs.dim() == 2 else 0, out=_OUT_NAME[out_dtype])
-        return gemm(*quantize_rows(h), *w2, out=_OUT_NAME[out_dtype])
+        return gemm(*quantize_rows(h), *w2, out=_OUT_NAME[out_dtype], resid=resid)
     if path == "intmm":
         if isinstance(x, tuple):
             xq, xs = x
@@ -748,13 +801,16 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
         xq, xs = quantize_rows(x)
     M = xq.shape[0]
     if cfg1 is None:
-        cfg1 = (pick_config(M, w1[0].shape[0], xq.shape[1], GROUP, w1[1].dim() == 2) if xs.dim() == 2
-                else CFG_FC1_INT8)
+        if xs.dim() == 2 and w1[1].dim() != 2:
+            cfg1 = fc1_group_cfg(xq.device)
+        else:
+            cfg1 = (pick_config(M, w1[0].shape[0], xq.shape[1], GROUP, w1[1].dim() == 2) if xs.dim() == 2
+                    else CFG_FC1_INT8)
     if cfg1[1] != GROUP:                            # fc1's BLOCK_N is the group size of fc2's input
         cfg1 = (cfg1[0], GROUP) + tuple(cfg1[2:])
     hq, hs = gemm(xq, xs, *w1, gelu=True, out="int8", group=GROUP if xs.dim() == 2 else 0, cfg=cfg1,
                   out_smooth=inv_smooth2)
-    return gemm(hq, hs, *w2, group=GROUP, cfg=CFG_GROUP, out=_OUT_NAME[out_dtype])
+    return gemm(hq, hs, *w2, group=GROUP, cfg=CFG_GROUP, out=_OUT_NAME[out_dtype], resid=resid)
 
 
 # =====================================================================================================================
@@ -840,6 +896,423 @@ def bf16_ulps(got: torch.Tensor, want64: torch.Tensor) -> Tuple[float, float]:
     return float(d.max()), float(neq)
 
 
+# fc1 with GELU and group-scaled int8 output (int8_mlp's "group" path) on group-scaled input: its tile is chosen
+# once per card at install (calibrate_fc1_tiles, the calibration record's "triton" section, "int8_tiles"). Every
+# candidate gives the same bits: BLOCK_K is the group (each 128-K slab's int32 sum exact, the slabs summed in order
+# per element), BLOCK_N fc2's input group (the output's scales per 128 columns). On an RTX 3060 (64, 128, 128, 8,
+# 3, 4) was 13 % faster than CFG_GROUP at 19,928 rows.
+FC1_GROUP_CANDIDATES = (CFG_GROUP, (64, 128, 128, 8, 3, 4))
+FC1_GROUP_CFG: Optional[tuple] = None   # forced (developers); None: the calibration record's choice, else CFG_GROUP
+FC1_TILE_MARGIN = 0.03                  # a candidate serves only where it is this much faster at every size timed
+FC1_TILE_ROWS = (21504, 8192)           # the sizes timed at install
+_fc1_cfg: dict = {}
+
+
+def fc1_group_cfg(device: torch.device) -> tuple:
+    """fc1's tile for this card (FC1_GROUP_CFG, else the install's record of calibrate_fc1_tiles where it was made
+    on this card with this Triton, else CFG_GROUP)."""
+    if FC1_GROUP_CFG is not None:
+        return tuple(FC1_GROUP_CFG)
+    key = str(device)
+    if key not in _fc1_cfg:
+        _fc1_cfg[key] = CFG_GROUP
+        try:
+            from .. import calibration
+            import triton
+
+            entry = ((calibration.section("triton", device) or {}).get("int8_tiles") or {})
+            chosen = tuple(entry.get("fc1_group") or ())
+            if entry.get("triton") == triton.__version__ and chosen in FC1_GROUP_CANDIDATES:
+                _fc1_cfg[key] = chosen
+        except Exception:       # noqa: BLE001 - no record, no Triton: the shipped tile
+            pass
+    return _fc1_cfg[key]
+
+
+def warm_handoffs(device: torch.device, rows: tuple = (4096, 4099)) -> int:
+    """The flows' blocks' hand-off kernels compiled at the flows' widths (the install's calibration calls this, so
+    that the first prop finds them in Triton's cache): norm_quant for the modulated norms (group scales) and the
+    affine one (per row) at norm_modulate's warps, the per-row GEMM with the residual in its epilogue (a gate, and a
+    second term), and fused.residual_row. Returns the calls made (0 where the Triton GEMMs do not serve)."""
+    from . import fused
+
+    if not ready(device)[0] or gemm_path() != "triton":
+        return 0
+    g = torch.Generator(device=device).manual_seed(0)
+    C = 1536
+    w_q, w_s = quantize_weight(torch.randn((C, C), device=device, dtype=torch.bfloat16, generator=g) * 0.03)
+    bias = torch.zeros(C, device=device)
+    w32 = torch.ones(C, device=device, dtype=torch.float32)  # norm2's weight/bias: LayerNorm32 stays fp32
+    calls = 0
+    with torch.no_grad():
+        for m in rows:
+            x = torch.randn((m, C), device=device, dtype=torch.bfloat16, generator=g)
+            mod = torch.randn((1, 2 * C), device=device, dtype=torch.bfloat16, generator=g)
+            norm_quant(x, 1e-6, scale=mod[:, :C], shift=mod[:, C:], group=GROUP, num_warps=8)
+            norm_quant(x, 1e-6, weight=w32, bias=w32, group=0, num_warps=8)
+            int8_linear(x, w_q, w_s, bias, path="triton", resid={"x": x, "gate": mod[:, :C]})
+            int8_linear(x, w_q, w_s, bias, path="triton", resid={"x": x, "second": x})
+            if fused.active(x):
+                saved = fused.ROW_RESIDUAL
+                fused.ROW_RESIDUAL = True
+                try:
+                    fused.residual_row(x, x[:1])
+                finally:
+                    fused.ROW_RESIDUAL = saved
+            calls += 5
+    torch.cuda.synchronize(device)
+    return calls
+
+
+def calibrate_fc1_tiles(device: torch.device, reps: int = 6, iters: int = 5) -> dict:
+    """The install's choice of fc1's tile (FC1_GROUP_CANDIDATES): each candidate on the same random tables at
+    FC1_TILE_ROWS rows (1536 -> 8192, GELU, int8 out, as int8_mlp runs it), its output torch.equal to CFG_GROUP's,
+    timed interleaved (CUDA events, medians); the fastest serves where it is FC1_TILE_MARGIN faster than CFG_GROUP at
+    every size. Returns the record's entry: {"fc1_group", "triton", "timings", "summary", "ok"}."""
+    import statistics
+
+    import triton
+
+    g = torch.Generator(device=device).manual_seed(0)
+    w = torch.randn((8192, 1536), device=device, dtype=torch.bfloat16, generator=g) * 0.03
+    wq, ws = quantize_weight(w)
+    bias = torch.randn(8192, device=device, generator=g) * 0.1
+    del w
+    found: dict = {"fc1_group": list(CFG_GROUP), "triton": triton.__version__, "timings": [], "ok": True}
+    wins = {c: True for c in FC1_GROUP_CANDIDATES[1:]}
+    for m in FC1_TILE_ROWS:
+        x = torch.randn((m, 1536), device=device, dtype=torch.bfloat16, generator=g)
+        xq, xs = quantize_rows(x, GROUP)
+        del x
+        run = {c: (lambda c=c: gemm(xq, xs, wq, ws, bias, gelu=True, out="int8", group=GROUP, cfg=c,
+                                    kernel="triton"))
+               for c in FC1_GROUP_CANDIDATES}
+        want = run[CFG_GROUP]()
+        for c in FC1_GROUP_CANDIDATES[1:]:
+            got = run[c]()
+            if not (torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])):
+                wins[c] = False
+        del want, got
+        ms: dict = {c: [] for c in FC1_GROUP_CANDIDATES}
+        for rep in range(reps):
+            for c in (FC1_GROUP_CANDIDATES if rep % 2 == 0 else FC1_GROUP_CANDIDATES[::-1]):
+                run[c]()
+                events = []
+                for _ in range(iters):
+                    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                    start.record()
+                    run[c]()
+                    end.record()
+                    events.append((start, end))
+                torch.cuda.synchronize(device)
+                ms[c] += [a.elapsed_time(b) for a, b in events]
+        med = {c: statistics.median(v) for c, v in ms.items()}
+        found["timings"].append({"rows": m, **{".".join(map(str, c)): round(t, 3) for c, t in med.items()}})
+        for c in wins:
+            wins[c] = wins[c] and med[c] <= med[CFG_GROUP] * (1 - FC1_TILE_MARGIN)
+        del xq, xs, run, ms
+    best = [c for c in FC1_GROUP_CANDIDATES[1:] if wins[c]]
+    if best:
+        def total(c):
+            return sum(t[".".join(map(str, c))] for t in found["timings"])
+        found["fc1_group"] = list(min(best, key=total))
+    found["summary"] = "fc1 tile " + ".".join(map(str, found["fc1_group"])) + ": " + "; ".join(
+        f"{t['rows']:,} rows " + ", ".join(f"{k} {v:.2f} ms" for k, v in t.items() if k != "rows")
+        for t in found["timings"])
+    del wq, ws, bias
+    torch.cuda.empty_cache()
+    _fc1_cfg.clear()
+    try:
+        found["group_cuda"] = calibrate_group_cuda(device, tuple(found["fc1_group"]), reps=reps, iters=iters)
+    except Exception as exc:        # noqa: BLE001 - the Triton kernel serves every group layer
+        found["group_cuda"] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
+    return found
+
+
+# =====================================================================================================================
+# The group GEMM on pixal3d_kernels' CUDA kernel (sm_80+)
+# =====================================================================================================================
+
+# The group GEMM's layers (activations scaled per row and 128-K slab, weights per output channel: the "detail"
+# policy's to_qkv, fc1 and fc2) can run pixal3d_kernels' sm_80+ kernel (int8_gemm_group80) instead of the Triton one.
+# Its arithmetic is the Triton kernel's instruction for instruction (each slab's exact int32 sum, the fp32
+# accumulation in slab order, the same epilogue down to libdevice's tanhf), so the numbers are the same bit for bit
+# (checked once a process on small tables: group_cuda_check, and on the flows' shapes when the install races the two
+# kernels: calibrate_group_cuda). Which layer forms take which of its tiles is the race's (the record's "triton" ->
+# "int8_tiles" -> "group_cuda"); a form it did not choose, or a record of another card, Triton or kernel build, keeps
+# the Triton kernel. PIXAL3D_INT8_GEMM = triton | cuda forces one for every group layer (developers; "cuda" takes the
+# record's tile, else GROUP_CUDA_DEFAULT).
+GROUP_CUDA_ENV = "PIXAL3D_INT8_GEMM"
+GROUP_CUDA_FORMS = {"qkv": (4608, 1536, False, "bf16"), "fc1": (8192, 1536, True, "int8"),
+                    "fc2": (1536, 8192, False, "bf16")}     # the forms raced at install: N, K, GELU, out
+GROUP_CUDA_CANDIDATES = {"bf16": (0, 1, 2, 3, 4), "int8": (2, 4, 6)}   # the kernel's tiles raced per output kind
+GROUP_CUDA_DEFAULT = {"bf16": 2, "int8": 4, "fp16": 2}                # a forced run's tiles where the record has none
+GROUP_CUDA_GROUP_M = 8                  # the tile order (row tiles per group: Triton's GROUP_M)
+GROUP_CUDA_MARGIN = 0.03                # a tile serves only where it is this much faster than Triton at every size
+GROUP_CUDA_ROWS = FC1_TILE_ROWS
+_group_cuda: dict = {"op": None, "checked": {}, "choice": {}, "said": False}
+
+
+def group_cuda_op() -> Optional[Callable]:
+    """pixal3d_kernels' int8_gemm_group80 where the installed build has it and runs on this card, else None."""
+    if _group_cuda["op"] is None:
+        _group_cuda["op"] = False
+        try:
+            import pixal3d_kernels  # noqa: F401
+
+            ops = torch.ops.pixal3d_kernels
+            if bool(ops.int8_gemm_group80_loaded()):
+                _group_cuda["op"] = ops.int8_gemm_group80
+        except Exception:       # noqa: BLE001 - no package, an older build, no sm_80+ code for the card
+            pass
+    return _group_cuda["op"] or None
+
+
+def _kernels_build() -> str:
+    try:
+        from importlib import metadata
+
+        return metadata.version("pixal3d_kernels")
+    except Exception:       # noqa: BLE001
+        return ""
+
+
+def group_cuda_stands(int8_tiles: Optional[dict]) -> bool:
+    """Whether an install record's int8_tiles entry holds the race this build would make (calibrate.py's due rule):
+    a "group_cuda" entry made with the installed pixal3d_kernels build, or one that could not race (no kernel then,
+    or a failure: not tried again by itself), or no kernel to race now."""
+    entry = (int8_tiles or {}).get("group_cuda")
+    if not isinstance(entry, dict):
+        return group_cuda_op() is None
+    return not entry.get("ok") or entry.get("kernels") == _kernels_build() or group_cuda_op() is None
+
+
+def _tile_info(tile: int) -> list:
+    return [int(v) for v in torch.ops.pixal3d_kernels.int8_gemm_group80_info(int(tile))]
+
+
+def _form_key(N: int, K: int, gelu: bool, out: str) -> str:
+    return f"{N}x{K}{'.gelu' if gelu else ''}.{out}"
+
+
+def _group_cuda_choice(device: torch.device) -> dict:
+    """{form key: tile} for this card (PIXAL3D_INT8_GEMM, else the install's race), or {"*": None} for none."""
+    key = str(device)
+    if key not in _group_cuda["choice"]:
+        forced = os.environ.get(GROUP_CUDA_ENV, "").strip().lower()
+        choice: dict = {}
+        if forced not in ("", "triton", "cuda"):
+            print(f"[INT8] {GROUP_CUDA_ENV}={forced!r} is neither triton nor cuda: the install's choice serves",
+                  flush=True)
+            forced = ""
+        if forced != "triton" and group_cuda_op() is not None:
+            try:
+                from .. import calibration
+                import triton
+
+                entry = (((calibration.section("triton", device) or {}).get("int8_tiles") or {}).get("group_cuda")
+                         or {})
+                tiles = entry.get("tiles") or {}
+                if (entry.get("ok") and entry.get("triton") == triton.__version__
+                        and entry.get("kernels") == _kernels_build()
+                        and all(_tile_info(int(t)) == list(info) for t, info in tiles.items())):
+                    choice = {k: int(t) for k, t in (entry.get("choice") or {}).items() if t is not None}
+            except Exception:       # noqa: BLE001 - no record, no Triton: the Triton kernel serves
+                choice = {}
+            if forced == "cuda":
+                choice["*"] = True
+        _group_cuda["choice"][key] = choice
+    return _group_cuda["choice"][key]
+
+
+def group_cuda_tile(xq: torch.Tensor, w_q: torch.Tensor, gelu: bool, out: str,
+                    resid: Optional[dict] = None) -> Optional[int]:
+    """The CUDA kernel's tile for this group GEMM call, or None where the Triton kernel serves (no choice for its
+    form, a form the kernel lacks: fp16 unless forced, a residual not in bf16, int8 out on N not in groups of 128;
+    or the first-use check failed)."""
+    if not xq.is_cuda or out not in ("bf16", "int8", "fp16"):
+        return None
+    choice = _group_cuda_choice(xq.device)
+    if not choice:
+        return None
+    N, K = w_q.shape
+    tile = choice.get(_form_key(N, K, gelu, out))
+    if tile is None and choice.get("*"):
+        tile = GROUP_CUDA_DEFAULT[out]
+    if tile is None or (out == "fp16" and not choice.get("*")) or (out == "int8" and N % GROUP):
+        return None
+    if resid is not None and any(t is not None and t.dtype != torch.bfloat16
+                                 for t in (resid.get("x"), resid.get("gate"), resid.get("second"))):
+        return None
+    if not group_cuda_check(xq.device, tile):
+        return None
+    if not _group_cuda["said"]:
+        _group_cuda["said"] = True
+        print(f"[INT8] the group-scaled layers run pixal3d_kernels' sm_80 GEMM where the install chose it "
+              f"({', '.join(f'{k} tile {t}' for k, t in sorted(choice.items()) if k != '*') or 'forced'}; "
+              f"{GROUP_CUDA_ENV})", flush=True)
+    return tile
+
+
+def group_cuda(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor,
+               bias: Optional[torch.Tensor], *, gelu: bool = False, out: str = "bf16", resid: Optional[dict] = None,
+               tile: int = 0):
+    """gemm()'s group path on pixal3d_kernels' kernel: the same arguments and results (bf16 / fp16 [M, N], or int8
+    [M, N] + scales [M, N / 128]), the residual modes included."""
+    rx = rg = r2 = None
+    if resid is not None:
+        rx, rg, r2 = resid["x"], resid.get("gate"), resid.get("second")
+        if rg is not None:
+            rg = rg.reshape(-1)
+    y, qs = group_cuda_op()(xq, xs, w_q, w_s, bias, gelu, {"bf16": 0, "int8": 2, "fp16": 3}[out], rx, rg, r2,
+                            int(tile), GROUP_CUDA_GROUP_M)
+    return (y, qs) if out == "int8" else y
+
+
+def _torch_resid(h: torch.Tensor, x: torch.Tensor, gate: Optional[torch.Tensor] = None,
+                 second: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """fused.residual's rounded mode in torch ops on the bf16 result h (the Triton epilogue's RESID arithmetic)."""
+    hf = h.float()
+    if gate is not None:
+        hf = (hf * gate.reshape(1, -1).float()).to(torch.bfloat16).float()
+    elif second is not None:
+        hf = (second.float() + hf).to(torch.bfloat16).float()
+    return (x.float() + hf).to(torch.bfloat16)
+
+
+def group_cuda_check(device: torch.device, tile: int) -> bool:
+    """Once a process per tile: the CUDA kernel's outputs torch.equal to the Triton kernel's on small tables (300
+    rows: masked tails; an outlier group) in the flows' forms - bf16 with a bias, int8 + scales with GELU (int8
+    tiles), fp16 where forced: Triton kernels the install's warm-up compiled, none compiled here - and its residual
+    modes equal to the residual's arithmetic on its own bf16 result. A mismatch turns the CUDA kernel off for the
+    process (once said)."""
+    key = (str(device), int(tile))
+    if key in _group_cuda["checked"]:
+        return _group_cuda["checked"][key]
+    ok, why = True, ""
+    try:
+        info = _tile_info(tile)
+        g = torch.Generator(device=device).manual_seed(3)
+        M, K, N = 300, 256, 384
+        x = torch.randn((M, K), device=device, dtype=torch.bfloat16, generator=g)
+        x[7, :9] = 50.0
+        w = torch.randn((N, K), device=device, dtype=torch.bfloat16, generator=g) * 0.05
+        b = torch.randn((N,), device=device, generator=g)
+        xq, xs = quantize_rows(x, GROUP)
+        wq, ws = quantize_weight(w)
+        forms = [("bf16", False, b)]
+        if info[1] % GROUP == 0 and GROUP % info[3] == 0:
+            forms.append(("int8", True, b))
+        if _group_cuda_choice(device).get("*"):
+            forms.append(("fp16", False, b))
+        for out, gelu, bias in forms:
+            cfg = fc1_group_cfg(device) if out == "int8" else CFG_GROUP
+            want = gemm(xq, xs, wq, ws, bias, gelu=gelu, out=out, group=GROUP, cfg=cfg, kernel="triton")
+            got = group_cuda(xq, xs, wq, ws, bias, gelu=gelu, out=out, tile=tile)
+            same = (torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])) if out == "int8" else \
+                torch.equal(got, want)
+            if not same:
+                ok, why = False, f"{out}{' + GELU' if gelu else ''} differs from the Triton kernel's"
+                break
+        if ok:
+            h = group_cuda(xq, xs, wq, ws, b, tile=tile)
+            rx = torch.randn((M, N), device=device, dtype=torch.bfloat16, generator=g)
+            gate = torch.randn((1, N), device=device, dtype=torch.bfloat16, generator=g)
+            for resid in ({"x": rx, "gate": gate}, {"x": rx, "second": h.flip(0).contiguous()}, {"x": rx}):
+                got = group_cuda(xq, xs, wq, ws, b, resid=resid, tile=tile)
+                if not torch.equal(got, _torch_resid(h, **resid)):
+                    ok, why = False, f"the residual ({', '.join(sorted(resid))}) differs from its arithmetic"
+                    break
+        torch.cuda.synchronize(device)
+    except Exception as exc:        # noqa: BLE001
+        ok, why = False, f"{type(exc).__name__}: {str(exc)[:200]}"
+    if not ok:
+        print(f"[INT8] pixal3d_kernels' sm_80 group GEMM (tile {tile}) is left out: {why}; the Triton kernel serves",
+              flush=True)
+    _group_cuda["checked"][key] = ok
+    return ok
+
+
+def calibrate_group_cuda(device: torch.device, fc1_cfg: tuple, reps: int = 6, iters: int = 5) -> dict:
+    """The install's race of the group layers (GROUP_CUDA_FORMS, as the flows run them: bias, fc1's GELU and int8
+    output, fc2 on fc1's output) between the Triton kernel (fc1 at fc1_cfg) and the CUDA kernel's tiles
+    (GROUP_CUDA_CANDIDATES) at GROUP_CUDA_ROWS rows: every tile's outputs torch.equal to Triton's, timed interleaved
+    (CUDA events, medians); per form the fastest equal tile serves where it is GROUP_CUDA_MARGIN faster than Triton
+    at every size. Returns the record's entry {"ok", "triton", "kernels", "tiles", "choice", "timings", "summary"}."""
+    import statistics
+
+    import triton
+
+    if group_cuda_op() is None:
+        return {"ok": False, "why": "pixal3d_kernels has no sm_80 group GEMM for this card"}
+    g = torch.Generator(device=device).manual_seed(0)
+    cands = sorted({t for ts in GROUP_CUDA_CANDIDATES.values() for t in ts})
+    found: dict = {"ok": True, "triton": triton.__version__, "kernels": _kernels_build(),
+                   "tiles": {str(t): _tile_info(t) for t in cands}, "choice": {}, "timings": []}
+    weights = {name: quantize_weight(torch.randn((n, k), device=device, dtype=torch.bfloat16, generator=g) * 0.03)
+               for name, (n, k, _, _) in GROUP_CUDA_FORMS.items()}
+    biases = {name: torch.randn(n, device=device, generator=g) * 0.1 for name, (n, _, _, _) in GROUP_CUDA_FORMS.items()}
+    wins = {name: {t: True for t in GROUP_CUDA_CANDIDATES[out]} for name, (_, _, _, out) in GROUP_CUDA_FORMS.items()}
+    totals = {name: {t: 0.0 for t in GROUP_CUDA_CANDIDATES[out]} for name, (_, _, _, out) in
+              GROUP_CUDA_FORMS.items()}
+    for m in GROUP_CUDA_ROWS:
+        x = torch.randn((m, 1536), device=device, dtype=torch.bfloat16, generator=g)
+        xq, xs = quantize_rows(x, GROUP)
+        del x
+        hq, hs = gemm(xq, xs, *weights["fc1"], biases["fc1"], gelu=True, out="int8", group=GROUP, cfg=fc1_cfg,
+                      kernel="triton")
+        for name, (n, k, gelu, out) in GROUP_CUDA_FORMS.items():
+            ax, axs = (hq, hs) if k == 8192 else (xq, xs)
+            cfg = fc1_cfg if out == "int8" else CFG_GROUP
+            run = {"triton": (lambda: gemm(ax, axs, *weights[name], biases[name], gelu=gelu, out=out, group=GROUP,
+                                           cfg=cfg, kernel="triton"))}
+            for t in GROUP_CUDA_CANDIDATES[out]:
+                run[t] = (lambda t=t: group_cuda(ax, axs, *weights[name], biases[name], gelu=gelu, out=out, tile=t))
+            want = run["triton"]()
+            for t in GROUP_CUDA_CANDIDATES[out]:
+                got = run[t]()
+                same = (torch.equal(got[0], want[0]) and torch.equal(got[1], want[1])) if out == "int8" else \
+                    torch.equal(got, want)
+                wins[name][t] = wins[name][t] and same
+                del got
+            del want
+            ms: dict = {c: [] for c in run}
+            order = list(run)
+            for rep in range(reps):
+                for c in (order if rep % 2 == 0 else order[::-1]):
+                    run[c]()
+                    events = []
+                    for _ in range(iters):
+                        start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                        start.record()
+                        run[c]()
+                        end.record()
+                        events.append((start, end))
+                    torch.cuda.synchronize(device)
+                    ms[c] += [a.elapsed_time(b) for a, b in events]
+            med = {c: statistics.median(v) for c, v in ms.items()}
+            found["timings"].append({"rows": m, "form": name, **{str(c): round(v, 3) for c, v in med.items()}})
+            for t in GROUP_CUDA_CANDIDATES[out]:
+                wins[name][t] = wins[name][t] and med[t] <= med["triton"] * (1 - GROUP_CUDA_MARGIN)
+                totals[name][t] += med[t]
+            del run, ms
+        del xq, xs, hq, hs
+        torch.cuda.empty_cache()
+    for name, (n, k, gelu, out) in GROUP_CUDA_FORMS.items():
+        best = [t for t, w in wins[name].items() if w]
+        found["choice"][_form_key(n, k, gelu, out)] = min(best, key=lambda t: totals[name][t]) if best else None
+    found["summary"] = "group layers: " + ", ".join(
+        f"{name} {'tile ' + str(found['choice'][_form_key(n, k, gelu, out)]) if found['choice'][_form_key(n, k, gelu, out)] is not None else 'Triton'}"
+        for name, (n, k, gelu, out) in GROUP_CUDA_FORMS.items()) + "; " + "; ".join(
+        f"{t['form']} {t['rows']:,} rows triton {t['triton']:.2f} ms, best tile "
+        f"{min((c for c in t if c not in ('rows', 'form', 'triton')), key=lambda c: t[c])} "
+        f"{min(v for c, v in t.items() if c not in ('rows', 'form', 'triton')):.2f} ms" for t in found["timings"])
+    del weights, biases
+    torch.cuda.empty_cache()
+    _group_cuda["choice"].clear()
+    return found
+
+
 def self_check(device: torch.device) -> Tuple[bool, str]:
     """Every path the card uses once on small tables (M = 300: masked tails), against fp64 from the same int8
     operands: the integer part exactly, the outputs (in the torso's dtype) within the epilogue's fp32 rounding
@@ -901,7 +1374,7 @@ def self_check(device: torch.device) -> Tuple[bool, str]:
         rq, rs = quantize_rows_torch(x, GROUP)
         if not (torch.equal(gq, rq) and torch.equal(gs, rs)):
             return False, "group quantize_rows differs from the torch reference"
-        got = gemm(gq, gs, wq, ws, b, group=GROUP, cfg=(64, 64, 128, 8, 3, 4))
+        got = gemm(gq, gs, wq, ws, b, group=GROUP, cfg=(64, 64, 128, 8, 3, 4), kernel="triton")
         worst, _ = within(got, reference(gq, gs, wq, ws, b), reference_mag(gq, gs, wq, ws, b), c=4 + K // GROUP)
         if worst > 1.0:
             return False, f"group GEMM {worst:.2f}x the fp32-rounding bound off"
@@ -952,6 +1425,18 @@ def _check_group_weights(device: torch.device, g: torch.Generator, x: torch.Tens
     return True, ""
 
 
+def _cuda_elementwise(device: torch.device) -> bool:
+    """Below sm_80, where the GEMM is pixal3d_kernels': whether that package's quantiser serves (the torch ops'
+    bits, checked once: modules/old_cards.py), where the Triton quantiser does not run (Pascal, a Turing card whose
+    Triton fails its check): 10-16 times the torch ops' speed. Triton's runs 2-30 % faster where it runs (an RTX 2070's
+    passes)."""
+    if _state["gemm"] != "cuda":
+        return False
+    from . import old_cards
+
+    return old_cards.quantiser_ok(device)
+
+
 def _triton_elementwise(device: torch.device) -> bool:
     """Whether the Triton quantiser and epilogue run on this card and give the torch ops' bits (a card below sm_80:
     Triton may run there, or not - Windows builds for Turing are untested - so nothing depends on it)."""
@@ -993,7 +1478,8 @@ def ready(device: torch.device) -> Tuple[bool, str]:
                 _state["gemm"], _state["elementwise"] = "triton", "triton"
             else:
                 _state["gemm"] = "cuda" if cuda_gemm_op() is not None else "intmm"
-                _state["elementwise"] = "triton" if _triton_elementwise(device) else "torch"
+                _state["elementwise"] = ("triton" if _triton_elementwise(device) else
+                                         "cuda" if _cuda_elementwise(device) else "torch")
             _state["ok"], _state["why"] = self_check(device)
             if not _state["ok"] and _state["gemm"] == "cuda":       # the package's kernel failed: per-row layers only
                 print(f"[INT8] pixal3d_kernels' GEMM is left out ({_state['why']}); torch._int_mm serves the per-row "

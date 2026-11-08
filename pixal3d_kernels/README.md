@@ -1,13 +1,15 @@
 # pixal3d_kernels
 
 Spellcast3D's own CUDA kernels for the Pixal3D fork, as one small torch extension (`pixal3d_kernels._C`, operators
-under `torch.ops.pixal3d_kernels`). Today it holds one operator: the flows' W8A8 linear with group scales for the cards
-Triton's int8 GEMM does not serve (Turing sm_75, Pascal sm_61). On sm_80 and newer the fork keeps its Triton kernel
-(modules/int8mm.py); this operator runs there too (the tensor-core kernel is plain sm_75 code), untuned.
+under `torch.ops.pixal3d_kernels`), for the cards the fork's Triton kernels do not serve (Turing sm_75, Pascal sm_61):
+the flows' W8A8 linear with group scales (`int8_gemm_group`), and the flows' element-wise chains of the eager code
+path (`quantize_rows`, `modulate`, `residual_gated`, `qk_norm_rope`: below, "The element-wise chains"). On sm_80 and
+newer the fork keeps its Triton kernels (modules/int8mm.py, fused.py) - but for the group-scaled GEMM, whose
+sm_80+ twin `int8_gemm_group80` the install races against Triton's (below) - and these operators run there too, untuned.
 
 ## Build
 
-    TORCH_CUDA_ARCH_LIST="6.1;7.5;8.0;8.6;8.9;9.0;12.0+PTX" python setup.py bdist_wheel     # the product's wheel
+    TORCH_CUDA_ARCH_LIST="6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0+PTX" python setup.py bdist_wheel # the product's wheel
     TORCH_CUDA_ARCH_LIST="7.5" python setup.py build_ext --inplace                          # one card (a pod)
 
 Verified: `TORCH_CUDA_ARCH_LIST="6.1;7.5" python setup.py bdist_wheel` on Linux (CUDA 12.8, torch 2.8.0+cu128) gives
@@ -125,3 +127,98 @@ card: `check.py` and `bench.py` (the speed, and GELU's hardware exp2 / reciproca
 code/devtools/pixal3d-lowmem/round-l/int8-gemm/: `check.py` (exactness and the fp32-rounding bound against int8mm's
 fp64 references on every scale layout, epilogue and output dtype, masked tails, the flows' shapes at M = 21,504),
 `bench.py` (the table above), `ubench_imma.cu` (the card's m8n8k16 ceiling).
+
+## The element-wise chains
+
+    torch.ops.pixal3d_kernels.quantize_rows(x, group, inv_smooth) -> (q, s)
+    torch.ops.pixal3d_kernels.modulate(h, scale1, shift, out_dtype) -> y
+    torch.ops.pixal3d_kernels.residual_gated(x, h, gate) -> y
+    torch.ops.pixal3d_kernels.qk_norm_rope(x, gamma, scale, eps, phases, out_dtype) -> y
+
+On Turing and Pascal the flows' blocks run their eager torch code (the fused Triton kernels are bf16-only), where each
+norm, modulation, residual, q / k RMS norm and rotary embedding is a chain of 3 to 10 kernels in fp32 (with fp16
+casts on Turing). Each operator here is one such chain in one kernel, with the chain's bits: every rounding the chain
+makes, in its order, with intrinsics that round once (`__fmul_rn`, `__fadd_rn`, `__fdiv_rn`, IEEE `sqrtf`; separate
+torch kernels are never contracted into an FMA, and neither are these). modules/old_cards.py calls them from the
+blocks and checks each against its chain once a process on the card (a torch whose kernels round otherwise turns them
+off); modules/int8mm.py takes the quantiser below sm_80. Which of them serve on a card is the install's race
+(old_cards.calibrate, the calibration record's "old_cards": each against its chain at two of the flows' sizes, on only
+where it is 5 % faster at both).
+
+| operator | the eager chain (one item; rows of C channels) |
+|---|---|
+| quantize_rows | int8mm.quantize_rows_torch: x.float() [* inv_smooth], amax of the row's (group's) \|x\| (exact), floored at 1e-30, q = rint(x * (127 / amax)) clamped to +-127, s = amax / 127; fp16 / fp32 / bf16 in, per row or per 128 (any group dividing K) |
+| modulate | after LayerNorm32: `(h * (1 + scale) + shift)` then the cast to the sub-layers' dtype (h fp32; 1 + scale is the caller's own torch op) |
+| residual_gated | `x + h.float() * gate` (x fp32, h fp16 or fp32, gate one row) |
+| qk_norm_rope | `(F.normalize(x.float(), dim=-1) * gamma * scale).to(x.dtype)` (MultiHeadRMSNorm) and, with phases, `view_as_real(view_as_complex(y.float()) * phases).to(x.dtype)` (the rotary embedding): x [T, H, 128] with any token / head strides |
+
+The q / k norm's sum of squares is torch's own reduction order for 128 values a row (Reduce.cuh with its config for
+that shape: 32 lanes along the row, no vectorised input since 128 is not above 128, four accumulators a lane at
+stride 32 each holding one square, combined in order, then shuffles down at offsets 1, 2, 4, 8, 16); the complex
+product is c10::complex's own operator, as torch's mul kernel has it. Checked bit for bit (code/devtools/pixal3d-lowmem
+/round-n/old-cards/check_kernels.py: random tables with outliers and zero rows, every dtype the profiles use, odd row
+counts, and the tensors captured from the flows' real passes) on an RTX 2070 (Linux, torch 2.8.0+cu128: 109 checks)
+and on an RTX 3060 against Windows' torch 2.8.0+cu128 (sm_86 code; the turing profile's fp16 chains, 85 checks, and
+the pascal profile's fp32 ones, 70); and the boy at 1024 and the ork made through the whole pipeline with them on the
+RTX 2070 give the decoded meshes of the eager code, byte for byte. Not run on a Pascal card: there the first-use check
+(old_cards.py) decides.
+
+Times on the RTX 2070 (CUDA events, medians; 5,084 tokens = an hr / tex pass of the boy at 1024, C = 1536, 12 heads):
+
+| chain | eager | kernel |
+|---|---|---|
+| q / k norm + rope (one of q, k) | 1.30 ms | 0.16 ms |
+| q norm (cross attention) | 0.87 ms | 0.10 ms |
+| modulate | 0.48 ms | 0.17 ms |
+| residual_gated | 0.57 ms | 0.21 ms |
+| quantize_rows, K 1536, group 128 | 1.11 ms torch ops, 0.115 ms Triton | 0.09 ms |
+| quantize_rows, K 1536, per row | 1.08 ms torch ops, 0.115 ms Triton | 0.08 ms |
+| quantize_rows, K 8192 (fc1's hidden), group 128 | 5.57 ms torch ops, 0.37 ms Triton | 0.34 ms |
+
+(Whole calls, the launch included. Inside the flows' passes, where the CPU runs ahead, the Triton quantiser's kernel
+alone is the faster one on the RTX 2070 - 61 against 64 us per row and group, 319 against 326 us on fc1's hidden
+layer - so int8mm keeps Triton's where it passes its check and takes this one where Triton does not run: Pascal,
+and a Turing card whose Triton fails.) The boy at 1024 through the whole pipeline on the RTX 2070 with these
+kernels: one conditional pass of ss 601.6 -> 498.0 ms, lr 149.0 -> 118.4, hr 559.9 -> 430.6, tex 557.4 -> 431.1
+(kernels a pass 2,234 -> 1,093 in hr); its decoded mesh the same bytes.
+
+An int8 output for fc1 (the hidden layer quantised in the GEMM's epilogue, bit-identical to the quantiser on its fp16
+table) was measured 16-21 % slower than the GEMM plus this quantiser on the RTX 2070 (its epilogue's arithmetic is
+exposed at one block an SM) and is not part of the package (round-n/old-cards/int8-out-epilogue/).
+
+## sm_80+: the group GEMM in the Triton kernel's bits
+
+    torch.ops.pixal3d_kernels.int8_gemm_group80(xq, xs, wq, ws, bias, gelu, out, rx, rg, r2, tile, group_m) -> (y, qs)
+    torch.ops.pixal3d_kernels.int8_gemm_group80_info(tile) -> [BM, BN, WM, WN, BK, STAGES, blocks per SM, shared, threads]
+    torch.ops.pixal3d_kernels.int8_gemm_group80_loaded() -> bool
+
+`csrc/int8_gemm_sm80.cu` (+ `.h`, `ops_sm80.cpp`, a fragment of the package's op library): the hr / tex flows'
+group-scaled layers (activations scaled per row and 128-K slab, weights per output channel) for sm_80 and newer, with
+modules/int8mm.py's Triton "group" kernel's numbers bit for bit in every output form: bf16 / fp16, the block's
+residual on the bf16 result (rx with rg = a gate row, or r2 = a second term, or neither), int8 + one fp32 scale per
+row and 128 columns (out 2: fc1's output for fc2). The arithmetic is the Triton kernel's PTX instruction for
+instruction (int8_gemm_sm80.h: per slab the exact int32 sum, `fma.rn` into the fp32 accumulator in slab order; the
+epilogue's `fma.rn`, libdevice's tanhf as Triton links it - its ftz build -, `div.rn.ftz`, `cvt.rni`). Requirements:
+K % 128 == 0, N % 16 == 0 (int8 out: N % 128 == 0), xs [M, K / 128] with unit stride along K, ws [N], bias fp32 [N] or
+None, rx / r2 bf16 [M, N], rg bf16 [N]. Below sm_80 the kernel compiles to an empty stub that `..._loaded()` reports
+and the op refuses.
+
+The kernel: mma.sync.m16n8k32, ldmatrix.x4 from XOR-swizzled tiles, cp.async in 2-4 slots, four warps and 48 KB a
+block, two blocks per SM. `tile` picks one of seven configurations (64 x 128 or 128 x 64 blocks, 64- or 128-K
+stages); modules/int8mm.py races them against the Triton kernel at install (calibrate_group_cuda) and records the
+fastest per layer form where it beats Triton by 3 %; `group_m` is the tile order (Triton's GROUP_M; int8mm passes 8).
+
+RTX 3060 (interleaved CUDA-event medians, random tables, bits equal on every tile; ms, Triton -> the best tile):
+
+| rows | to_qkv 1536 -> 4608 | fc1 1536 -> 8192, GELU, int8 out | fc2 8192 -> 1536 |
+|---:|---|---|---|
+| 8,192 | 1.808 -> 1.675 (-7.4 %) | 3.625 -> 3.294 (-9.1 %) | 2.986 -> 2.877 (-3.6 %) |
+| 19,928 | 4.394 -> 4.178 (-4.9 %) | 8.735 -> 8.069 (-7.6 %) | 7.175 -> 7.319 (+2.0 %) |
+| 21,504 | 4.713 -> 4.474 (-5.1 %) | 9.276 -> 8.612 (-7.2 %) | 7.710 -> 7.821 (+1.4 %) |
+| 43,529 | 9.323 -> 9.125 (-2.1 %) | 18.913 -> 17.574 (-7.1 %) | 16.011 -> 16.325 (+2.0 %) |
+
+Without their global copies the four-warp tiles reach 100 TOPS on fc2's shape (92 % of the card's int8 peak); with
+them 66-69: the 64 x 128 blocks move half again the bytes per product of the per-row Triton kernel's 128 x 128 ones
+(86 TOPS), which need 64 x 64 warp tiles - more registers than the slab sums and the fp32 accumulators leave. One
+8-warp block per SM, two halves of a 64 x 64 warp tile, fragments double-buffered across stages and a later copy issue
+were all slower (code/devtools/pixal3d-lowmem/round-n/group-gemm/README.md).

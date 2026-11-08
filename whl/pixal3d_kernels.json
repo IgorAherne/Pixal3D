@@ -1,22 +1,37 @@
 {
-  "wheel": "pixal3d_kernels-0.1.0-cp39-abi3-win_amd64.whl",
-  "sha256": "83ad18ae1f5c07b4a5a53981e4edf92eefc4758e041fc906d4313f190cc35d14",
-  "size_bytes": 601283,
-  "built": "2026-11-03T07:31:34+00:00",
-  "build_seconds": 28,
+  "wheel": "pixal3d_kernels-0.2.0-cp39-abi3-win_amd64.whl",
+  "sha256": "c4c4ae4935adbdd5fb84fd84937795e7f3d9f29f333b45d1daf29498c6a4e95d",
+  "size_bytes": 2950155,
+  "built": "2026-11-08T05:38:14+00:00",
+  "build_seconds": 54,
   "source": {
     "path": "C:\\_myDrive\\repos\\spellcast3d\\code\\pixal3d\\pixal3d_kernels",
-    "commit": "6b627477550acf27309e58b83801c6f6b9905263",
-    "branch": "the fork's branch hi3d (pixal3d_kernels/)"
+    "commit": "02e22419bc3fcbc711bd85d3b6b555f4e7b64874",
+    "branch": "the fork's master (pixal3d_kernels/), with this round's uncommitted changes: the files below",
+    "files_sha256": {
+      "csrc/elementwise.cu": "a3698368fbc3c696b4ddd408e4318c8f0a182bc6b3155e59e13745c2bb524719",
+      "csrc/elementwise.h": "5d871fa28e25a2c1d00946b6f0b0f268a686c01c4bc15f81b537ee889780044f",
+      "csrc/int8_gemm.h": "596878131593642725df6fa250d5850ce936ed04209b03d75ac371f70a767ad8",
+      "csrc/int8_gemm_common.cuh": "d1e9a7c5741029c3d4d3281a4807e42df4d19ab5d79719aafdb4c70ac1778505",
+      "csrc/int8_gemm_dp4a.cu": "a18d6f92060e42a7c49fd892eb97957d2889c624e89542cc4b96105f7a910f5e",
+      "csrc/int8_gemm_imma.cu": "8d2abb03f144b88c29bc9b71942669599325d0a91f6f9adbe702446b6f83d35f",
+      "csrc/int8_gemm_sm80.cu": "815d0f7063d22bde6340b44d060dbcdc4e51bd692364a125e70e43b3c9896b41",
+      "csrc/int8_gemm_sm80.h": "01b2e9a29c9558b69ba400ee59155c63c291618e9d7a2fd627ebe8dd3f37b6f6",
+      "csrc/ops.cpp": "6f29e0fd846bec0fd4c57ba99e9c18af7d926c8c7e83822889cf2dd61d182506",
+      "csrc/ops_sm80.cpp": "63fd627c70ec7d241285fab02972b949a5c442cb46db379048a49ee75ba4b704",
+      "pixal3d_kernels/__init__.py": "e6a5fbaad28fd27df0a8dfba1652ca97cf92870dfdda026a6cbafac2373a0ab8",
+      "README.md": "0991d65b9542c214d5c42bbff9bb1444aacf6b813ac0edd1ebb627d974998fe7",
+      "setup.py": "10cf41e4424b594c644d8fd59df8f9936664f5ec76b332ad64fbbe8089d68b64"
+    }
   },
-  "what_for": "Spellcast3D round L: the flows' W8A8 linear with group scales for the cards Triton's int8 GEMM does not serve (Turing's tensor cores, Pascal's dp4a); modules/int8mm.py's cuda path",
+  "what_for": "Spellcast3D round L: the flows' W8A8 linear with group scales for the cards Triton's int8 GEMM does not serve (Turing's tensor cores, Pascal's dp4a); modules/int8mm.py's cuda path. Round N: the eager code's element-wise chains below sm_80 (elementwise.cu, modules/old_cards.py), and on sm_80+ int8_gemm_group80 (int8_gemm_sm80.cu, ops_sm80.cpp): the group-scaled GEMM with the Triton kernel's bits, raced against it at install (modules/int8mm.py calibrate_group_cuda)",
   "build": {
-    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\kernels\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\round-l\\kernels\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\kernels\\wheel-out",
+    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-n-gg\\kernels\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\ROUND-~2\\kernels\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-n-gg\\kernels\\wheel-out",
     "env": {
       "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
       "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
       "DISTUTILS_USE_SDK": "1",
-      "MAX_JOBS": "6",
+      "MAX_JOBS": "4",
       "NVCC_THREADS": "1",
       "CUDA_VISIBLE_DEVICES": "-1",
       "TORCH_CUDA_ARCH_LIST": "6.1;7.0;7.5;8.0;8.6;8.9;9.0;12.0+PTX"

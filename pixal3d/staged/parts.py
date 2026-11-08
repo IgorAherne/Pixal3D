@@ -136,10 +136,18 @@ FLOW_INT8_CONVERTED_MIB = 1_121     # the token-sized linears as int8 (policy "d
 FLOW_REST_MIB = 436                 # what stays in the torso's dtype beside them, in bf16
 SAMPLER_MIB_PER_KTOKEN = 50
 SAMPLER_SLACK = 1.25
-PROJ_CACHE_SLACK = 1.1              # over the kept proj_linear answers' bytes (proj_cache_fits)
-PROJ_CACHE_MARGIN_MIB = 1_536       # what must stay free under the cap beside the sampler and the kept tables: on a
-#                                     7-8 GB card's cap (6.8-7.1 GB) the tables of a 1536 prop left 72 MiB (round J's
-#                                     emulated run: hr reserved 6,964 of 7,036), so they are for caps of about 9 GB on
+PROJ_CACHE_SLACK = 1.1              # over the kept proj_linear answers' bytes (proj_cache_count)
+PROJ_CACHE_MARGIN_MIB = 512         # free under the cap beside the sampler and the kept tables (proj_cache_count).
+#                                     sampler_mib is itself above a bf16 sampling's peak: on a 7.2 GiB card's 6.2 GB cap
+#                                     the ork's hr (30.5k tokens) allocated 2,737 MiB without tables (sampler_mib
+#                                     3,853) and 5,451 with all 30, the allocator's cache filling the cap with one
+#                                     retry and no failure; this margin keeps 18-19 of its blocks there (4.4 GB
+#                                     allocated) and all of a 20k-token prop's
+PROJ_CACHE_FP32_TOKENS = 2.0        # the per-token part of the sampler beside the tables, times this for an fp32
+#                                     torso (proj_cache_sampler_mib): a sampling there allocates 86-89 MiB per
+#                                     thousand tokens beyond the weights and the tables (the boy, the pascal profile
+#                                     forced on an RTX 3060), twice bf16's 39-45; the fp16 torso with its fp32 stream
+#                                     (turing) measured 52, within sampler_mib's 62.5
 HOOK_RAM_BASE_MIB = 1_500
 HOOK_RAM_MIB_PER_MVOXEL = 200
 RAM_FLOOR_MIB = 1_500               # what must stay available to Windows and the hub beside the hook's own need
@@ -245,16 +253,17 @@ def reserve_faces(native_mib: int) -> int:
 
 def next_sampler_mib(flow: Any, tokens: int, cap_mib: float, weights_mib: int | None = None) -> float:
     """MiB the next prop's texture sampling takes on the card beside what is kept for it: its sampler
-    (sampler_mib, with the flow's `weights_mib` where known) and, where the cap in force leaves room for them beside
-    it, the flow's kept proj_linear answers (the same test as proj_cache_fits', so that the decoders the pair keeps
-    never take that room: the sampling would run out of memory and run again with them gone). A flow without such
-    answers, or one that cannot say, needs its sampler alone."""
-    sampler = sampler_mib(tokens, weights_mib)
+    (proj_cache_sampler_mib, with the flow's `weights_mib` where known) and the proj_linear answers of the blocks
+    that will keep theirs under the cap in force (proj_cache_count, the rule of proj_cache_blocks, so that the
+    decoders the pair keeps never take that room: the sampling would run out of memory and run again with them
+    gone). A flow without such answers, or one that cannot say, needs its sampler alone."""
+    sampler = proj_cache_sampler_mib(tokens, weights_mib)
     try:
-        proj = PROJ_CACHE_SLACK * proj_cache_mib(flow, tokens) if flow is not None else 0.0
+        tables = proj_cache_tables_mib(flow, tokens) if flow is not None else []
     except Exception:           # noqa: BLE001 - no proj cache to make room for
-        proj = 0.0
-    return sampler + proj if proj_cache_room(sampler, proj / PROJ_CACHE_SLACK, cap_mib) else sampler
+        tables = []
+    kept = proj_cache_count(sampler, tables, cap_mib)
+    return sampler + PROJ_CACHE_SLACK * sum(tables[:kept])
 
 
 def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: list) -> frozenset:
@@ -374,10 +383,20 @@ def sampler_mib(tokens: int, weights_mib: int | None = None) -> float:
     return SAMPLER_SLACK * (weights + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
 
 
+def proj_cache_sampler_mib(tokens: int, weights_mib: int | None = None) -> float:
+    """MiB a flow sampler needs on the card beside the proj_linear answers it keeps (the one figure of
+    proj_cache_blocks and next_sampler_mib): sampler_mib's, with its per-token part PROJ_CACHE_FP32_TOKENS times
+    as wide for an fp32 torso. Which props a card can make (resolution_fits) stays with sampler_mib."""
+    if precision.torso() != torch.float32:
+        return sampler_mib(tokens, weights_mib)
+    weights = FLOW_BF16_MIB if weights_mib is None else weights_mib
+    return SAMPLER_SLACK * (weights + PROJ_CACHE_FP32_TOKENS * SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+
+
 def flow_weights_mib(ctx: PartContext, kind: str) -> int:
-    """MiB the 1024-grid flow network of `kind` (hr, tex, lr) takes on the card: the loader's figure while it is
-    loaded, else what this card's torso and the int8 policy give (a converted flow keeps its token-sized linears as
-    int8 whatever the torso)."""
+    """MiB the flow network of `kind` (hr, tex, lr; ss) takes on the card: the loader's figure while it is loaded,
+    else what this card's torso and the int8 policy give (a converted flow keeps its token-sized linears as int8
+    whatever the torso)."""
     size_of = getattr(getattr(ctx, "loader", None), "size_mib", None)
     if size_of is not None:
         for name in (f"{kind}_flow.sv", f"{kind}_flow.mv"):
@@ -406,38 +425,55 @@ def _int8_converts(kind: str) -> bool:
     return getattr(int8, "_state", None) is not False
 
 
+def proj_cache_tables_mib(flow: Any, tokens: int) -> list:
+    """MiB of the proj_linear answer each block of the flow keeps for a prop of `tokens` tokens, block by block."""
+    from ..modules.sparse.attention.proj_attention import proj_cache_tables
+
+    return [size / 2**20 for size in proj_cache_tables(flow, tokens)]
+
+
 def proj_cache_mib(flow: Any, tokens: int) -> float:
-    """MiB the flow's blocks keep when their proj_linear answers are cached for a prop of `tokens` tokens."""
-    from ..modules.sparse.attention.proj_attention import proj_cache_bytes
-
-    return proj_cache_bytes(flow, tokens) / 2**20
+    """MiB the flow's blocks keep when all of them cache their proj_linear answers for a prop of `tokens` tokens."""
+    return sum(proj_cache_tables_mib(flow, tokens))
 
 
-def proj_cache_room(sampler: float, need: float, cap_mib: float) -> bool:
-    """Whether `need` MiB of kept proj_linear answers fit beside a sampler of `sampler` MiB under `cap_mib`, with
-    PROJ_CACHE_MARGIN_MIB to spare (the one test of proj_cache_fits and next_sampler_mib)."""
-    return need > 0 and sampler + PROJ_CACHE_SLACK * need + PROJ_CACHE_MARGIN_MIB <= cap_mib
+def proj_cache_count(sampler: float, tables: list, cap_mib: float) -> int:
+    """How many blocks of a flow, the first ones, may keep their proj_linear answers (`tables`: the MiB of each
+    block's) beside a sampler of `sampler` MiB under `cap_mib`: each table with PROJ_CACHE_SLACK on top, and
+    PROJ_CACHE_MARGIN_MIB to spare beside them all (the one rule of proj_cache_blocks and next_sampler_mib)."""
+    room = cap_mib - sampler - PROJ_CACHE_MARGIN_MIB
+    count = 0
+    for mib in tables:
+        room -= PROJ_CACHE_SLACK * mib
+        if mib <= 0 or room < 0:
+            break
+        count += 1
+    return count
 
 
-def proj_cache_fits(ctx: PartContext, flow: Any, tokens: int, kind: str = "hr") -> bool:
-    """Whether the flow may keep its blocks' proj_linear answers across a sampling's conditional steps for a prop
-    of `tokens` tokens: the same bits one GEMM per block cheaper every pass after the first (157 ms of a 3.1 s
-    detail pass at 21.5k tokens), for 1.9 GB on the card there - taken only where the cap in force has that room
-    beside the sampler's own need with PROJ_CACHE_MARGIN_MIB to spare (the 12 GB card at 1536; never a 7-8 GB
-    one), never on the CPU or when the cap was lifted."""
+def proj_cache_blocks(ctx: PartContext, flow: Any, tokens: int, kind: str, mode: str) -> int:
+    """How many of the flow's blocks keep their proj_linear answer across a sampling's conditional steps for a
+    prop of `tokens` tokens (`kind`: ss, lr, hr or tex): the same bits, one GEMM a block cheaper every conditional
+    pass after the first (all 30 blocks: 157 ms of a 3.1 s detail pass at 21.5k tokens, for 1.9 GB on the card
+    there). As many blocks as the cap in force has room for beside the sampler's own need (proj_cache_sampler_mib;
+    proj_cache_count: every block on the 12 GB card at 1536, some on a 7-8 GB one); none on the ladder's tight rung
+    (an attempt that ran out of memory runs again without them), on the CPU, or when the cap was lifted."""
+    if mode != "normal":
+        return 0
     limits = card_limits(ctx)
     if limits is None:
-        return False
-    return proj_cache_room(sampler_mib(tokens, flow_weights_mib(ctx, kind)), proj_cache_mib(flow, tokens), limits[1])
+        return 0
+    tables = proj_cache_tables_mib(flow, tokens)
+    return proj_cache_count(proj_cache_sampler_mib(tokens, flow_weights_mib(ctx, kind)), tables, limits[1])
 
 
-def _drop_proj_cache(ctx: PartContext, flow: Any, part: str, prop: PropState) -> None:
-    from ..modules.sparse.attention.proj_attention import drop_proj_caches
+def _drop_proj_cache(ctx: PartContext, flow: Any, part: str, prop: PropState, blocks: int) -> None:
+    from ..modules.sparse.attention.proj_attention import drop_proj_caches, proj_cache_tables
 
     freed = drop_proj_caches(flow)
     if freed:
-        print(f"[PROJ-CACHE] {part} {prop.id}: proj_linear's answers kept across the conditional steps "
-              f"({freed / 2**20:,.0f} MiB), dropped", flush=True)
+        print(f"[PROJ-CACHE] {part} {prop.id}: proj_linear's answers kept across the conditional steps in "
+              f"{blocks} of {len(proj_cache_tables(flow, 1))} blocks ({freed / 2**20:,.0f} MiB), dropped", flush=True)
 
 
 def hook_ram_mib(voxels: int) -> float:
@@ -691,13 +727,14 @@ def _as_reference_layout(cond: dict, multi: bool) -> dict:
     return {**cond, "proj": proj.transpose(1, 2).contiguous().transpose(1, 2)}
 
 
-def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True, proj_cache: bool = False) -> dict:
+def _token_cond(cond: dict, coords: torch.Tensor, negative: bool = True, proj_cache: int = 0) -> dict:
     """{"cond", "neg_cond"} of a sparse stage: the stored rows on the prop's coords, and zeros of the same form.
-    `proj_cache`: the flow keeps each block's proj_linear answer across the conditional steps (proj_cache_fits)."""
+    `proj_cache`: how many of the flow's blocks, the first ones, keep their proj_linear answer across the
+    conditional steps (proj_cache_blocks)."""
     pair = {"cond": {"global": cond["global"], "proj": SparseTensor(feats=cond["proj"], coords=coords)},
             "neg_cond": None}
     if proj_cache:
-        pair["cond"]["proj_cache"] = True
+        pair["cond"]["proj_cache"] = int(proj_cache)
     if negative:
         zero = _proj_cond().negative(cond)
         pair["neg_cond"] = {"global": zero["global"], "proj": SparseTensor(feats=zero["proj"], coords=coords),
@@ -801,12 +838,19 @@ def draw_sparse_structure(ctx: PartContext, prop: PropState, mode: str, cond: di
 def ss(ctx: PartContext, prop: PropState, mode: str) -> None:
     store, request = ctx.store, prop.req
     cond = _as_reference_layout(ctx.take(prop, "cond_ss"), prop.req.multi)
-    pair = {"cond": cond, "neg_cond": _proj_cond().negative(cond)}
+    # The dense flow's blocks keep their proj_linear answers like the sparse flows' (one [4096, 1536] table a
+    # block, 377 MB in bf16 for all 30): the guard's draws all take this conditioning, so they share them.
+    flow = _network(ctx, f"ss_flow.{prop.kind}")
+    cached = proj_cache_blocks(ctx, flow, int(getattr(flow, "resolution", 0)) ** 3, "ss", mode)
+    pair = {"cond": {**cond, "proj_cache": cached} if cached else cond, "neg_cond": _proj_cond().negative(cond)}
     draws = [] if geometry(prop) == "hi3d" else None
     draw = functools.partial(draw_sparse_structure, ctx, prop, mode, draws=draws)
     torch.manual_seed(request.seed)
-    with ctx.hooks.prop_scope(request, "ss") as found, ctx.engine.drawing(draw):
-        coords = ctx.engine.sample_sparse_structure(pair, 32, 1, request.sampler_params.get("ss", {}))
+    try:
+        with ctx.hooks.prop_scope(request, "ss") as found, ctx.engine.drawing(draw):
+            coords = ctx.engine.sample_sparse_structure(pair, 32, 1, request.sampler_params.get("ss", {}))
+    finally:
+        _drop_proj_cache(ctx, flow, "ss", prop, cached)
     rng = torch.get_rng_state()
     if coords.shape[0] == 0:
         raise PropFailed("The first stage found no shape in the picture.")
@@ -840,8 +884,8 @@ def _shape_latent(ctx: PartContext, prop: PropState, mode: str, part: str, coord
     store, device, args = ctx.store, ctx.device, ctx.args(prop)
     flow = _network(ctx, f"{part}_flow.{prop.kind}")
     coords = store.get_small(prop.id, coords_key)["coords"].to(device)
-    pair = _token_cond(ctx.take(prop, f"cond_{part}"), coords,
-                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0], part))
+    cached = proj_cache_blocks(ctx, flow, coords.shape[0], part, mode)
+    pair = _token_cond(ctx.take(prop, f"cond_{part}"), coords, proj_cache=cached)
     params = {**args.sampler_params["shape"], **prop.req.sampler_params.get("shape", {})}
     torch.set_rng_state(store.get_small(prop.id, rng_key)["state"])
     noise = SparseTensor(feats=torch.randn(coords.shape[0], flow.in_channels).to(device), coords=coords)
@@ -851,7 +895,7 @@ def _shape_latent(ctx: PartContext, prop: PropState, mode: str, part: str, coord
             step_callback=_steps(ctx, prop, part, mode),
         ).samples
     finally:
-        _drop_proj_cache(ctx, flow, part, prop)
+        _drop_proj_cache(ctx, flow, part, prop, cached)
     slat = _denormalised(slat, args.shape_normalization)
     rng = torch.get_rng_state()
     store.put_small(prop.id, slat_key, {"feats": slat.feats.cpu()})
@@ -948,8 +992,9 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     coords = stored["coords"].to(device)
     params = {**args.sampler_params["tex"], **request.sampler_params.get("tex", {})}
     # A guidance strength of 1 runs only the positive pass: the zero conditioning would never be read.
+    cached = proj_cache_blocks(ctx, flow, coords.shape[0], "tex", mode)
     pair = _token_cond(ctx.take(prop, "cond_tex"), coords, negative=params.get("guidance_strength") != 1,
-                       proj_cache=proj_cache_fits(ctx, flow, coords.shape[0], "tex"))
+                       proj_cache=cached)
 
     std = torch.tensor(args.shape_normalization["std"])[None].to(device)
     mean = torch.tensor(args.shape_normalization["mean"])[None].to(device)
@@ -963,7 +1008,7 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
             step_callback=_steps(ctx, prop, "tex", mode),
         ).samples
     finally:
-        _drop_proj_cache(ctx, flow, "tex", prop)
+        _drop_proj_cache(ctx, flow, "tex", prop, cached)
     tex_feats = _denormalised(slat, args.tex_normalization).feats.cpu()
 
     store.put_small(prop.id, "tex_slat", {"feats": tex_feats})

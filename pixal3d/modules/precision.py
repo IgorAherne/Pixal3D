@@ -8,9 +8,10 @@ and a GTX 1080):
              flex_gemm's convolutions, natten.
     turing   sm_70 - sm_79 (RTX 20xx, GTX 16xx, Volta): no bf16 arithmetic (torch emulates it at a seventh of the
              fp16 rate, and no bf16 attention kernel exists) - the torso in fp16 on the tensor cores (27 TFLOPS on an
-             RTX 2060 Super); the int8 GEMMs through torch._int_mm (cuBLASLt's IMMA kernels, 82 TOPS there; Triton
-             emits no int8 MMA for sm_75) with the group-scaled layers kept in fp16 until a kernel for them exists;
-             attention through torch SDPA, xformers on request (flash_attn and SageAttention's wheel are sm_80+); the sparse
+             RTX 2060 Super); the int8 GEMMs through pixal3d_kernels' tensor-core kernel with group scales (Triton
+             emits no int8 MMA for sm_75; torch._int_mm's per-row layers where that package is missing);
+             attention through torch SDPA or the SageAttention wheel's Turing kernel where the install's calibration
+             ran it, xformers on request (flash_attn is sm_80+); the sparse
              decoders' convolutions on spconv (flex_gemm's are Triton kernels, which Windows cannot be trusted to
              compile for Turing - Triton elementwise kernels stay optional, behind their self-checks); NAF's
              neighborhood attention in plain torch (natten's wheel is sm_80+).
@@ -20,6 +21,11 @@ and a GTX 1080):
              fp32), attention through torch SDPA in fp32 (its fp16 kernel takes 20 times longer there), the decoders
              on spconv (in fp16, as their checkpoints say: fp32 decoders ran the biggest prop out of an 8 GB card), NAF in
              plain torch, and no Triton at all (Triton does not support Pascal).
+
+On both old profiles the flows' eager element-wise chains (norm modulations, gated residuals, the q / k RMS norm and
+rotary embedding, the int8 quantisers) run as pixal3d_kernels' CUDA kernels with the chains' own bits
+(modules/old_cards.py), and the decoders' spconv kernels are the ones the install's calibration chose
+(sparse/conv/spconv_choices.py), so that every process makes the same meshes.
 
 The profile follows the card (torch.cuda.get_device_capability) unless the environment says otherwise:
 PIXAL3D_PRECISION = ampere | turing | pascal forces one (developers, tests); PIXAL3D_CARD_SM = 75 (and the like)

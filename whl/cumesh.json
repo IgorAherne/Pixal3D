@@ -1,14 +1,14 @@
 {
-  "wheel": "cumesh-0.0.1.post5+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "b68d1cf333d7ae788cd17146fb5921f7c83c422d1687f44e8c49a98c9346590d",
-  "size_bytes": 13736646,
-  "built": "2026-11-04T19:51:57+00:00",
-  "build_seconds": 511,
+  "wheel": "cumesh-0.0.1.post6+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "1a54a41af3fa68c7006b5e4fb553b55e706e1a2f5323ddd08fae6902bd5cf81b",
+  "size_bytes": 13969948,
+  "built": "2026-11-08T03:03:07+00:00",
+  "build_seconds": 764,
   "sources": {
     "fork": {
       "repo": "https://github.com/IgorAherne/CuMesh.git",
       "branch": "spellcast3d",
-      "commit": "553a0043af0281a1b015af1b1975eb4e97e71f81",
+      "commit": "6e9875f3c5a49f68ced42a612609465d8f655de2",
       "license": "MIT (Microsoft TRELLIS.2's CuMesh)"
     },
     "upstream": {
@@ -36,8 +36,8 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "nothing at build time: the fork's commit is built as committed; the hunks are its commits' contents, and `patch_cumesh_win.py check` holds the commit equal to upstream + cubvh + the hunks",
-    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 33 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
-    "why": "the version (0.0.1.post4+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
+    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 50 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
+    "why": "the version (0.0.1.post6+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); cuBVH's tree built on several threads (the same tree byte for byte); the ray-stab's inside test for any subset of a call's points (raystab_inside: each point's rays seeded from its index in the full query, the same verdicts bit for bit) and an any-hit ray_hits query (equal to ray_trace's hit >= 0); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
@@ -47,7 +47,7 @@
       {
         "id": "local-version",
         "file": "pyproject.toml",
-        "commit": "cubvh: the tree built on several threads (post5; before it: Version 0.0.1.post4+cu128torch2.8)"
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points (post6; before it: the tree built on several threads, post5)"
       },
       {
         "id": "gitignore-vs",
@@ -203,6 +203,91 @@
         "id": "cubvh-build-threads",
         "file": "third_party/cubvh/src/bvh.cu",
         "commit": "cubvh: the tree built on several threads, the same tree byte for byte; version 0.0.1.post5+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-raystab-hits-declaration",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-raystab-hits",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-raystab-hits-kernel",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-tree-raystab-hits",
+        "file": "third_party/cubvh/include/gpu/bvh.cuh",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-api-raystab-hits",
+        "file": "third_party/cubvh/include/gpu/api_gpu.h",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-impl-raystab-hits",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "cubvh-bindings-raystab-hits",
+        "file": "third_party/cubvh/src/bindings.cpp",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "bvh-py-raystab-directions",
+        "file": "cumesh/bvh.py",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "bvh-py-raystab-inside",
+        "file": "cumesh/bvh.py",
+        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points and any range of its directions, the same verdicts bit for bit; version 0.0.1.post6+cu128torch2.8"
+      },
+      {
+        "id": "bvh-py-ray-hits",
+        "file": "cumesh/bvh.py",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-api-ray-hits",
+        "file": "third_party/cubvh/include/gpu/api_gpu.h",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-tree-ray-hits",
+        "file": "third_party/cubvh/include/gpu/bvh.cuh",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-impl-ray-hits",
+        "file": "third_party/cubvh/src/api_gpu.cu",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-bindings-ray-hits",
+        "file": "third_party/cubvh/src/bindings.cpp",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-ray-hits-declaration",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-ray-hits",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "cubvh-ray-hits-kernel",
+        "file": "third_party/cubvh/src/bvh.cu",
+        "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
       }
     ],
     "structure": [
@@ -357,7 +442,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post5+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post6+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs-post6b\\cumesh-build.log"
 }

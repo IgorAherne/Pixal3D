@@ -564,7 +564,8 @@ def install_dependencies(args):
         )
         run_command_with_retry(torch_cmd, "Installing PyTorch")
 
-        # 2. General Dependencies
+        # 2. General Dependencies (a new Triton pin re-times the calibration's int8 tile by itself: the record
+        # keeps the Triton version it was timed with, calibrate.py _triton_stands)
         print("\n--- Installing General Dependencies ---")
         general_deps = [
             "imageio==2.37.2", "imageio-ffmpeg==0.6.0", "tqdm==4.67.1", "easydict==1.13",

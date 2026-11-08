@@ -8,6 +8,7 @@ The kernels here do each group in one read and one write:
 
     norm_modulate   LayerNorm32(x) [* weight + bias] [* (1 + scale) + shift]                    -> x.dtype
     residual        x + gate * h,  x + h,  x + (h2 + h)                                         -> x.dtype
+    residual_row    x + row (one row per batch item, read at every row: the zero pass's kept row) -> x.dtype
     qk_norm_rope    F.normalize(q.float()) * gamma * sqrt(D), then the rotary embedding           -> q.dtype
 
 The switch is the environment variable PIXAL3D_FUSED, read once when this module is first imported (set_mode()
@@ -237,6 +238,24 @@ def _build():
                 t = round_bf16(t)
         tl.store(Y + offs, (x + t).to(dt), mask=mask)
 
+    @triton.jit(do_not_specialize=["n", "rows_per_batch"])
+    def residual_row_kernel(X, H, BIDX, Y, n, rows_per_batch, C, stride_h, HAS_BIDX: tl.constexpr,
+                            BLOCK: tl.constexpr):
+        # residual_kernel's x + h (no gate, no second term) with h one row per batch item, read at the element's
+        # column: the same one rounding of the sum
+        offs = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        dt = Y.dtype.element_ty
+        x = tl.load(X + offs, mask=mask, other=0.0).to(tl.float32)
+        row = offs // C
+        col = offs - row * C
+        if HAS_BIDX:
+            bi = tl.load(BIDX + row, mask=mask, other=0).to(tl.int64)
+        else:
+            bi = row // rows_per_batch
+        t = tl.load(H + bi * stride_h + col, mask=mask, other=0.0).to(tl.float32)
+        tl.store(Y + offs, (x + t).to(dt), mask=mask)
+
     @triton.jit(do_not_specialize=["n_rows", "phase_period"])
     def qk_kernel(X, Y, GAMMA, PH, n_rows, H, phase_period, stride_xt, scale, NORM: tl.constexpr,
                   ROPE: tl.constexpr, ROUNDED: tl.constexpr, D: tl.constexpr, BLOCK_R: tl.constexpr):
@@ -269,7 +288,8 @@ def _build():
             x = tl.reshape(tl.join(re, im), (BLOCK_R, D))
         tl.store(Y + rows[:, None] * D + dims[None, :], x.to(dt), mask=rmask[:, None])
 
-    _kernels = {"norm_modulate": norm_modulate_kernel, "residual": residual_kernel, "qk": qk_kernel,
+    _kernels = {"norm_modulate": norm_modulate_kernel, "residual": residual_kernel,
+                "residual_row": residual_row_kernel, "qk": qk_kernel,
                 "next_pow2": triton.next_power_of_2, "cdiv": triton.cdiv}
     return _kernels
 
@@ -338,6 +358,31 @@ def residual(x: torch.Tensor, h: torch.Tensor, *, gate: Optional[torch.Tensor] =
             batch_index if batch_index is not None else x, y, n, rows_per_batch or n // C, C, stride_g,
             GATE=gate is not None, SECOND=second is not None, HAS_BIDX=batch_index is not None,
             ROUNDED=MODE != "fp32", BLOCK=BLOCK, num_warps=8)
+    return y
+
+
+ROW_RESIDUAL = True     # residual_row without the expanded table (False: residual on row.expand(), the same bits)
+
+
+def residual_row(x: torch.Tensor, row: torch.Tensor, *, batch: int = 1, rows_per_batch: Optional[int] = None,
+                 batch_index: Optional[torch.Tensor] = None) -> torch.Tensor:
+    """x + row: the row [1, C], or one per batch item ([batch, 1, C] or [batch, C], found as `residual` finds the
+    gate's), read at every row of x - residual(x, row.expand(x.shape)) bit for bit, without the expanded table."""
+    C = x.shape[-1]
+    rows = row.reshape(-1, C)
+    if rows.shape[0] not in (1, batch) or rows.stride(-1) != 1:
+        raise ValueError(f"residual_row: a row of shape {tuple(row.shape)} for {batch} items of {C} channels")
+    if not ROW_RESIDUAL:
+        expanded = rows[:, None, :].expand(rows.shape[0], x.numel() // C // rows.shape[0], C)
+        return residual(x, expanded.reshape(x.shape))
+    k = _build()
+    x = x.contiguous()
+    n = x.numel()
+    y = torch.empty_like(x)
+    if n:
+        k["residual_row"][(k["cdiv"](n, 2048),)](
+            x, rows, batch_index if batch_index is not None else x, y, n, rows_per_batch or n // C, C,
+            0 if rows.shape[0] == 1 else rows.stride(0), HAS_BIDX=batch_index is not None, BLOCK=2048, num_warps=8)
     return y
 
 

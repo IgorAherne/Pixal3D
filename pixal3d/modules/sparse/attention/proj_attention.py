@@ -33,10 +33,10 @@ class SparseProjectAttention(nn.Module):
         self._zero_rows: Dict[int, torch.Tensor] = {}
         # Conditional passes: proj_linear's input, the projected conditioning, is the same tensor at every step of
         # a sampling, so its answer is too (one GEMM of one shape on one input gives the same bits each time).
-        # When the engine says the card has room for the 30 answers (`cache` below: parts.proj_cache_fits), the
+        # In the blocks the engine has room for (`cache` below: parts.proj_cache_blocks, the first K of 30), the
         # answer is kept with its input's identity (storage address, shape, version) and given again while the
         # input is that tensor; the engine drops it after the sampling (drop_proj_caches). 157 ms of a 3.1 s
-        # detail pass at 21.5k tokens; 1.9 GB on the card there.
+        # detail pass at 21.5k tokens for all 30 blocks; 1.9 GB on the card there.
         self._proj_cache: Optional[Tuple[tuple, torch.Tensor]] = None
 
     def proj_feats(self, proj_context: Union[torch.Tensor, SparseTensor], cache: bool = False) -> torch.Tensor:
@@ -109,13 +109,14 @@ def drop_proj_caches(model: nn.Module) -> int:
     return freed
 
 
-def proj_cache_bytes(model: nn.Module, tokens: int) -> int:
-    """Bytes the kept proj_linear answers of `model` would take for a prop of `tokens` tokens (one [tokens, C]
-    table in the layer's dtype per projection-attention module); 0 for a network without such modules."""
+def proj_cache_tables(model: nn.Module, tokens: int) -> List[int]:
+    """Bytes of the proj_linear answer each projection-attention module of `model` keeps for a prop of `tokens`
+    tokens (one [tokens, C] table in the layer's dtype), in the order of the model's modules - the order of its
+    blocks; [] for a network without such modules."""
     modules = getattr(model, "modules", None)
     if modules is None:
-        return 0
-    total = 0
+        return []
+    tables = []
     for module in modules():
         if not hasattr(module, "_proj_cache"):
             continue
@@ -127,8 +128,14 @@ def proj_cache_bytes(model: nn.Module, tokens: int) -> int:
         if not isinstance(dtype, torch.dtype):
             weight = getattr(linear, "weight", None)
             dtype = weight.dtype if weight is not None else torch.bfloat16
-        total += tokens * int(width) * torch.empty((), dtype=dtype).element_size()
-    return total
+        tables.append(tokens * int(width) * torch.empty((), dtype=dtype).element_size())
+    return tables
+
+
+def proj_cache_bytes(model: nn.Module, tokens: int) -> int:
+    """Bytes the kept proj_linear answers of all of `model`'s blocks would take for a prop of `tokens` tokens; 0
+    for a network without projection-attention modules."""
+    return sum(proj_cache_tables(model, tokens))
 
 
 class SparseGatedProjectAttention(nn.Module):

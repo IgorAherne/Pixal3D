@@ -247,8 +247,22 @@ def _usable(x: torch.Tensor, K: int, dtype: torch.dtype = torch.bfloat16) -> boo
 
 def _weight(w: torch.Tensor, how: str, smooth: Optional[torch.Tensor]) -> tuple[torch.Tensor, torch.Tensor]:
     """The int8 weight and its scales for `how`: per output channel ("rows", "group") or per output channel and
-    GROUP input channels ("cg", "cs"), of W * s when there is a smoothing vector s."""
-    return int8mm.quantize_weight(w, smooth=smooth, group=GROUP if how in ("cg", "cs") else 0)
+    GROUP input channels ("cg", "cs"), of W * s when there is a smoothing vector s. Off the card (the install's
+    pre-quantised copies on the CPU, a layer's shell on the meta device) by the torch reference quantiser, which
+    the card's kernel equals bit for bit (int8mm.self_check checks it in every process)."""
+    group = GROUP if how in ("cg", "cs") else 0
+    if w.is_cuda:
+        return int8mm.quantize_weight(w, smooth=smooth, group=group)
+    if w.is_meta:                   # a shell: the shapes and dtypes alone (the loader assigns the copy's tensors)
+        N, K = w.shape
+        return (torch.empty((N, K), dtype=torch.int8, device="meta"),
+                torch.empty((N, K // group) if group else (N,), dtype=torch.float32, device="meta"))
+    if smooth is not None:
+        w = w.float() * smooth.float()[None, :]
+    q, s = int8mm.quantize_rows_torch(w, group)
+    if group:
+        s = s.t().contiguous().t()
+    return q, s
 
 
 def _dequantized(w_q: torch.Tensor, w_s: torch.Tensor, inv: Optional[torch.Tensor], dtype: torch.dtype):
@@ -418,12 +432,41 @@ def _resolve(rules: dict[str, str], calib: Optional[dict[str, torch.Tensor]]) ->
     return out
 
 
+def _effective(rules: dict[str, str], calib: Optional[dict[str, torch.Tensor]],
+               group_gemm: bool) -> tuple[dict[str, str], list[str]]:
+    """(the rules a flow runs on this card, the group-scaled layer types left in the torso's dtype): `_resolve`'s,
+    without the group-scaled layers where the card has no group GEMM (torch._int_mm takes per-row scales only)."""
+    effective = _resolve(rules, calib)
+    if group_gemm:
+        return effective, []
+    kept = sorted(layer for layer, how in effective.items() if how in _GROUP_HOWS)
+    return {layer: how for layer, how in effective.items() if how not in _GROUP_HOWS}, kept
+
+
+def _layers(model: nn.Module, effective: dict[str, str]):
+    """What `effective` turns into int8 layers in `model`, in the order convert replaces them, each looked at as
+    its turn comes: ("mlp", block prefix, module name, the feed-forward module, its Sequential) for a feed-forward
+    converted as one Int8MLP, ("linear", module name, container, attribute, layer type, how) for one Int8Linear."""
+    for mod_name, module in list(model.named_modules()):
+        hit = _BLOCK.match(mod_name + ".")
+        prefix = f"blocks.{hit.group(1)}." if hit else ""
+        mlp = getattr(module, "mlp", None)
+        if (type(module).__name__ in _FFN and "fc1" in effective and "fc2" in effective
+                and isinstance(mlp, nn.Sequential) and len(mlp) == 3 and isinstance(mlp[0], nn.Linear)
+                and isinstance(mlp[2], nn.Linear) and type(mlp[1]).__name__ in ("SparseGELU", "GELU")):
+            yield "mlp", prefix, mod_name, module, mlp
+            continue
+        for layer, container, key, how in _targets(module, effective):
+            yield "linear", mod_name, container, key, layer, how
+
+
 def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module:
     """The model (a flow of `kind`: ss, lr, hr or tex, loaded from `checkpoint`: the checkpoint's file name without
     extension, which names its calibration file) with its token-sized linears as int8 layers where the policy says
     so, when the switch is on and the card and the self-check allow it; the model unchanged otherwise. Called by the
     staged loader after a flow network is loaded (its weights on the card in bf16; each bf16 weight is freed as it
-    is replaced)."""
+    is replaced). A model the loader read from the install's pre-quantised copy (staged/weights.py) holds its int8
+    layers already: nothing is left to convert, and one line says so."""
     name = policy()
     if name is None:
         return model
@@ -437,13 +480,10 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
     if device.type != "cuda" or not available(device):
         return model
     calib = load_calib(checkpoint) if "cs" in rules.values() else None
-    effective = _resolve(rules, calib)
-    if not int8mm.has_group_gemm():
-        kept = sorted(layer for layer, how in effective.items() if how in _GROUP_HOWS)
-        effective = {layer: how for layer, how in effective.items() if how not in _GROUP_HOWS}
-        if kept:
-            print(f"[INT8] {kind}: the group-scaled layers ({', '.join(kept)}) keep {precision.profile().torso_name} "
-                  f"on this card (torch._int_mm takes per-row scales only); the per-row layers run int8", flush=True)
+    effective, kept = _effective(rules, calib, int8mm.has_group_gemm())
+    if kept:
+        print(f"[INT8] {kind}: the group-scaled layers ({', '.join(kept)}) keep {precision.profile().torso_name} "
+              f"on this card (torch._int_mm takes per-row scales only); the per-row layers run int8", flush=True)
     if "cs" in rules.values() and calib is None:
         print(f"[INT8] no SmoothQuant calibration for {Path(str(checkpoint)).name or '(no checkpoint name)'} "
               f"({calib_file(checkpoint or '?').name} in {CALIB_DIR}): {kind} runs policy {name} without the "
@@ -467,13 +507,9 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
         return None, None
 
     with torch.no_grad():
-        for mod_name, module in list(model.named_modules()):
-            hit = _BLOCK.match(mod_name + ".")
-            prefix = f"blocks.{hit.group(1)}." if hit else ""
-            mlp = getattr(module, "mlp", None)
-            if (type(module).__name__ in _FFN and "fc1" in effective and "fc2" in effective
-                    and isinstance(mlp, nn.Sequential) and len(mlp) == 3 and isinstance(mlp[0], nn.Linear)
-                    and isinstance(mlp[2], nn.Linear) and type(mlp[1]).__name__ in ("SparseGELU", "GELU")):
+        for found in _layers(model, effective):
+            if found[0] == "mlp":
+                _, prefix, _, module, mlp = found
                 h1, h2 = effective["fc1"], effective["fc2"]
                 s1, _ = vector(prefix + PATHS["fc1"], "fc1", h1)
                 s2, _ = vector(prefix + PATHS["fc2"], "fc2", h2)
@@ -482,18 +518,18 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
                 module.mlp = Int8MLP(mlp[0], mlp[2], h1, h2, smooth1=s1, smooth2=s2)
                 smoothed += (s1 is not None) + (s2 is not None)
                 counts["mlp"] = counts.get("mlp", 0) + 1
-                del mlp
+                del mlp, module
                 continue
-            for layer, container, key, how in _targets(module, effective):
-                old = getattr(container, key)
-                full = f"{mod_name}.{key}" if mod_name else key
-                s, share = vector(full, layer, how)
-                if how == "cs" and s is None:
-                    raise RuntimeError(f"the calibration of {checkpoint} has no vector for {full}")
-                setattr(container, key, Int8Linear(old, how, smooth=s if share is None else s, shared=share))
-                smoothed += s is not None
-                counts[layer] = counts.get(layer, 0) + 1
-                del old
+            _, mod_name, container, key, layer, how = found
+            old = getattr(container, key)
+            full = f"{mod_name}.{key}" if mod_name else key
+            s, share = vector(full, layer, how)
+            if how == "cs" and s is None:
+                raise RuntimeError(f"the calibration of {checkpoint} has no vector for {full}")
+            setattr(container, key, Int8Linear(old, how, smooth=s if share is None else s, shared=share))
+            smoothed += s is not None
+            counts[layer] = counts.get(layer, 0) + 1
+            del old, container
     for sh in shared.values():
         model.register_forward_pre_hook(sh.clear)
         model.register_forward_hook(sh.clear)
@@ -503,7 +539,106 @@ def convert(model: nn.Module, kind: str = "", checkpoint: str = "") -> nn.Module
               + f" as int8 GEMMs ({int8mm.kernel_name()}; PIXAL3D_INT8)"
               + (f", {smoothed} smoothed ({calib_file(checkpoint).name})" if smoothed else "")
               + f", {before / 2**20:,.0f} -> {_bytes(model) / 2**20:,.0f} MiB of weights", flush=True)
+    else:
+        held = sum(isinstance(module, (Int8Linear, Int8MLP)) for module in model.modules())
+        if held:
+            print(f"[INT8] {type(model).__name__} ({kind}, policy {name}): {held} int8 layers read pre-quantised "
+                  f"from the install's copy ({int8mm.kernel_name()}; PIXAL3D_INT8), {before / 2**20:,.0f} MiB of "
+                  f"weights", flush=True)
     return model
+
+
+# =====================================================================================================================
+# Pre-quantised copies (staged/weights.py writes them at install; the loader reads them)
+# =====================================================================================================================
+#
+# The flow kinds the policy converts are read from copies whose converted layers already hold the int8 weights,
+# scales and biases convert would make, so a load reads half the bytes and quantises nothing. The weights are
+# quantised off the card by the torch reference quantiser (`_weight`): the card's kernel gives the same bits. A copy
+# is made for the rules a card of the PC's profile will run (`copy_rules`, which cannot run the card's self-check)
+# and read only where the process's own rules after the self-check are the same (`live_rules`). SageAttention's fold
+# then scales the int8 layers' channel scales by powers of two, as it scales the bf16 or fp32 weights before convert
+# quantises them: the same bits either way, since those dtypes have fp32's exponent range. Not in fp16: the fold's
+# 2^-8 turns to_qkv's small v weights into fp16 subnormals, which lose bits before convert quantises them, while a
+# copy quantises them unfolded - other int8 codes. So an fp16 torso (the turing profile) gets no copy and reads
+# none (`_copy_exact`); the install cannot know whether a run will fold.
+
+COPY_HOWS = ("rows", "group")   # the weights quantised per output channel alone: what a copy holds (no smoothing)
+
+
+def copy_rules(kind: str) -> Optional[dict[str, str]]:
+    """The rules a process on this PC's card runs for a flow of `kind` once its int8 self-check passes, as far as
+    they can be told without the card (the install makes its copies with the card hidden; modules/precision.py
+    knows the card's capability): the policy's rules, the group-scaled layers left out where the card will have no
+    group GEMM. None when nothing would be converted, when the rules need what a copy does not hold (a
+    calibration's smoothing, group-scaled weights), and on an fp16 torso (_copy_exact)."""
+    rules = POLICIES.get(policy() or "", {}).get(kind)
+    if not rules or "cs" in rules.values() or not _copy_exact():
+        return None
+    capability = precision.profile().capability
+    if capability is not None and tuple(capability) < MIN_CAPABILITY:
+        return None
+    if capability is None or tuple(capability) >= (8, 0):
+        group_gemm = _triton_importable()
+    else:
+        group_gemm = int8mm.cuda_gemm_op() is not None
+    effective, _ = _effective(rules, None, group_gemm)
+    if not effective or any(how not in COPY_HOWS for how in effective.values()):
+        return None
+    return effective
+
+
+def live_rules(kind: str, device: torch.device) -> Optional[dict[str, str]]:
+    """The rules convert applies to a flow of `kind` loaded onto `device` in this process (the int8 self-check runs
+    here when it has not yet), or None when it converts nothing, needs what a copy does not hold, or runs an fp16
+    torso (_copy_exact: a copy, however it came there, is not read)."""
+    rules = POLICIES.get(policy() or "", {}).get(kind)
+    if (not rules or "cs" in rules.values() or not _copy_exact() or torch.device(device).type != "cuda"
+            or not available(device)):
+        return None
+    effective, _ = _effective(rules, None, int8mm.has_group_gemm())
+    if not effective or any(how not in COPY_HOWS for how in effective.values()):
+        return None
+    return effective
+
+
+def _copy_exact() -> bool:
+    """Whether a copy quantised from the unfolded weights holds what convert makes after SageAttention's fold: in a
+    bf16 or fp32 torso (a power of two scales every value exactly), not in fp16 (subnormals lose bits)."""
+    return precision.profile().torso is not torch.float16
+
+
+def skeleton(model: nn.Module, effective: dict[str, str]) -> list[tuple[str, list[str]]]:
+    """Replace in `model` (built on the meta device, or on the CPU with its real weights) the layers `effective`
+    converts with the int8 layers convert would put there, made by the same constructors (on the meta device:
+    buffers of the right shapes and dtypes, nothing computed). Returns, in convert's order, each new module's state
+    key prefix and the keys of the original tensors it is made from (a linear's weight and bias; a feed-forward's
+    two of each)."""
+    made: list[tuple[str, list[str]]] = []
+    with torch.no_grad():
+        for found in _layers(model, effective):
+            if found[0] == "mlp":
+                _, _, mod_name, module, mlp = found
+                path = f"{mod_name}.mlp" if mod_name else "mlp"
+                sources = ([f"{path}.0.weight"] + ([f"{path}.0.bias"] if mlp[0].bias is not None else [])
+                           + [f"{path}.2.weight"] + ([f"{path}.2.bias"] if mlp[2].bias is not None else []))
+                module.mlp = Int8MLP(mlp[0], mlp[2], effective["fc1"], effective["fc2"])
+                made.append((path, sources))
+                continue
+            _, mod_name, container, key, layer, how = found
+            old = getattr(container, key)
+            path = f"{mod_name}.{key}" if mod_name else key
+            setattr(container, key, Int8Linear(old, how))
+            made.append((path, [f"{path}.weight"] + ([f"{path}.bias"] if old.bias is not None else [])))
+    return made
+
+
+def _triton_importable() -> bool:
+    try:
+        import triton  # noqa: F401
+    except Exception:       # noqa: BLE001
+        return False
+    return True
 
 
 def _bytes(model: nn.Module) -> int:

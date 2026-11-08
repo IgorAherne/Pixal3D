@@ -19,7 +19,7 @@ import torch
 import torch.nn as nn
 from .. import SparseTensor
 from ... import precision
-from . import config
+from . import config, spconv_choices
 import spconv.pytorch as spconv
 from spconv.pytorch import ops as spconv_ops
 
@@ -112,6 +112,7 @@ def sparse_conv3d_init(self, in_channels, out_channels, kernel_size, stride=1, d
 
 
 def sparse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
+    spconv_choices.restore(x.device)
     spatial_changed = any(s != 1 for s in self.stride) or (self.padding is not None)
     new_data = _lent(self)(x.data)
     new_shape = [x.shape[0], self.out_channels]
@@ -145,6 +146,7 @@ def sparse_inverse_conv3d_init(self, in_channels, out_channels, kernel_size, str
 
 
 def sparse_inverse_conv3d_forward(self, x: SparseTensor) -> SparseTensor:
+    spconv_choices.restore(x.device)
     spatial_changed = any(s != 1 for s in self.stride)
     if spatial_changed:
         # recover the original spconv order

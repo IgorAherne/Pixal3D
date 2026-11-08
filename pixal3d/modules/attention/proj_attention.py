@@ -91,6 +91,19 @@ class ProjectAttention(nn.Module):
         return context_combined
 
 
+def proj_cache_limit(cond: Any, blocks: int) -> int:
+    """How many of a flow's `blocks` blocks, the first ones, keep their proj_linear answer for the conditioning
+    `cond` (dense or sparse): its "proj_cache" entry (the staged engine's parts.proj_cache_blocks: a count, or True
+    for every block), none for a zero context or a conditioning without the entry. Which blocks keep theirs changes
+    no value: a kept answer is the table the GEMM gives again."""
+    if not isinstance(cond, dict) or cond.get("zero", False):
+        return 0
+    asked = cond.get("proj_cache", 0)
+    if asked is True:
+        return blocks
+    return max(0, min(int(asked or 0), blocks))
+
+
 class GatedProjectAttention(nn.Module):
     """
     Concat-Projection Attention Module for DINOv3 (semantic) + VAE (color) features.

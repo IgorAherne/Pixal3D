@@ -7,6 +7,7 @@ import numpy as np
 from ..modules.utils import convert_module_to, manual_cast, str_to_dtype, stream_dtype
 from ..modules.transformer import AbsolutePositionEmbedder, ModulatedTransformerCrossBlock
 from ..modules.attention import RotaryPositionEmbedder
+from ..modules.attention.proj_attention import proj_cache_limit
 
 
 class TimestepEmbedder(nn.Module):
@@ -303,8 +304,8 @@ class SparseStructureFlowModel(nn.Module):
         
         # Handle different conditioning modes
         zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
-        # the engine asks for proj_linear's answers to be kept across the steps (proj_attention.py)
-        proj_cache = isinstance(cond, dict) and bool(cond.get("proj_cache", False)) and not zero
+        # the first blocks the engine asks for keep proj_linear's answer across the steps (proj_attention.py)
+        cached = proj_cache_limit(cond, len(self.blocks))
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -322,8 +323,8 @@ class SparseStructureFlowModel(nn.Module):
         else:
             cond = manual_cast(cond, self.dtype)
             
-        for block in self.blocks:
-            h = block(h, t_emb, cond, self.rope_phases, zero=zero, proj_cache=proj_cache)
+        for index, block in enumerate(self.blocks):
+            h = block(h, t_emb, cond, self.rope_phases, zero=zero, proj_cache=index < cached)
         h = manual_cast(h, x.dtype)
         h = F.layer_norm(h, h.shape[-1:])
         h = self.out_layer(h)

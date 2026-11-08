@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 from ..modules.utils import convert_module_to, manual_cast, str_to_dtype, stream_dtype
 from ..modules.transformer import AbsolutePositionEmbedder
+from ..modules.attention.proj_attention import proj_cache_limit
 from ..modules import sparse as sp
 from ..modules.sparse.transformer import ModulatedSparseTransformerCrossBlock
 from .sparse_structure_flow import TimestepEmbedder
@@ -227,8 +228,8 @@ class SLatFlowModel(nn.Module):
             
         # Handle different conditioning modes
         zero = isinstance(cond, dict) and bool(cond.get("zero", False))     # all zeros: the unconditional pass
-        # the engine asks for proj_linear's answers to be kept across the steps (proj_attention.py)
-        proj_cache = isinstance(cond, dict) and bool(cond.get("proj_cache", False)) and not zero
+        # the first blocks the engine asks for keep proj_linear's answer across the steps (proj_attention.py)
+        cached = proj_cache_limit(cond, len(self.blocks))
         if self.image_attn_mode == 'proj':
             if isinstance(cond, dict):
                 global_cond = cond['global']
@@ -253,8 +254,8 @@ class SLatFlowModel(nn.Module):
                 cond = sp.VarLenTensor.from_tensor_list(cond)
             cond = manual_cast(cond, self.dtype)
 
-        for block in self.blocks:
-            h = block(h, t_emb, cond, zero=zero, proj_cache=proj_cache)
+        for index, block in enumerate(self.blocks):
+            h = block(h, t_emb, cond, zero=zero, proj_cache=index < cached)
 
         h = manual_cast(h, x.dtype)
         h = h.replace(F.layer_norm(h.feats, h.feats.shape[-1:]))

@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .. import VarLenTensor, SparseTensor
 from .. import config
-from ... import fused
+from ... import fused, old_cards
 from .full_attn import sparse_scaled_dot_product_attention
 from .windowed_attn import sparse_windowed_scaled_dot_product_self_attention
 from .rope import SparseRotaryPositionEmbedder
@@ -12,6 +12,24 @@ from .rope import SparseRotaryPositionEmbedder
 
 def _feats(x: Union[VarLenTensor, torch.Tensor]) -> torch.Tensor:
     return x.feats if isinstance(x, VarLenTensor) else x
+
+
+def _pre_linear(layer: nn.Module, pre: Tuple[torch.Tensor, torch.Tensor]) -> torch.Tensor:
+    """An int8 layer (modules/int8.py Int8Linear) on its input quantised already (int8mm.norm_quant's rows and
+    scales): the GEMM its own forward runs after quantising a bf16 input, [M, N] in the layer's dtype."""
+    from ... import int8mm
+
+    return int8mm.int8_linear(pre, layer.weight_q, layer.scale, layer.bias,
+                              path="triton" if layer.how == "rows" else "group", out_dtype=layer.dtype)
+
+
+def _resid_linear(layer: nn.Module, feats: torch.Tensor, resid: dict) -> torch.Tensor:
+    """An int8 layer (Int8Linear) on its bf16 input with the block's residual in its epilogue (int8mm.gemm `resid`):
+    the new stream, [M, N]."""
+    from ... import int8mm
+
+    return int8mm.int8_linear(feats.reshape(-1, feats.shape[-1]), layer.weight_q, layer.scale, layer.bias,
+                              path="triton" if layer.how == "rows" else "group", out_dtype=layer.dtype, resid=resid)
 
 
 class SparseMultiHeadRMSNorm(nn.Module):
@@ -118,14 +136,20 @@ class SparseMultiHeadAttention(nn.Module):
         wrap = lambda t, f: t.replace(f) if isinstance(t, VarLenTensor) else f
         return wrap(q, fq), wrap(k, fk)
 
-    def forward(self, x: SparseTensor, context: Optional[Union[VarLenTensor, torch.Tensor]] = None) -> SparseTensor:
+    def forward(self, x: SparseTensor, context: Optional[Union[VarLenTensor, torch.Tensor]] = None,
+                pre: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, resid: Optional[dict] = None) -> SparseTensor:
+        """`pre`: the input of to_qkv (self) or to_q (cross) quantised already for its int8 layer (the block's
+        norm_quant); x then gives only the layout. `resid`: the block's residual done in to_out's epilogue (int8mm.gemm
+        `resid`): the result is then the new stream."""
         if self._type == "self":
-            qkv = self._linear(self.to_qkv, x)
+            qkv = self._linear(self.to_qkv, x) if pre is None else x.replace(_pre_linear(self.to_qkv, pre))
             qkv = self._fused_pre(qkv, num_fused=3)
             apart = None
             if self.qk_rms_norm or self.use_rope:
                 q, k, v = qkv.unbind(dim=-3)
                 normed = self._fused_qk(q, k) if self.qk_rms_norm and fused.active(q.feats) else None
+                if normed is None and self.qk_rms_norm:     # the eager chain's bits in one kernel each
+                    normed = old_cards.qk(self, q, k, rope=True)
                 if normed is not None:
                     q, k = normed
                 else:
@@ -161,13 +185,15 @@ class SparseMultiHeadAttention(nn.Module):
                 )
                 h = qkv.replace(torch.cat([h0.feats, h1.feats], dim=1))
         else:
-            q = self._linear(self.to_q, x)
+            q = self._linear(self.to_q, x) if pre is None else x.replace(_pre_linear(self.to_q, pre))
             q = self._reshape_chs(q, (self.num_heads, -1))
             kv = self._linear(self.to_kv, context)
             kv = self._fused_pre(kv, num_fused=2)
             if self.qk_rms_norm:
                 k, v = kv.unbind(dim=-3)
                 normed = self._fused_qk(q, k, rope=False) if fused.active(_feats(q)) else None
+                if normed is None:
+                    normed = old_cards.qk(self, q, k, rope=False)
                 if normed is not None:
                     q, k = normed
                 else:
@@ -177,5 +203,7 @@ class SparseMultiHeadAttention(nn.Module):
             else:
                 h = sparse_scaled_dot_product_attention(q, kv)
         h = self._reshape_chs(h, (-1,))
+        if resid is not None:
+            return h.replace(_resid_linear(self.to_out, _feats(h), resid))
         h = self._linear(self.to_out, h)
         return h

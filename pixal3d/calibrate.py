@@ -14,7 +14,9 @@ process times or tunes anything while the artist works:
      by itself: Spellcast3D's Settings > Debugging has "Measure the graphics card again" for that).
   2. The Triton kernels the engine compiles at first use are compiled now, through their own self-checks (the
      fused elementwise kernels, the int8 GEMMs, the convolutions' row codes): the first 3D job of the install no
-     longer waits for them (the compiled kernels stay in Triton's cache).
+     longer waits for them (the compiled kernels stay in Triton's cache). On sm_80+ the int8 GEMMs' fc1 tile is chosen
+     here too ("int8_tiles": candidates that give the same bits, timed). A record made before that choice existed
+     runs this step again, alone where the installer asks for it (--only triton), its other sections standing.
   3. Which of the SageAttention wheel's two CUDA kernels is faster on this card (modules/sage.py `calibrate`; they
      give the same bits).
   4. The decoders' sparse convolutions' tile configurations for every size a prop can have
@@ -26,6 +28,13 @@ process times or tunes anything while the artist works:
      every process on the first prop's own input, and which could differ between sessions. Spellcast3D's installer
      leaves this step out (--skip spconv) while Hi3D's AI models are not on the PC, and their download runs it alone
      afterwards (--only spconv: the other sections of the record stand).
+  6. Below sm_80, where the decoders' convolutions run spconv's own kernels (RTX 20xx): spconv's kernel choice for
+     each of the decoders' convolutions (modules/sparse/conv/spconv_choices.py, the step "spconv_decoders"), which
+     spconv otherwise times again at the first prop of every process, differently from one process to the next.
+  7. Below sm_80 (RTX 20xx, GTX 10xx): pixal3d_kernels' element-wise kernels (modules/old_cards.py `calibrate`, the
+     step "old_cards") each timed against the eager chain it stands for at two of the flows' sizes; a kind serves
+     only where its kernel is 5 % faster at both (an fp32 chain on Pascal may be as fast as one kernel). They give
+     the same bits either way. A record without the section runs this step alone (--only old_cards).
 
 Nothing here changes a result: every choice is between kernels that give the same numbers (the convolutions' split-K
 choice aside, which flex_gemm has always timed per install). A step that fails is recorded and the others go on; the
@@ -68,7 +77,8 @@ SAY_EVERY = 30.0         # while waiting: one line this often
 MAX_ATTEMPTS = 3         # (kept for the record's "attempts" count; the installer no longer retries by itself)
 # Where the run's bar stands when each step begins (the installer shows it on its page: components._calibrate reads
 # the "NN%" of a progress line).
-SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "convolutions": 0.18, "spconv": 0.95, "done": 1.0}
+SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "old_cards": 0.16, "convolutions": 0.18, "spconv_decoders": 0.18,
+         "spconv": 0.95, "done": 1.0}       # (convolutions: flex_gemm's cards; old_cards, spconv_decoders: the others)
 
 
 def say(text: str) -> None:
@@ -222,6 +232,11 @@ def _triton(device: Any) -> dict:
     done["fused"] = bool(fused._check(device)) if precision.torso() == torch.bfloat16 else "not used: the torso is "         + precision.profile().torso_name
     ok, why = int8mm.ready(device)
     done["int8"] = bool(ok) if ok else f"off: {why}"
+    if ok and int8mm.gemm_path() == "triton":        # fc1's tile for this card (the same bits whichever serves)
+        try:
+            done["int8_tiles"] = int8mm.calibrate_fc1_tiles(device)
+        except Exception as exc:        # noqa: BLE001 - the shipped tile serves
+            done["int8_tiles"] = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:160]}"}
     from pixal3d.modules.sparse.conv import codes
 
     done["codes"] = bool(codes._usable(torch.zeros(1, device=device), 27))     # its self-check, on its own table
@@ -363,7 +378,9 @@ def _warm_fused(device: Any) -> int:
             gamma = torch.ones(128, device=device, dtype=torch.bfloat16)
             fused.qk_norm_rope(qk, gamma, 128 ** -0.5)
             calls += 6
-    return calls
+    from pixal3d.modules import int8mm
+
+    return calls + int8mm.warm_handoffs(device, WARM_ROWS)      # the blocks' norm -> int8 / residual hand-offs
 
 
 def _warm_codes(device: Any) -> int:
@@ -445,7 +462,7 @@ def _hi3d_code() -> Optional[Path]:
     return code if (code / "sparc3d" / "__init__.py").is_file() else None
 
 
-def _spconv(device: Any, quiet: Quiet) -> dict:
+def _spconv(device: Any, quiet: Quiet, decoders: Optional[dict] = None) -> dict:
     """The spconv step: spconv's kernel choice for every sparse convolution Hi3D runs, measured on random points
     (sparc3d.ops.spconv_tuning.calibrate); skipped where Hi3D's code is not on this PC."""
     code = _hi3d_code()
@@ -455,6 +472,10 @@ def _spconv(device: Any, quiet: Quiet) -> dict:
         sys.path.insert(0, str(code))
     from sparc3d.ops import spconv_tuning
 
+    from pixal3d.modules.sparse.conv import spconv_choices
+
+    # a key the decoders use too keeps the decoders' choice (both share spconv's cache in one process)
+    spconv_choices.restore_section(decoders)
     return spconv_tuning.calibrate(device, say=say, pause=lambda: quiet.wait(quick=True))
 
 
@@ -471,6 +492,35 @@ def _shapes_lacking(earlier: dict, record: dict) -> Optional[dict]:
         return None
     held = set(earlier["flex_gemm"].get("grid") or {})
     return {shape: span for shape, span in calibrate_conv.GRID.items() if calibrate_conv.family(*shape) not in held}
+
+
+def _triton_stands(earlier: dict, device: Any) -> bool:
+    """Whether the earlier record's Triton section holds what this build's Triton step records: where the card runs
+    the Triton int8 GEMMs (sm_80+) and they passed their self-check then, fc1's tile choice (int8_tiles) made with
+    this Triton (int8mm.fc1_group_cfg reads a choice of another Triton as none: two tiles proven to give the same
+    bits under one Triton are not proven so under another). A section without it is made again, alone
+    (Spellcast3D's installer runs --only triton for it): the step's kernels compile into Triton's cache again (those
+    there are found), the tiles are timed once. A section whose int8 GEMMs did not run, or whose tile timing failed,
+    stands."""
+    section = earlier.get("triton") or {}
+    if section.get("int8") is not True:
+        return True
+    tiles = section.get("int8_tiles")
+    if tiles is not None:
+        if not (isinstance(tiles, dict) and tiles.get("ok") is True):
+            return True             # a timing that failed is not tried again by itself
+        try:
+            import triton
+
+            if tiles.get("triton") == triton.__version__:
+                from pixal3d.modules import int8mm
+
+                return int8mm.group_cuda_stands(tiles)      # and the group GEMMs' race, made with this kernels build
+        except Exception:           # noqa: BLE001 - no Triton to time with: the section stands
+            return True
+    from pixal3d.modules import int8mm
+
+    return not int8mm.capability(device)[1]
 
 
 def _sage_stands(earlier: dict) -> bool:
@@ -498,14 +548,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--record", default="", help="the record file (default: pixal3d/calibration.py's)")
     ap.add_argument("--quiet-wait", type=float, default=900.0, help="seconds to wait for a quiet card at most")
     ap.add_argument("--skip", default="",
-                    help="comma-separated steps to leave out: triton, sage, convolutions, spconv")
+                    help="comma-separated steps to leave out: triton, sage, old_cards, convolutions, spconv_decoders, "
+                         "spconv")
     ap.add_argument("--only", default="",
                     help="comma-separated steps to run alone, the earlier record's other sections standing (spconv "
                          "once Hi3D's models arrived, say)")
     args = ap.parse_args(argv)
     if args.record:
         os.environ["PIXAL3D_CALIBRATION_FILE"] = args.record
-    steps = {"triton": "triton", "sage": "sage", "convolutions": "flex_gemm", "spconv": "spconv"}  # step -> section
+    steps = {"triton": "triton", "sage": "sage", "old_cards": "old_cards", "convolutions": "flex_gemm",
+             "spconv_decoders": "spconv_decoders", "spconv": "spconv"}  # step -> section
     skip = {part.strip() for part in args.skip.split(",") if part.strip()}
     only = {part.strip() for part in args.only.split(",") if part.strip()}
     if only:
@@ -540,8 +592,12 @@ def main(argv: Optional[list[str]] = None) -> int:
         + (f", attempt {attempts}" if attempts > 1 else ""))
     lacking = _shapes_lacking(earlier, record)
     if lacking is not None:         # the record stands; the shapes it lacks are added, the other steps kept
-        skip |= {"triton"}
-        record["triton"] = earlier.get("triton")
+        if _triton_stands(earlier, device) and "triton" not in only:
+            skip |= {"triton"}
+            record["triton"] = earlier.get("triton")
+        elif "triton" not in skip:
+            say("the earlier calibration has no tile choice for the int8 GEMMs with this Triton: the Triton step "
+                "runs again")
         if _sage_stands(earlier):   # the attention timings belong to the wheel they were made with
             skip |= {"sage"}
             record["sage"] = earlier["sage"]
@@ -587,6 +643,19 @@ def main(argv: Optional[list[str]] = None) -> int:
                 f"({found.get('why', '')})")
         elif found:
             say(f"attention: the {'tuned' if found.get('tuned') else 'shipped'} kernel ({found.get('summary', '')})")
+    if "old_cards" not in skip:
+        from pixal3d.modules import old_cards
+
+        held = earlier.get("old_cards") or {}
+        if lacking is not None and old_cards.race_holds(held):
+            record["old_cards"] = held                  # the earlier record's race stands
+        else:                                           # (on the ampere profile: "skipped", nothing timed)
+            if card.name != "ampere":
+                progress(SHARE["old_cards"], "timing the element-wise kernels for this card")
+                quiet.wait(quick=True)
+            found = _timed("old_cards", lambda: old_cards.calibrate(device), record)
+            if found and not found.get("skipped"):
+                say(f"element-wise kernels: {found.get('summary', '')}")
     if "convolutions" not in skip:
         progress(SHARE["convolutions"], "tuning the 3D decoders' convolutions for this card (step 3 of 4, the longest: "
                                         "several minutes)")
@@ -598,13 +667,31 @@ def main(argv: Optional[list[str]] = None) -> int:
                 record["flex_gemm"] = _merged(earlier, record["flex_gemm"])
             if found:
                 say(f"convolutions: {record['flex_gemm'].get('summary', found)}")
+    if "spconv_decoders" not in skip:
+        from pixal3d.modules.sparse.conv import spconv_choices
+
+        held = earlier.get("spconv_decoders") or {}
+        if lacking is not None and held.get("ok") and (held.get("entries") or held.get("skipped")):
+            record["spconv_decoders"] = held            # the earlier record's choices stand
+        elif not spconv_choices.applies():
+            record["spconv_decoders"] = {"ok": True, "skipped": f"the decoders do not run spconv's own kernels on "
+                                                                f"this card ({card.name} profile)", "entries": []}
+        else:
+            progress(SHARE["spconv_decoders"], "choosing spconv's kernels for the 3D decoders (step 3 of 4)")
+            quiet.wait(quick=True)
+            found = _timed("spconv_decoders", lambda: spconv_choices.calibrate(
+                device, say=say, pause=lambda: quiet.wait(quick=True),
+                others=calibration.section("spconv", device)), record)
+            if found:
+                say(f"spconv (decoders): {found.get('summary') or found.get('skipped')}")
     if "spconv" not in skip:
         if lacking is not None and (earlier.get("spconv") or {}).get("ok") and earlier["spconv"].get("entries"):
             record["spconv"] = earlier["spconv"]        # the earlier record's choices stand
         else:
             progress(SHARE["spconv"], "choosing spconv's kernels for Hi3D's convolutions (step 4 of 4)")
             quiet.wait(quick=True)
-            found = _timed("spconv", lambda: _spconv(device, quiet), record)
+            decoders = record.get("spconv_decoders") or calibration.section("spconv_decoders", device)
+            found = _timed("spconv", lambda: _spconv(device, quiet, decoders), record)
             if found:
                 say(f"spconv: {found.get('summary') or found.get('skipped')}")
     for step, key in steps.items():     # a step left out keeps the earlier record's section (--only: all the others)

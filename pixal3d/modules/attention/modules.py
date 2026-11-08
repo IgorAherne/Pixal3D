@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from .full_attn import scaled_dot_product_attention
 from .rope import RotaryPositionEmbedder
-from .. import fused
+from .. import fused, old_cards
 
 
 class MultiHeadRMSNorm(nn.Module):
@@ -92,6 +92,8 @@ class MultiHeadAttention(nn.Module):
                     normed = (self._fused_qk(q, k, phases if self.use_rope else None)
                               if self.qk_rms_norm and (phases is not None or not self.use_rope)
                               and fused.active(q) else None)
+                    if normed is None and self.qk_rms_norm and (phases is not None or not self.use_rope):
+                        normed = old_cards.qk_dense(self, q, k, phases if self.use_rope else None)
                     if normed is not None:
                         q, k = normed
                     else:
@@ -116,6 +118,8 @@ class MultiHeadAttention(nn.Module):
             if self.qk_rms_norm:
                 k, v = kv.unbind(dim=2)
                 normed = self._fused_qk(q, k, None) if fused.active(q) else None
+                if normed is None:
+                    normed = old_cards.qk_dense(self, q, k, None)
                 if normed is not None:
                     q, k = normed
                 else:

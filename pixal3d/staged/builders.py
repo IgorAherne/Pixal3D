@@ -23,6 +23,7 @@ launcher's configure_env does that. Nothing here reads an environment variable o
 from __future__ import annotations
 
 import functools
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -169,20 +170,40 @@ def build_moge(paths: ModelPaths, device: str) -> nn.Module:
 
 _INITIALISERS = ("trunc_normal_", "normal_", "uniform_", "kaiming_uniform_", "kaiming_normal_", "xavier_uniform_",
                  "xavier_normal_", "constant_", "zeros_", "ones_")
+# Packages whose modules hold their own references to the initialisers (`from torch.nn.init import trunc_normal_`:
+# MoGe's DINOv2), which the no-ops must replace as well - MoGe's ViT-L otherwise draws its random weights anyway
+# (1.0-1.1 s of every single-view batch, measured)
+_BOUND_IN = ("moge.",)
 
 
 class _no_initialisers:
     """torch.nn.init's initialisers as no-ops while a model is built whose every parameter the checkpoint then
-    replaces (an nn.Module cannot be built on the meta device where its code reads a tensor's value)."""
+    replaces (an nn.Module cannot be built on the meta device where its code reads a tensor's value), in
+    torch.nn.init and wherever a module of _BOUND_IN holds one of them under a name of its own."""
 
     def __enter__(self) -> None:
         self.saved = {name: getattr(nn.init, name) for name in _INITIALISERS}
+        originals = {id(function) for function in self.saved.values()}
+
+        def skip(tensor: Any, *args: Any, **kwargs: Any) -> Any:
+            return tensor
+
+        self.bound: list[tuple[Any, str, Any]] = []
+        for module_name, module in list(sys.modules.items()):
+            if module is None or not module_name.startswith(_BOUND_IN):
+                continue
+            for attr, value in list(vars(module).items()):
+                if callable(value) and id(value) in originals:
+                    self.bound.append((module, attr, value))
+                    setattr(module, attr, skip)
         for name in _INITIALISERS:
-            setattr(nn.init, name, lambda tensor, *args, **kwargs: tensor)
+            setattr(nn.init, name, skip)
 
     def __exit__(self, *exc: Any) -> None:
         for name, function in self.saved.items():
             setattr(nn.init, name, function)
+        for module, attr, value in self.bound:
+            setattr(module, attr, value)
 
 
 def build_dino(paths: ModelPaths, device: str) -> nn.Module:

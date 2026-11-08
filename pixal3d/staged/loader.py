@@ -10,10 +10,13 @@ buffer one tensor at a time. Where the installer has made a copy of
 the file with every tensor already in the model's dtype (weights.py: the flows' fp32 tensors as bf16, half the
 bytes), that copy is read instead and nothing is cast - as long as it was made from the file as it is now, by this
 torch, and holds what the model takes; anything else about it (missing, stale, unreadable, breaking half-way) only
-means that the original is read. The four small models (background removal, MoGe, DINOv3, NAF) come from their own
-builders (builders.py). The loader also owns the cap on what PyTorch may reserve on the card, and a background
-thread that reads the next network's file (its copy, when that is current) so that the operating system has it in
-its file cache when its turn comes.
+means that the original is read. A flow the int8 policy converts may have a pre-quantised copy too (weights.py
+make_int8_copy): where its record fits this process (the rules the int8 policy runs here after its self-check), the
+model is built with its int8 layers in place (modules/int8.py skeleton) and that copy is read into them, so its
+convert hook finds nothing left to quantise. The four small models (background removal, MoGe, DINOv3, NAF) come
+from their own builders (builders.py). The loader also owns the cap on what PyTorch may reserve on the card, and a
+background thread that reads the next network's file (its copy, when that is current) so that the operating system
+has it in its file cache when its turn comes.
 
     loader = NetworkLoader("cuda", on_event=print)
     loader.register_checkpoint("hr_flow.sv", ckpts / "slat_flow_img2shape_dit_1_3B_1024_bf16")
@@ -76,6 +79,8 @@ POOL_BYTES = 64 * MIB               # page-locked RAM beside the read buffer for
 PARALLEL_ON_CPU = False             # tests: loads onto the CPU take the parallel way as well
 PREFETCH_BYTES = 16 * MIB           # the prefetch thread's own read size
 PREFETCH_SPARE_BYTES = 1536 * MIB   # RAM that must stay available beside a file before it is read ahead
+PREFETCH_RAM_POLL_S = 0.25          # while RAM is short for it: how often a read ahead looks again
+PREFETCH_RAM_WAIT_S = 600.0         # and for how long at most (a request that stands that long is given up)
 CONTEXT_MIB = 300                   # what a CUDA context takes on the card outside PyTorch's allocator
 LOADS_KEPT = 256                    # stats() remembers this many loads
 
@@ -175,10 +180,14 @@ class NetworkLoader:
         source = self._source(name)
         if cancelled is not None and cancelled():
             raise Cancelled()
-        self.trim()                                     # weights go onto an empty card: where a block lands is final
-        began = time.perf_counter()
+        if self._prefetcher is not None:
+            self._prefetcher.forget(name)               # the load reads the file: its read ahead is over
         state: dict[str, torch.Tensor] = {}
         try:
+            if self._prefetcher is not None:
+                self._prefetcher.hold(True)             # and the load has the drive to itself meanwhile
+            self.trim()                                 # weights go onto an empty card: where a block lands is final
+            began = time.perf_counter()
             if isinstance(source, _Builder):
                 module, size = self._build(name, source)
             else:
@@ -197,6 +206,9 @@ class NetworkLoader:
             traceback.clear_frames(error.__traceback__)     # the frames below still hold the tensor being read
             self.trim()
             raise
+        finally:
+            if self._prefetcher is not None:
+                self._prefetcher.hold(False)
         state.clear()
         if module is None:
             self.trim()
@@ -306,8 +318,9 @@ class NetworkLoader:
         """Start reading those networks' files in the background, one after the other, in place of whatever was
         being read; None stops. The bytes are thrown away: the point is that the operating system keeps the files
         in its cache while RAM is free. For a checkpoint whose copy was made from its file as it is now, the copy is
-        what a load will read, so it is the copy that is read ahead (deciding that takes a look at two headers,
-        here). Nothing is read for a network that is loaded or has no file."""
+        what a load will read, so it is the copy that is read ahead - the int8 copy for a flow that has one
+        (deciding that takes a look at two headers, here: _read_ahead_file). Nothing is read for a network that is
+        loaded or has no file."""
         if self._prefetcher is None:
             return
         requests = []
@@ -319,7 +332,7 @@ class NetworkLoader:
             if file is None:
                 continue
             if isinstance(source, _Checkpoint):
-                file = weights.current_copy(file) or file
+                file = self._read_ahead_file(source)
             requests.append((each, file))
         self._prefetcher.read(requests)
 
@@ -366,10 +379,29 @@ class NetworkLoader:
     def _read(self, name: str, source: _Checkpoint, state: dict[str, torch.Tensor],
               cancelled: Callable[[], bool] | None) -> tuple[nn.Module | None, int]:
         """A checkpoint onto the device: (the module, bytes read), or (None, 0) when cancelled. The tensors are
-        collected in `state`, which the caller owns and empties. They come from the checkpoint's copy when it is
-        valid (weights.usable_copy), else from its own file; a copy that fails while it is read is given up for
-        the original, read from its first tensor."""
-        plan = _plan(source.config_file, source.file, source.config)
+        collected in `state`, which the caller owns and empties. They come from the flow's pre-quantised copy when
+        it serves this process (_int8_copy, weights.usable_int8_copy: the module then holds its int8 layers
+        already), else from the checkpoint's model-dtypes copy when it is valid (weights.usable_copy), else from
+        its own file; a copy that fails while it is read is given up for the next of these, read from its first
+        tensor."""
+        plan = None
+        int8_copy = self._int8_copy(source)
+        if int8_copy is not None:
+            plan = _plan(source.config_file, source.file, source.config)
+            found = _int8_plan(plan, source.file, *int8_copy)
+            if found is not None:
+                broken = False
+                try:
+                    return self._read_file(name, *found, state, cancelled)
+                except (OSError, EOFError) as error:
+                    traceback.clear_frames(error.__traceback__)
+                    broken = True
+                if broken:
+                    state.clear()
+                    self.trim()
+            plan = None             # its layers are the int8 shells now: built again for the copy or the original
+        if plan is None:
+            plan = _plan(source.config_file, source.file, source.config)
         copy = weights.usable_copy(source.file, plan.keys, plan.want)
         if copy is not None:
             broken = False
@@ -383,6 +415,49 @@ class NetworkLoader:
                 state.clear()
                 self.trim()
         return self._read_file(name, plan, source.file, plan.header, state, cancelled)
+
+    def _read_ahead_file(self, source: _Checkpoint) -> Path:
+        """The file a load of `source` will read, as far as a quick look tells (two headers, never the card): the
+        flow's int8 copy where one was made for this card's profile, for the kind the convert hook names, with the
+        rules this process runs - after its int8 self-check when that has run (int8.live_rules), the install's
+        prediction before it (int8.copy_rules) -; else the model-dtypes copy when it is current, else the
+        original."""
+        if source.convert is not None and self.device.type == "cuda":
+            found = weights.current_int8_copy(source.file)
+            if found is not None:
+                from ..modules import int8
+
+                state = getattr(int8, "_state", None)          # read once: live_rules must not run the self-check
+                copy, metadata = found
+                kind = metadata.get("kind", "")
+                told = getattr(source.convert, "keywords", None) or {}
+                if state is not False and ("kind" not in told or told["kind"] == kind):
+                    rules = int8.live_rules(kind, self.device) if state else int8.copy_rules(kind)
+                    if rules is not None and weights.recorded_rules(metadata) == rules:
+                        return copy
+        return weights.current_copy(source.file) or source.file
+
+    def _int8_copy(self, source: _Checkpoint) -> tuple[Path, str, dict[str, str]] | None:
+        """(the flow's int8 copy, its kind, the rules it holds) when this process may read it: a flow network
+        (one with a convert hook) going onto the card, a copy made from its file as it is now for this card's
+        profile (weights.current_int8_copy), and the rules the int8 policy applies to that kind here, after the
+        self-check on the card (modules/int8.py live_rules: it runs now when it has not yet), the copy's own."""
+        if source.convert is None or self.device.type != "cuda":
+            return None
+        found = weights.current_int8_copy(source.file)
+        if found is None:
+            return None
+        copy, metadata = found
+        kind = metadata.get("kind", "")
+        told = getattr(source.convert, "keywords", None) or {}
+        if "kind" in told and told["kind"] != kind:         # the convert hook names the flow's kind (engine.py)
+            return None
+        from ..modules import int8
+
+        rules = int8.live_rules(kind, self.device)
+        if rules is None or weights.recorded_rules(metadata) != rules:
+            return None
+        return copy, kind, rules
 
     def _read_file(self, name: str, plan: _Plan, file: Path, header: dict[str, stfile.TensorInfo],
                    state: dict[str, torch.Tensor], cancelled: Callable[[], bool] | None
@@ -520,7 +595,10 @@ class NetworkLoader:
         cls, args, computed, model = plan.cls, plan.args, plan.computed, plan.model
         model.load_state_dict(state, strict=False, assign=True)
         if not computed and _on_meta(model):
-            # The constructor made something on the parameters' device that the file does not carry.
+            # The constructor made something on the parameters' device that the file does not carry. A build for
+            # real has no int8 layers: an int8 plan never comes here (_int8_plan refuses such a model).
+            if _holds_int8(model):
+                raise RuntimeError(f"{cls.__name__}: {_on_meta(model)[0]} has no values after loading {file}")
             model = _build_for_real(cls, args)
             model.load_state_dict(state, strict=False, assign=True)
         stranded = _on_meta(model)
@@ -550,6 +628,29 @@ def _plan(config_file: Path, file: Path, config: dict | None = None) -> _Plan:
             raise ValueError(f"{file}: {key} is {list(header[key].shape)}, {cls.__name__} expects "
                              f"{list(want[key][1])}")
     return _Plan(cls, args, computed, model, header, want, keys)
+
+
+def _int8_plan(plan: _Plan, file: Path, copy: Path, kind: str, rules: dict[str, str]
+               ) -> tuple[_Plan, Path, dict[str, stfile.TensorInfo]] | None:
+    """`plan` with its model's converted layers replaced by the int8 shells `rules` give (modules/int8.py
+    skeleton: the modules convert makes, on the meta device), and the int8 copy and its header when the copy holds
+    exactly that model's state (weights.usable_int8_copy); None otherwise (the plan's model is changed all the
+    same)."""
+    from ..modules import int8
+
+    if plan.computed:
+        return None
+    int8.skeleton(plan.model, rules)
+    want = {key: (value.dtype, tuple(value.shape)) for key, value in plan.model.state_dict().items()}
+    if _meta_outside(plan.model, want):
+        # Something the constructor put on the meta device that is no part of the state gets its values only from a
+        # build for real, which has no int8 layers: such a model is read from the model-dtypes copy or the original.
+        return None
+    found = weights.usable_int8_copy(file, kind, rules, want)
+    if found is None:
+        return None
+    copy, header = found
+    return _Plan(plan.cls, plan.args, plan.computed, plan.model, header, want, list(header)), copy, header
 
 
 def _config(file: Path) -> dict:
@@ -608,6 +709,16 @@ def _on_meta(model: nn.Module) -> list[str]:
     """Names of the parameters and buffers that have no memory."""
     return [name for name, tensor in itertools.chain(model.named_parameters(), model.named_buffers())
             if tensor.is_meta]
+
+
+def _meta_outside(model: nn.Module, want: dict) -> list[str]:
+    """Names of the parameters and buffers without memory that are not in `want` (the model's state): what no file
+    gives values (a non-persistent buffer made on the parameters' device)."""
+    return [name for name in _on_meta(model) if name not in want]
+
+
+def _holds_int8(model: nn.Module) -> bool:
+    return any(type(module).__name__ in ("Int8Linear", "Int8MLP") for module in model.modules())
 
 
 def _tensor_bytes(module: nn.Module) -> int:
@@ -807,15 +918,21 @@ def _staging_buffer(pinned: bool) -> torch.Tensor:
 
 class _Prefetcher:
     """One daemon thread that reads files from end to end and throws the bytes away, one file at a time, the files
-    of one request in turn. A new request replaces the running one between two reads."""
+    of one request in turn. A new request replaces the running one between two reads. A file waits while RAM is
+    short for it (_read_through), a load of its network takes it out of the request (forget), and every load
+    holds it between two reads (hold): the read the card waits for has the drive to itself."""
 
     def __init__(self) -> None:
         self._wake = threading.Condition()
         self._thread: threading.Thread | None = None
         self._request: list[tuple[str, Path]] | None = None
         self._serial = 0
+        self._running = 0                               # the serial of the request the thread took last
         self._closed = False
         self._status: dict | None = None
+        self._rest: list[tuple[str, Path]] = []     # what the running request reads after the current file
+        self._go = threading.Event()                    # clear while a load reads (hold)
+        self._go.set()
 
     def read(self, requests: list[tuple[str, Path]]) -> None:
         with self._wake:
@@ -831,6 +948,29 @@ class _Prefetcher:
     def status(self) -> dict | None:
         with self._wake:
             return dict(self._status) if self._status is not None else None
+
+    def hold(self, held: bool) -> None:
+        """While a load reads its file (held), the read ahead waits between two of its reads."""
+        if held:
+            self._go.clear()
+        else:
+            self._go.set()
+
+    def forget(self, name: str) -> None:
+        """The load of `name` begins: it reads the file itself. Its read ahead stops where it is (what is read
+        stays in the cache), and is not begun later; the rest of the request goes on - unless a newer request (or
+        a stop) has come since the thread took it, which replaces it as it would have anyway."""
+        with self._wake:
+            if self._request is not None:
+                self._request = [entry for entry in self._request if entry[0] != name] or None
+            self._rest = [entry for entry in self._rest if entry[0] != name]
+            current = self._status or {}
+            if current.get("name") != name or current.get("state") not in ("reading", "waiting for RAM"):
+                return
+            current["state"] = "stopped"
+            if self._serial != self._running:
+                return          # the thread stops at its next look and takes the newer request
+            self.read(list(self._rest))     # the Condition's lock is re-entrant
 
     def close(self) -> None:
         with self._wake:
@@ -849,12 +989,14 @@ class _Prefetcher:
                     self._wake.wait()
                 if self._closed:
                     return
-                requests, serial = self._request, self._serial
+                self._rest, serial = list(self._request), self._serial
+                self._running = serial
                 self._request = None
-            for name, file in requests:
+            while True:
                 with self._wake:
-                    if self._serial != serial:
+                    if self._serial != serial or not self._rest:
                         break
+                    name, file = self._rest.pop(0)
                     self._status = {"name": name, "state": "reading", "bytes_read": 0, "bytes": 0}
                 state = self._read_through(file, serial, view)
                 self._tell(state=state)
@@ -862,17 +1004,31 @@ class _Prefetcher:
                     break
 
     def _read_through(self, file: Path, serial: int, view: memoryview) -> str:
-        """Read the file unless RAM is short: "done", "stopped" (another request came), "skipped" or "failed"."""
+        """Read the file once RAM allows: "done", "stopped" (another request came, or the load of this network
+        began), "skipped" (RAM stayed short for PREFETCH_RAM_WAIT_S) or "failed". RAM short now is often RAM free
+        a few seconds later (the finish steps let a mesh's trees go): the file is read then, instead of cold by
+        the load that comes."""
         try:
             import psutil
 
             size = file.stat().st_size
             self._tell(bytes=size)
-            if psutil.virtual_memory().available < size + PREFETCH_SPARE_BYTES:
-                return "skipped"
+            waited = time.monotonic()
+            while psutil.virtual_memory().available < size + PREFETCH_SPARE_BYTES:
+                if self._serial != serial:
+                    return "stopped"
+                if time.monotonic() - waited >= PREFETCH_RAM_WAIT_S:
+                    return "skipped"
+                self._tell(state="waiting for RAM")
+                with self._wake:
+                    self._wake.wait(PREFETCH_RAM_POLL_S)
+            self._tell(state="reading")
             done = 0
             with open(file, "rb", buffering=0) as handle:
                 while True:
+                    while not self._go.wait(PREFETCH_RAM_POLL_S):
+                        if self._serial != serial:
+                            return "stopped"
                     if self._serial != serial:
                         return "stopped"
                     count = handle.readinto(view)

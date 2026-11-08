@@ -33,12 +33,13 @@ from typing import Iterable, Iterator, NamedTuple
 
 import torch
 
-DTYPES = {"F32", "F16", "BF16", "I32", "I64", "U8", "BOOL", "C64"}
+DTYPES = {"F32", "F16", "BF16", "I32", "I64", "U8", "I8", "BOOL", "C64"}
 
 _TORCH = {"F32": torch.float32, "F16": torch.float16, "BF16": torch.bfloat16, "I32": torch.int32,
-          "I64": torch.int64, "U8": torch.uint8, "BOOL": torch.bool, "C64": torch.complex64}
+          "I64": torch.int64, "U8": torch.uint8, "I8": torch.int8, "BOOL": torch.bool,
+          "C64": torch.complex64}
 _CODE = {dtype: code for code, dtype in _TORCH.items()}
-_ITEM = {"F32": 4, "F16": 2, "BF16": 2, "I32": 4, "I64": 8, "U8": 1, "BOOL": 1, "C64": 8}
+_ITEM = {"F32": 4, "F16": 2, "BF16": 2, "I32": 4, "I64": 8, "U8": 1, "I8": 1, "BOOL": 1, "C64": 8}
 _HEADER_LIMIT = 100 << 20
 
 

@@ -247,11 +247,13 @@ def mark_int8pv(model: torch.nn.Module, kind: str) -> int:
 def fold(model: torch.nn.Module) -> int:
     """The 2^-V_SHIFT of v and the 2^V_SHIFT of the answer folded into the weights of every full self-attention of
     `model`: to_qkv's v rows (weight and bias) times 2^-V_SHIFT, to_out's weight times 2^V_SHIFT. Powers of two
-    scale a floating-point value exactly (no value of the flows comes near the exponent's ends), and every product
-    and sum of the attention and of the two GEMMs scales with them, so every path - SageAttention without its two
-    scaling passes (0.8 ms a block at 21.5k tokens), flash_attn, SDPA, the int8 layers (their row and channel
-    scales carry the powers) - gives the same bits as before. Done once per loaded network (the module's
-    `sage_folded` says so), by the engine when the switch is on. Returns how many modules were folded."""
+    scale a floating-point value exactly in bf16 and fp32 (no value of the flows comes near their exponent's ends;
+    in an fp16 torso v's weights below 2^-6 become subnormals and lose bits, so there the fold must come before the
+    int8 quantiser, never after it: staged/weights.py makes no int8 copy for fp16), and every product and sum of the
+    attention and of the two GEMMs scales with them, so every path - SageAttention without its two scaling passes
+    (0.8 ms a block at 21.5k tokens), flash_attn, SDPA, the int8 layers (their row and channel scales carry the
+    powers) - gives the same bits as before. Done once per loaded network (the module's `sage_folded` says so), by
+    the engine when the switch is on. Returns how many modules were folded."""
     down, up = 2.0 ** -V_SHIFT, 2.0 ** V_SHIFT
     count = 0
     with torch.no_grad():

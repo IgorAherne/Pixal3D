@@ -182,6 +182,26 @@ of a pass is unchanged. Before the first fused pass of a process the kernels are
 small tables; a card or a Triton that cannot run them turns the switch off with a `[FUSED]` warning and the flows
 run eagerly.
 
+Four more savings in the flows' blocks change no bit (each has a switch whose False runs the code before it, the same
+numbers). A norm followed by an int8 layer of the Triton GEMMs writes that layer's int8 input itself, instead of a
+bf16 table the layer reads back to quantise (`modules/sparse/transformer/modulated.py` `NORM_QUANT`,
+`int8mm.norm_quant`: norm_modulate's arithmetic and quantize_rows' in one kernel, at norm_modulate's 8 warps - at
+Triton's default 4 a few codes come out otherwise), at the three hand-offs of the sparse blocks' fused path (sm_80+):
+0.06-0.65 ms a hand-off. The attentions' to_out writes the new residual stream from its epilogue (`RESID_EPILOGUE`,
+`int8mm.gemm(..., resid=)`: the residual kernel's arithmetic with its gate, its second term or a plain add, without
+the bf16 table of to_out's results): to_out 2.06 -> 1.62 ms at 21.5k tokens; fc2's epilogue gained nothing, so fc2
+keeps the residual kernel. The guided pair's second pass starts its first block from the stream the first pass kept
+after that block's self-attention half, which reads no context (`classifier_free_guidance_mixin.SHARE_FIRST_BLOCK`,
+`_self_half_shared` in both block files, the block's `cfg_pair`): one [tokens, 1536] table held through the
+conditional pass, 11 MiB more of hr's peak for the boy at 1536; it runs on the eager path below sm_80 as well, the
+same bits by construction (not run on such a card). And a zero pass adds its kept row without expanding it into a
+table first (`fused.ROW_RESIDUAL`, `fused.residual_row`): 0.27 / 0.42 / 0.77 ms a block at 8k / 21.5k / 41.6k tokens.
+With the fc1 tile (below), on an RTX 3060 for the boy's three views at 1536 (19,928 tokens): an hr conditional pass
+1,992 -> 1,920 ms (-3.6 %), a zero pass 1,874 -> 1,756 ms (-6.3 %), tex -3.6 %, the prop 100.2 -> 97.5 s; every flow
+pass's output and the decoded meshes equal to the code before (76 of 76 passes, and 152 of 152 on two more props).
+The new kernels compile at their first use (about 3 s once per Triton cache); the install's calibration compiles them
+ahead (`int8mm.warm_handoffs`).
+
 The full self-attention of one prop's tokens (the sparse flows: lr, hr, tex; the dense sparse-structure flow's 4096
 tokens) runs SageAttention (`pixal3d/modules/sage.py`: int8 Q.K^T, fp16 P.V with fp32 accumulation, the wheel in
 `whl/`) on sm_80+ cards, on by default after a first-use self-check: `PIXAL3D_SAGE=off` gives flash_attn, bit for
@@ -229,37 +249,79 @@ the answer by 2^8 after it is folded into the weights when the switch is on (`sa
 two scale every product and sum exactly, so flash_attn, SDPA and the int8 layers give the same bits too): the
 kernel is called without its two elementwise passes (`sage.attention(..., scaled=True)`).
 
-A third saving of the same kind (round J): on the conditional passes, proj_linear's input is the projected
-conditioning, the same tensor at every step of a sampling, so each block's answer is the same table every pass
-(one GEMM of one shape on one input gives the same bits each time). Where the cap in force leaves room for the 30
-tables beside the sampler's own need (`parts.proj_cache_fits`: `sampler_mib(tokens)` + 1.1 x the tables, 1.9 GB at
-21.5k tokens, + 1,536 MiB to spare - the 12 GB card at 1536; a 7-8 GB card's cap of 6.8-7.1 GB would be left 72 MiB,
-as round J's emulated run showed before the margin; never when the cap was lifted) the engine marks the
-conditioning (`"proj_cache": True`, `parts._token_cond`) and the block keeps its answer with its input's identity
+A third saving of the same kind (round J; per block, and in part ss too, since 2026-11-08): on the conditional
+passes, proj_linear's input is the projected conditioning, the same tensor at every step of a sampling, so each
+block's answer is the same table every pass (one GEMM of one shape on one input gives the same bits each time). The
+first K blocks of a flow keep theirs, K as many as the cap in force has room for beside the sampler's own need
+(`parts.proj_cache_blocks` / `proj_cache_count`: `proj_cache_sampler_mib(tokens)` + 1.1 x each block's table - one
+[tokens, 1536] table a block, 58 MiB at 20k tokens in bf16 - with `PROJ_CACHE_MARGIN_MIB` 512 to spare).
+`proj_cache_sampler_mib` is `sampler_mib`'s figure, with its per-token part twice as wide for an fp32 torso (the
+pascal profile: its samplings allocate 86-89 MiB per thousand tokens beyond the weights and the tables, the boy
+forced on an RTX 3060, against 39-45 in bf16; turing's fp16 torso with its fp32 stream measured 52, within the 62.5
+sampler_mib charges). In bf16 sampler_mib is itself above a sampling's peak: on a 7.2 GiB card (cap 6.2-6.3 GB) hr
+allocated 2,455 / 2,737 MiB without tables for the boy / ork (sampler_mib 3,192 / 3,853), and with all 30 of the
+ork's tables 5,451 MiB, its reserve filling the cap with one allocator retry and no failure. So all 30 blocks on the
+12 GB card at 1536 and for the smaller 1536 props on a 7-8 GB card, 18-19 of the ork's there (the earlier rule, all
+30 or none with 1,536 MiB to spare, kept none for the boy or the ork there); by the figures 14 of the ork's fp32
+tables on a GTX 1080 Ti (not run on such a card); none on the ladder's tight rung (an attempt that ran out of memory
+runs again without them), on the CPU or when the cap was lifted. The engine marks the conditioning with the count
+(`"proj_cache": K`, `parts._token_cond`; True would mean every block), the flows hand it to their first K blocks
+(`proj_attention.proj_cache_limit`; none in a zero pass), and a block keeps its answer with its input's identity
 (storage address, shape, version: `SparseProjectAttention.proj_feats`, `ProjectAttention.proj_feats`) and gives it
-again while the input is that tensor; the engine drops the tables after the sampling (`drop_proj_caches`, in a
-`finally`). One GEMM per block (157 ms of a 3.1 s detail pass) cheaper on every conditional pass after the first;
-bit-identical (the golden engine check sv1024 with the tables kept).
+again while the input is that tensor; the engine drops the tables when the sampling attempt ends
+(`parts._drop_proj_cache` -> `drop_proj_caches`, in a `finally`: after an out-of-memory, a cancel or a failure too).
+Part `ss` does the same for the dense flow (30 tables of [4096, 1536]: 360 MiB in bf16, 720 MiB in fp32 on Pascal),
+across the guard's draws, which all take the same conditioning: -2.4 % a step (0.82 -> 0.80 s), about 0.2 s a prop on
+the RTX 3060. One GEMM per block cheaper on every conditional pass after the first (all 30 blocks: 157 ms of a 3.1 s
+detail pass at 21.5k tokens; on the 7.2 GiB card the boy's hr -3.6 % and tex -6.2 % a step, the ork's with 18-19
+blocks -2.0 % and -3.2 %); bit-identical (the sv1024 golden engine check with the tables kept; the boy's and the
+ork's decoded meshes equal with 0, 18-19 and 30 blocks and to the full card's). The fakes check the count, its marks
+on the conditioning, the drop after every attempt, the flows' first-K rule and the modules' keep and drop
+(check_engine.py --fake, the proj tests).
 
 The detail flows' token-sized linear layers run as int8 GEMMs (`pixal3d/modules/int8.py`, the kernels in
 `modules/int8mm.py`: Triton GEMMs on the int8 tensor cores with the scaling, bias and GELU fused into the epilogue,
 and the quantisers; switch `PIXAL3D_INT8` on/off/a policy name, on by default after a first-use self-check against
 fp64, sm_80+). cuBLAS already runs the bf16 GEMMs at the card's tensor peak (26 TFLOPS on an RTX 3060: half of a
-detail pass), and the same card multiplies int8 at 84-88 TOPS, so the weights are quantised once at load (one
-scale per output channel) and the activations at every call (one scale per token, or per token and 128 input
-channels: "group" scales); the loader's convert hook does it (`register_checkpoint(..., convert=)`, the engine's
-`_prepare_flow`, after the Sage fold). Which flows and layers, and how, is a policy: the default "detail" converts
-the hr and tex flows only (group scales on to_qkv and the MLP, which carry the error; per-row on the three
-1536 -> 1536 layers; proj_linear in bf16, whose input has two channels ~25x the others; the ss and lr flows in
-bf16, whose samples a small change flips the most). Measured: an hr pass at 1536 4.21 -> 3.08 s (-27 %), the five
-test props' batch 954 -> 760 s (-20 %), a flow's weights 2.7 -> 1.6 GB (the hr/tex memory peaks 1.1-1.5 GB lower);
-the final latent moves ~2x as far as the accepted changes (the fused kernels, SageAttention) but the meshes and
-textures do not: Chamfer 0.03-0.08 % of the bounding-box diagonal against the bf16 run (the sampling floor; the
-accepted changes 0.16-0.43 %), the base colour at matched surface points 3-11 levels apart (the Sage change 13-31),
-renders alike (`code/logs/profiling/pixal3d-lowmem/round-i/int8-detail-full/compare`). Off = the bf16 layers, bit
-for bit the numbers of before; "safe" (the three 1536 -> 1536 layers only, -5 % of a pass) and "every" / "all"
-(every flow) are policies for experiments. The kernels compile on first use (~6 s with a cold Triton cache, 0.4 s
-warm; one compilation serves every token count).
+detail pass), and the same card multiplies int8 at 84-88 TOPS, so the weights are quantised once at load (one scale
+per output channel) and the activations at every call (one scale per token, or per token and 128 input channels:
+"group" scales); the loader's convert hook does it (`register_checkpoint(..., convert=)`, the engine's
+`_prepare_flow`, after the Sage fold), or the load reads the weights quantised already, from the flow's int8 copy
+("The int8 copies of the detail flows", below). Which flows and layers, and how, is a policy: the default "detail"
+converts the hr and tex flows only (group scales on to_qkv and the MLP, which carry the error; per-row on the three
+1536 -> 1536 layers; proj_linear in bf16, whose input has two channels ~25x the others; the ss and lr flows in bf16,
+whose samples a small change flips the most). Measured: an hr pass at 1536 4.21 -> 3.08 s (-27 %), the five test
+props' batch 954 -> 760 s (-20 %), a flow's weights 2.7 -> 1.6 GB (the hr/tex memory peaks 1.1-1.5 GB lower); the
+final latent moves ~2x as far as the accepted changes (the fused kernels, SageAttention) but the meshes and textures
+do not: Chamfer 0.03-0.08 % of the bounding-box diagonal against the bf16 run (the sampling floor; the accepted
+changes 0.16-0.43 %), the base colour at matched surface points 3-11 levels apart (the Sage change 13-31), renders
+alike (`code/logs/profiling/pixal3d-lowmem/round-i/int8-detail-full/compare`). Off = the bf16 layers, bit for bit the
+numbers of before; "safe" (the three 1536 -> 1536 layers only, -5 % of a pass) and "every" / "all" (every flow) are
+policies for experiments. The kernels compile on first use (~6 s with a cold Triton cache, 0.4 s warm; one
+compilation serves every token count). fc1's tile (its GELU and group-scaled int8 output) is chosen once per card by
+the install's calibration, among tiles that give the same bits - BLOCK_K is the group, BLOCK_N fc2's input group
+(`int8mm.calibrate_fc1_tiles`: the bits checked, a candidate kept only where it is 3 % faster at both 21,504 and
+8,192 rows; the record's `triton.int8_tiles`, which `int8mm.fc1_group_cfg` reads only for the card and the Triton it
+was timed with, else the shipped tile; `FC1_GROUP_CFG` forces one): on an RTX 3060 (64, 128, 128, 8, 3, 4), fc1
+13-20 % faster (10.46 -> 8.93 ms at 21.5k rows). A record without that choice on a card whose int8 GEMMs are Triton's
+(sm_80+), or with a choice timed under another Triton, has the calibration run its Triton step again, alone
+(`calibrate.py --only triton`, which Spellcast3D's installer asks for), the record's other sections standing.
+
+On sm_80+ the group-scaled layers (to_qkv, fc1, fc2) can run pixal3d_kernels' CUDA twin of the Triton group GEMM
+(`torch.ops.pixal3d_kernels.int8_gemm_group80`, `csrc/int8_gemm_sm80.cu`): the same arithmetic instruction for
+instruction, read from Triton 3.4's own SASS - each 128-K slab's exact int32 sum, the fp32 accumulation in slab
+order, the epilogue down to libdevice's tanhf in GELU - so the same bits (checked on 2,840 random tables in every
+form, on every fp32 input of GELU, on captured real operands and on 7,536 calls inside real passes). The Triton step
+of the install's calibration races its tiles against Triton per layer form at 8,192 and 21,504 rows
+(`int8mm.calibrate_group_cuda`, called from `calibrate_fc1_tiles`: every tile's output torch.equal to Triton's, a
+tile serving a form only where it is 3 % faster at both; the record's `triton.int8_tiles.group_cuda`, with the
+kernels build it was made with); a first-use check per process (`group_cuda_check`) compares the two before it
+serves, and a form the race did not choose, or a record of another card, Triton or kernels build, keeps Triton. On
+an RTX 3060: to_qkv tile 2 (-3.4 to -8.2 %), fc1 tile 4 (-6.8 to -8.8 %), fc2 on Triton (no tile beat it); the boy's
+three views at 1536 hr 39.45 -> 39.06 s, tex 23.28 -> 23.00 s, all 76 flow passes and the decoded meshes equal.
+`PIXAL3D_INT8_GEMM = triton | cuda` forces one kernel for every group layer (a bench of Triton's must pass
+`kernel="triton"` to `int8mm.gemm`, which otherwise takes the record's choice). A record whose tile choice lacks the
+race (or holds one of another kernels build) runs the Triton step again, alone, like a missing tile.
 
 DINOv3 (part `features`) runs under float16 autocast on cards from sm_75 up (`proj_cond.dino_fp16`, switch
 `PIXAL3D_DINO_FP16` auto/on/off; a GTX 10xx keeps float32, where fp16 is slow): the features part 3.6x faster
@@ -374,10 +436,11 @@ Two rules use the room a big card leaves, and change nothing where it is short:
   4,008 MiB at 35.9 M faces is conservative; a 4096 texture's bake takes 2.5 GB and may then run out of memory
   once, to run again with what is kept gone);
   both decoders stay as well when the holes and the steps fit beside them too and the next prop's texture
-  sampling fits beside them under the cap in force: its sampler (`sampler_mib`) and, where it will keep them, its
-  flow's proj_linear answers (`next_sampler_mib`: the test of `proj_cache_fits`, so the decoders never take the
-  room of that cache - 3.5 GB with its margin at 36 k tokens; on the full RTX 3060 a next prop above about 34 k
-  tokens keeps its cache and the decoders are loaded again for it). The sizes are the loaded networks' own
+  sampling fits beside them under the cap in force: its sampler (`proj_cache_sampler_mib`) and, where it will keep
+  them, its flow's proj_linear answers (`next_sampler_mib`: the tables of the blocks `proj_cache_count` gives the
+  next prop under the cap in force, so the decoders never take the room of that cache - 3.5 GB with the 1.1 slack
+  at 36 k tokens; on the full RTX 3060 a next prop above about 43 k tokens with the int8 texture network, 34 k with
+  a bf16 one, keeps its cache and the decoders are loaded again for it). The sizes are the loaded networks' own
   (`loader.size_mib`: 2,708 MiB for a bf16 texture network, 1,557 for an int8 one, 914 for a decoder). What is kept
   is counted out of the room a finish step is offered (`tail_room`). On the full RTX 3060 every prop of the test
   set keeps both; under the caps of a card that leaves Pixal3D 7.2 GiB nothing is kept for the test set's 1536 props
@@ -477,6 +540,74 @@ weights.make_copy(ckpt)                          # one checkpoint, its path with
   seconds. It exits 1 when a checkpoint got no copy, 0 otherwise. Spellcast3D runs it after its installer has
   downloaded the models and after the multi-view download (its `install/components.py` and `multiview.py`).
 
+### The int8 copies of the detail flows
+
+The flows the int8 policy converts (hr and tex under "detail": four checkpoints with the multi-view set) get a
+second copy from the same maker, `<ckpt>.int8.model-dtypes.safetensors` (`weights.make_int8_copy`): the model's state
+with its int8 layers in place - each converted linear's int8 weight, fp32 scales and fp32 bias exactly as
+`int8.convert` makes them, every other tensor in the torso's dtype. A load reads it into a model built on the meta
+device with those int8 layers already in place (`int8.skeleton`: the modules convert makes, by the same
+constructors and the same walk over the model), and the convert hook then finds nothing left to quantise (one
+`[INT8] ... read pre-quantised` line instead of the conversion's). What it saves:
+
+| profile | read before | int8 copy | on the card before the conversion |
+|---|---|---|---|
+| ampere (bf16 torso) | 2.81 GB model-dtypes copy | 1.63 GB | 2.8 GB -> 1.6 GB |
+| turing (fp16 torso) | 2.81 GB model-dtypes copy | none (below: Same bits) | - |
+| pascal (fp32 torso) | 5.55 GB original (no smaller copy) | 2.01 GB | 5.5 GB -> 2.0 GB |
+
+(The copies' sizes as the maker wrote them for each profile; the pascal row's card figures follow from them and
+were not measured on that card.) On the RTX 3060 the first hr load of a process went 1.94 -> 0.54 s
+(the int8 self-check 0.22-0.62 s now runs before the read; the conversion's 0.5 s of first-use quantising is gone)
+and a tex load 0.45 -> 0.34 s; a later load from the file cache saves ~0.1 s of reading, a cold one the time of
+1.2 GB at the drive's speed.
+
+- **Same bits.** The weights are quantised on the CPU by `int8mm.quantize_rows_torch`, the reference the card's
+  Triton quantiser equals bit for bit (`int8mm.self_check` checks it in every process; for every converted weight of
+  the four checkpoints in bf16, and of the hr flow in fp16 and fp32, the CPU reference, the Triton kernel and the
+  card's torch ops gave the same bytes on an RTX 3060). SageAttention's fold (v's 2^-8 and the answer's 2^8) is
+  applied after the load to the int8 layers' channel scales and biases, as it is applied to the bf16 or fp32 weights
+  before they are quantised at load: in those dtypes (fp32's exponent range) a power of two scales a row's absmax,
+  its scale and its bias exactly and leaves its int8 codes as they are. Every tensor and module attribute of the four
+  checkpoints loaded both ways is the same, byte for byte (bf16), and so are the decoded meshes of a single-view prop
+  made with the copies and without. **Not in fp16**: there the fold's 2^-8 turns to_qkv's v weights and biases below
+  2^-6 into subnormals, which lose bits before the quantiser sees them, while a copy is quantised from the unfolded
+  weights - on the hr checkpoint hundreds to thousands of other int8 codes per block. So the turing profile (fp16
+  torso) makes no int8 copy and reads none (`int8._copy_exact`, in `copy_rules` and `live_rules`): the install cannot
+  know whether a run folds (the SageAttention switch is read at run time), and a copy is right only for one of the
+  two. Winning the read back with the same bits would take a copy folded as the load folds it (v's rows scaled in
+  fp16, their channel scales and bias times 2^8 again) and read only under the same switch.
+- **When it is read.** Its record holds what the model-dtypes copy's does (the original's name, size, modification
+  time, header SHA-256, the torch version) and the torso's dtype, the flow's kind, the layer rules it was made for,
+  the int8 group and `weights.INT8_FORMAT`. The maker cannot run the card's self-check (it runs with the card
+  hidden): it makes the copy for the rules a card of the PC's profile runs (`int8.copy_rules`: the policy's, the
+  group-scaled layers left out where no group GEMM will be there - Triton below sm_80 cannot, pixal3d_kernels can).
+  The loader reads it only where the process's own rules after its self-check on the card are the same
+  (`int8.live_rules`), the convert hook names the same kind, and the copy holds exactly that model's state;
+  anything else - a self-check that failed, PIXAL3D_INT8 off or another policy, a stale or broken copy - reads the
+  model-dtypes copy (or the original) and converts as before. A "cs" policy (calibrated smoothing) has no copies.
+  The read-ahead (`NetworkLoader._read_ahead_file`) picks the int8 copy by the same kind and rules - the process's
+  after its self-check, `copy_rules`' prediction before it - and never runs the self-check itself.
+- **Install.** `pixal3d_install_inputs` in Spellcast3D's installer carries `INT8_FORMAT`: an install made before the
+  int8 copies existed runs its install once more and makes them (the model-dtypes copies are up to date and stay).
+  4 x 1.63 GB more on the disk of an RTX 30xx PC (4 x 2.01 GB on a GTX 10xx, none on an RTX 20xx); about 4-14 s a
+  copy on the Ryzen 9 (CPU, read from the model-dtypes copy where it is current). Spellcast3D's multi-view download
+  runs the same maker with the card's `PIXAL3D_CARD_SM`, as the installer does: a maker in another profile would
+  remove the copies of this one.
+
+### Reading ahead
+
+The loader's read-ahead thread reads the next networks' files into the system's file cache (`prefetch`; the runner
+asks for the next group's while a group runs). It waits while RAM is short for a file (less than its size and
+`PREFETCH_SPARE_BYTES` available): it looks again every `PREFETCH_RAM_POLL_S` and reads the file once RAM allows,
+instead of giving up - in a cold 6-prop batch on an RTX 3060 the single-view texture flow's read ahead found
+3,960 MiB available at the kind switch (4,344 needed) and was skipped, 5,750 MiB were free eight seconds later, and the
+load read the 2.81 GB cold in 6.2 s with the card at 7 %. A load takes its own file out of the read-ahead (`forget`):
+what was read stays in the cache, and the rest of the request goes on (unless a newer request came meanwhile: that
+one wins, as it would have); and while any load runs the read-ahead waits between two of its reads (`hold`), so that
+the read the card waits for has the drive to itself. Spellcast3D's launcher holds its own read-ahead of libraries and
+first networks the same way, from the engine's `net_load` to its `net_ready` (pixal3d_server.py `ReadAheadGate`).
+
 ## Cards below sm_80: the precision profile
 
 The engine was made for Ampere and newer (bf16 flows, Triton kernels, natten, flash_attn, SageAttention: all
@@ -531,6 +662,31 @@ flows (above) then hold fp16 on Turing and are not made on Pascal (fp32 is the f
 tells a process that cannot see the card (the installer's copies) which card it is; `PIXAL3D_PRECISION` forces a
 profile (a forced profile on another card runs that profile's code paths with the card's own kernels: the
 developer's test of the Turing and Pascal paths on an RTX 3060, `round-l/smoke_precision.py` in Spellcast3D).
+
+On both old profiles the flows' eager element-wise chains - about a third of an hr / tex pass on an RTX 2070 - run
+as pixal3d_kernels' CUDA kernels with the chains' own bits (`modules/old_cards.py`; `pixal3d_kernels/csrc/
+elementwise.cu`, README "The element-wise chains"): the int8 quantiser (`int8mm.quantize_rows_torch`'s bits;
+int8mm takes it below sm_80 only where the Triton quantiser does not pass its check), the norm modulation, the
+gated residual, and the q / k RMS norm with the rotary embedding (its sum of squares in torch's own reduction
+order), every rounding through intrinsics that round once. Before the first use in a process each runs once on
+small tables against its eager chain (`_check`): a kernel that gives other bits turns them all off, with an
+`[OLD-CARDS]` line. Which kinds serve is the install's race (calibrate.py's step "old_cards", `old_cards.calibrate`:
+each kernel against its chain at 4,096 x 1024 and 20,000 x 1536 rows in the profile's dtypes, interleaved medians,
+on only where it is 5 % faster at both; the record's `old_cards` section keeps the timings and the choice, read only
+when made on this card for this profile with the installed kernels build; without such a record every kind serves).
+`PIXAL3D_OLD_CARD_KERNELS=off` gives the eager chains everywhere, `force` every kind whatever the race chose. On an
+RTX 2070 an ss pass 601.6 -> 498.0 ms, lr 149.0 -> 118.4, hr 559.9 -> 430.6, tex 557.4 -> 431.1 (the boy at 1024;
+the meshes the same); the RTX 3060 under the forced profiles had every kind 1.7-16x faster than its chain (pascal
+1.7-8x in fp32, turing 2.7-16x); no real Pascal card was measured, which is why the race decides there.
+Below sm_80 the decoders' spconv kernel choices are timed once at install as well (`modules/sparse/conv/
+spconv_choices.py`, the record's `spconv_decoders`, put back before the first convolution of every process by
+conv_spconv.py): spconv's own tuner otherwise times every candidate at the first prop of each process (25 s of the
+boy's first prop on an RTX 2070, 75 s of the ork's) on whatever that prop brings, and chose differently from one
+process to the next, which moved the decoded voxel count. The candidates are the C++ tuner's, fp16 and fp32
+accumulation alike (`FP32_ACCUM = False`: the decoders' numbers of before); spconv's Python rule (fp32 accumulation
+above 128 input channels, `FP32_ACCUM = None`) is steadier but a precision change, measured and not taken. Pascal
+needs no record (its products run on torch.mm). A record without the section on Turing, or without the old cards'
+race below sm_80, runs that step alone (`--only spconv_decoders`, `--only old_cards`; Spellcast3D's installer asks).
 
 ## Extending it
 

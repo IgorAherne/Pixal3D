@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 from ..attention import MultiHeadAttention, ProjectAttention, GatedProjectAttention
 from ..norm import LayerNorm32
-from .. import fused
+from .. import fused, old_cards
 from .blocks import FeedForwardNet
 
 
@@ -21,6 +21,36 @@ def _stream(h, x):
     range where the stream is fp32); h itself where the two agree."""
     hx, xx = getattr(h, "feats", h), getattr(x, "feats", x)
     return h if hx.dtype == xx.dtype else h.type(xx.dtype)
+
+
+def _modulate(h, scale, shift, dtype):
+    """_inner(h * (1 + scale) + shift, dtype): one kernel on the cards below sm_80 (modules/old_cards.py: the same
+    bits), the eager ops elsewhere."""
+    out = old_cards.modulate(h, scale, shift, dtype)
+    return out if out is not None else _inner(h * (1 + scale) + shift, dtype)
+
+
+def _gated(x, h, gate):
+    """x + _stream(h, x) * gate: one kernel on the cards below sm_80 (modules/old_cards.py: the same bits), the
+    eager ops elsewhere."""
+    out = old_cards.gated(x, h, gate)
+    return out if out is not None else x + _stream(h, x) * gate
+
+
+def _self_half_shared(block, x: torch.Tensor, run) -> torch.Tensor:
+    """`run(x)` (the block's norm1, self-attention and gated residual), or the stream the guided pair's first pass
+    kept for the second (modules/sparse/transformer/modulated.py: _self_half_shared)."""
+    pair = getattr(block, "cfg_pair", None)
+    if pair is None:
+        return run(x)
+    if not pair.get("keep") and pair.get("x") is not None:
+        kept = pair.pop("x")
+        if kept.shape == x.shape:
+            return kept
+    x = run(x)
+    if pair.get("keep"):
+        pair["x"] = x
+    return x
 
 
 def _fused_rows(x: torch.Tensor) -> Optional[dict]:
@@ -93,15 +123,13 @@ class ModulatedTransformerBlock(nn.Module):
             return fused.residual(x, h, gate=gate_mlp, **rows)
         inner = getattr(self, "inner_dtype", None)
         h = self.norm1(x)
-        h = _inner(h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1), inner)
+        h = _modulate(h, scale_msa.unsqueeze(1), shift_msa.unsqueeze(1), inner)
         h = self.attn(h, phases=phases)
-        h = _stream(h, x) * gate_msa.unsqueeze(1)
-        x = x + h
+        x = _gated(x, h, gate_msa.unsqueeze(1))
         h = self.norm2(x)
-        h = _inner(h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1), inner)
+        h = _modulate(h, scale_mlp.unsqueeze(1), shift_mlp.unsqueeze(1), inner)
         h = self.mlp(h)
-        h = _stream(h, x) * gate_mlp.unsqueeze(1)
-        x = x + h
+        x = _gated(x, h, gate_mlp.unsqueeze(1))
         return x
 
     def forward(self, x: torch.Tensor, mod: torch.Tensor, phases: Optional[torch.Tensor] = None) -> torch.Tensor:
@@ -222,11 +250,14 @@ class ModulatedTransformerCrossBlock(nn.Module):
             return self._forward_fused(x, context, phases, rows, shift_msa, scale_msa, gate_msa, shift_mlp,
                                        scale_mlp, gate_mlp, zero, proj_cache)
         inner = getattr(self, "inner_dtype", None)
-        h = self.norm1(x)
-        h = _inner(h * (1 + scale_msa.unsqueeze(1)) + shift_msa.unsqueeze(1), inner)
-        h = self.self_attn(h, phases=phases)
-        h = _stream(h, x) * gate_msa.unsqueeze(1)
-        x = x + h
+
+        def self_half(x):
+            h = self.norm1(x)
+            h = _modulate(h, scale_msa.unsqueeze(1), shift_msa.unsqueeze(1), inner)
+            h = self.self_attn(h, phases=phases)
+            return _gated(x, h, gate_msa.unsqueeze(1))
+
+        x = _self_half_shared(self, x, self_half)
         h = _inner(self.norm2(x), inner)
         if type(self.cross_attn) is ProjectAttention:
             # zero: the zero context's one row; proj_cache: proj_linear's kept answer (proj_attention.py)
@@ -235,10 +266,9 @@ class ModulatedTransformerCrossBlock(nn.Module):
             h = self.cross_attn(h, context)
         x = x + h
         h = self.norm3(x)
-        h = _inner(h * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1), inner)
+        h = _modulate(h, scale_mlp.unsqueeze(1), shift_mlp.unsqueeze(1), inner)
         h = self.mlp(h)
-        h = _stream(h, x) * gate_mlp.unsqueeze(1)
-        x = x + h
+        x = _gated(x, h, gate_mlp.unsqueeze(1))
         return x
 
     def _forward_fused(self, x: torch.Tensor, context: Any, phases: Optional[torch.Tensor], rows: dict,
@@ -247,14 +277,17 @@ class ModulatedTransformerCrossBlock(nn.Module):
                        zero: bool = False, proj_cache: bool = False) -> torch.Tensor:
         """_forward with the elementwise ops fused (modules/fused.py: the switch PIXAL3D_FUSED); the same
         sub-layers in the same order."""
-        h = fused.norm_modulate(x, self.norm1.eps, scale=scale_msa, shift=shift_msa, **rows)
-        h = self.self_attn(h, phases=phases)
-        x = fused.residual(x, h, gate=gate_msa, **rows)
+        def self_half(x):
+            h = fused.norm_modulate(x, self.norm1.eps, scale=scale_msa, shift=shift_msa, **rows)
+            h = self.self_attn(h, phases=phases)
+            return fused.residual(x, h, gate=gate_msa, **rows)
+
+        x = _self_half_shared(self, x, self_half)
         shape = (x.shape[0], x.shape[1])
         cached = self.cross_attn.zero_row(shape) if zero and type(self.cross_attn) is ProjectAttention else None
         if cached is not None:
             # the zero context's one row per batch item for every token (proj_attention.py); no norm2 needed
-            x = fused.residual(x, cached.expand(*x.shape).contiguous())
+            x = fused.residual_row(x, cached, **rows)
         elif type(self.cross_attn) is ProjectAttention:
             h = fused.norm_modulate(x, self.norm2.eps, weight=self.norm2.weight, bias=self.norm2.bias, **rows)
             # ProjectAttention.forward, its sum (proj + global) done in the residual kernel
