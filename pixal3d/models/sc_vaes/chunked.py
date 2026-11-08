@@ -30,12 +30,45 @@ The values are those of the whole-table decode, bit for bit, because:
   rather than fall back to a whole-table decode that may not fit. The coarse levels, decoded whole, take the
   whole-table decode's own calls where that would split (`sliced`).
 - A box's rows within the halo have all their neighbours, with the same values as in the whole table.
+
+On spconv (the cards below sm_80, Spellcast3D round O) the convolutions run on a pair table built once per level and
+kept in its spatial cache (modules/sparse/conv/conv_spconv.py `subm_rows`; whole levels and boxes alike):
+- spconv's implicit GEMM (sm_70+) computes an output row from its own neighbours alone, as flex_gemm's masked
+  kernel does: a block of rows visits the union of its rows' offsets in ascending order, a missing offset adds
+  exact zeros, the forward split-K is always 1 and the kernel is chosen without the row count (the calibration
+  record's choice, spconv_choices: the box decode has the whole-table decode's bits under the same record; with no
+  record spconv times its kernels at the first call of each shape in the process, and a decode then has that
+  process's bits, the boxes included). Every level may be sliced (`slices`).
+- the products on torch.mm (sm_61) are spconv's Native sums - centre, offsets 0..26, bias, one fp16 rounding an
+  offset. The whole levels' convolutions are the whole-table decode's own calls (unpadded: today's calls on any
+  card); every call that stands in for one - a box's, a slab's, a row subset's - has at least
+  products_floor.floor("products") rows a product (padded with zero rows): from there cuBLAS gives a row the
+  same bits whatever the call's size, for the shapes the boxes and slabs run (measured at install, the record's
+  "decode_products"). An offset the whole level pairs fewer rows for (0 < n < the floor) is the whole level's own
+  call once (conv_spconv.whole_offset_products), and every slab or box adds its rows of it at that offset's turn
+  (up_block's `fixed`): the boxes never fall back to a whole table the memory model did not plan.
+- cuBLAS's fp16 GEMMs without cuBLASLt (the pascal profile) give the coarse levels' Linear shapes (K = 1024 / 2048)
+  other bits at 8-131 Ki rows a call than at the level's size, so on spconv every Linear layer of a level decoded
+  whole makes the reference's own call, one per layer (`whole_level_calls`: the ConvNeXt MLPs and the tail); the
+  boxes' windows (BOX_WINDOW, padded) stand in for the box level's and the output layers' whole calls, which the
+  install's sweep checks at the whole-level sizes of each level (products_floor.verified: a decode whose level is
+  larger is outside what was measured - the planner's boxes_supported(voxels) keeps such props whole or at 1024, and
+  a decode that gets here all the same says so). Where the record found a launch-boundary band for the output layer
+  (products_floor.boundary_band) the fine rows before it are kept and, for a fine level in the band, the output
+  layer makes the whole decode's own call. Without this card's ok decode_products section, or where it found a
+  shape the boxes call with no such floor (products_floor.exact() False), spconv does not decode in boxes
+  (`backend`).
+
+PIXAL3D_CHUNK_VOXELS = n (> 0) decodes every decode that can be decoded in boxes in boxes of about n fine voxels,
+whatever `decoder.chunk_voxels` says (0: none in boxes) - for the identity checks of a prop the memory model would
+decode whole; unset, the decoder's own setting decides.
 """
 
 from __future__ import annotations
 
 import importlib
 import math
+import os
 import time
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -63,6 +96,7 @@ FINE_PER_LEVEL3 = 4.6       # fine voxels per level-3 voxel the shape decoder's 
 LAST: Dict[str, Any] = {}   # what the last chunked decode did (boxes, rows, seconds): for measuring
 BOXES = True                # False: no boxes, every level on whole tables with the slabbed layers only (for
 #                             measuring what the slabs alone give)
+CHUNK_ENV = "PIXAL3D_CHUNK_VOXELS"      # the override of decoder.chunk_voxels (the module's docstring)
 
 
 # ------------------------------------------------------------------------------------------------ the convolutions
@@ -72,16 +106,105 @@ def _module(name: str) -> Any:
     return importlib.import_module(f"flex_gemm.kernels.triton.spconv.{name}")
 
 
-def applies(decoder: Any, x: sp.SparseTensor) -> bool:
-    """Whether `decoder` decodes x in boxes: chunk_voxels set, no gradients, not training, one item, flex_gemm's
-    masked split-K algorithm (the one whose rows this module reproduces)."""
-    if not getattr(decoder, "chunk_voxels", 0) or torch.is_grad_enabled() or decoder.training:
-        return False
+def backend() -> str:
+    """The convolutions a decode in boxes runs on in this process: "flex_gemm" (its masked split-K algorithm, the one
+    whose rows this module reproduces), "spconv" (conv_spconv's subm_rows), or "" (no decode in boxes)."""
     from ...modules.sparse import config as sparse_config
     from ...modules.sparse.conv import config as conv_config
-    if sparse_config.CONV != "flex_gemm" or conv_config.FLEX_GEMM_ALGO != "masked_implicit_gemm_splitk":
+    if sparse_config.CONV == "flex_gemm":
+        return "flex_gemm" if conv_config.FLEX_GEMM_ALGO == "masked_implicit_gemm_splitk" else ""
+    if sparse_config.CONV == "spconv":
+        from ...modules.sparse.conv import conv_spconv, products_floor
+        return "spconv" if conv_spconv.boxes_supported() and products_floor.exact() else ""
+    return ""
+
+
+def boxes_supported(voxels: Optional[int] = None) -> bool:
+    """Whether this process's backend can decode in boxes (the whole-table decode's values in a bounded memory):
+    flex_gemm's masked split-K, or spconv where this card's decode_products measurement says so
+    (products_floor.exact: never without one). `voxels`: also whether a prop of that many fine voxels has every
+    level within the whole calls the measurement verified (products_floor.covers_voxels; spconv only) - for the
+    planner, which then keeps a prop it does not cover whole, or at 1024."""
+    found = backend()
+    if found != "spconv" or voxels is None:
+        return bool(found)
+    from ...modules.sparse.conv import products_floor
+    return products_floor.covers_voxels(int(voxels))
+
+
+def chunk_voxels(decoder: Any) -> int:
+    """The box size (fine voxels) `decoder` decodes in: PIXAL3D_CHUNK_VOXELS when set, else decoder.chunk_voxels."""
+    text = os.environ.get(CHUNK_ENV, "").strip()
+    if text:
+        try:
+            return max(0, int(float(text)))
+        except ValueError:
+            pass
+    return int(getattr(decoder, "chunk_voxels", 0) or 0)
+
+
+def applies(decoder: Any, x: sp.SparseTensor) -> bool:
+    """Whether `decoder` decodes x through forward_chunked: a box size set (chunk_voxels) - or the windows-everywhere
+    mode, in which every decode does (`windows`) - no gradients, not training, one item, a backend whose rows this
+    module reproduces (`backend`)."""
+    if not (chunk_voxels(decoder) or windows()) or torch.is_grad_enabled() or decoder.training:
+        return False
+    if not backend():
         return False
     return x.shape[0] == 1
+
+
+def _spconv() -> bool:
+    return backend() == "spconv"
+
+
+def slices(up: Any, x: sp.SparseTensor) -> bool:
+    """Whether a whole level x's up-block conv1 may run a slab of parents at a time with the whole call's values: on
+    flex_gemm where its split-K wrapper would not split the reference's call (reference_splitk); on spconv always
+    (the implicit GEMM's rows do not depend on the call; the products' offsets that pair fewer rows than the floor
+    are taken from the level's own calls: up_block, conv_spconv.whole_offset_products)."""
+    if _spconv():
+        return True
+    return reference_splitk(x.feats.shape[0], up.channels, 8 * up.out_channels) == 1
+
+
+def min_call_rows() -> int:
+    """The smallest Linear call of rowwise's even windows: MIN_CALL_ROWS, whatever the backend and the record (the
+    decoders' whole levels on spconv make whole-level calls instead, `whole_level_calls`; the other callers of
+    rowwise - lean_encode's encoder, Hi3D's shape encoder - keep their own windows: a record's floor never moves
+    them)."""
+    return MIN_CALL_ROWS
+
+
+def box_window() -> int:
+    """The rows of every Linear call inside a box: BOX_WINDOW (on spconv the install's sweep checked exactly these
+    calls against whole-level ones: products_floor.exact)."""
+    return BOX_WINDOW
+
+
+def windows() -> Optional[int]:
+    """On spconv where the install found a box shape with no floor: the rows of every GEMM call of the decoders
+    (products_floor.window: the windows-everywhere mode, whole decodes included), else None."""
+    if _spconv():
+        from ...modules.sparse.conv import products_floor
+        return products_floor.window()
+    return None
+
+
+def _linear(layer: Any, feats: torch.Tensor) -> torch.Tensor:
+    """layer's rows of feats (a Linear layer, a SparseLinear's module) in the windows-everywhere mode's calls."""
+    out = torch.empty((feats.shape[0], layer.out_features), dtype=feats.dtype, device=feats.device)
+    rowwise(lambda rows: torch.nn.Linear.forward(layer, rows), feats, out, windows(), pad=True)
+    return out
+
+
+def whole_level_calls() -> bool:
+    """On spconv the Linear layers of a level decoded whole make the reference's own calls (one call per layer on the
+    whole level, as SparseUnetVaeDecoder.forward's loop makes them): cuBLAS's fp16 GEMMs without cuBLASLt (the pascal
+    profile) give a row other bits at 8-131 Ki rows a call than at the level's size for the coarse levels' shapes
+    (K = 1024 / 2048; measured on sm_86, round O), so no window of them can stand in for the whole call. Not in the
+    windows-everywhere mode, whose windows are the calls of every decode."""
+    return _spconv() and not windows()
 
 
 def reference_splitk(rows: int, ci: int, co: int) -> Optional[int]:
@@ -144,8 +267,15 @@ def subset(cache: Any, rows: Any) -> Any:
                                    sorted_idx=torch.argsort(binary))
 
 
-def conv_rows(conv: Any, x: sp.SparseTensor, rows: Any = None) -> torch.Tensor:
-    """conv(x).feats - of the rows `rows` only when given - by flex_gemm's masked implicit GEMM with SPLITK 1."""
+def conv_rows(conv: Any, x: sp.SparseTensor, rows: Any = None, reference: bool = False,
+              fixed: Any = None) -> torch.Tensor:
+    """conv(x).feats - of the rows `rows` only when given - by flex_gemm's masked implicit GEMM with SPLITK 1, or on
+    spconv by conv_spconv.subm_rows (the level's cached pairs; `reference`: x is a whole level and the call covers
+    it all: the whole-table decode's own call, not padded; `fixed`: the products' offsets taken from the whole
+    level's own calls, with the whole level's row of each of x's rows)."""
+    if _spconv():
+        from ...modules.sparse.conv import conv_spconv
+        return conv_spconv.subm_rows(conv, x, rows, reference=reference, fixed=fixed)
     cache = neighbors(conv, x)
     if rows is not None:
         cache = subset(cache, rows)
@@ -156,7 +286,11 @@ def conv_rows(conv: Any, x: sp.SparseTensor, rows: Any = None) -> torch.Tensor:
 
 
 def whole_conv(conv: Any, x: sp.SparseTensor) -> torch.Tensor:
-    """conv(x).feats the reference's way (conv_flex_gemm: the split-K wrapper and its autotuned SPLITK)."""
+    """conv(x).feats the reference's way (conv_flex_gemm: the split-K wrapper and its autotuned SPLITK; on spconv
+    subm_rows of every row, which is what the module's forward runs on the cached pairs)."""
+    if _spconv():
+        from ...modules.sparse.conv import conv_spconv
+        return conv_spconv.subm_rows(conv, x, reference=True)
     return conv(x).feats
 
 
@@ -172,7 +306,7 @@ def even_windows(n: int, window: int) -> Optional[List[Tuple[int, int]]]:
     k = -(-n // window)
     size = -(-n // k)
     last = n - (k - 1) * size
-    if min(size, last) < MIN_CALL_ROWS:
+    if min(size, last) < min_call_rows():
         return None
     return [(a, min(n, a + size)) for a in range(0, n, size)]
 
@@ -187,8 +321,13 @@ def rowwise(fn: Callable[[torch.Tensor], torch.Tensor], src: torch.Tensor, out: 
 
     With EVEN_WINDOWS a whole level (`pad` False) is cut into near-equal windows instead (even_windows), and
     `into(rows, out_rows)`, when given, computes fn(rows) straight into out_rows (rows and out_rows may be the same
-    memory: `into` must have read its rows before it writes)."""
+    memory: `into` must have read its rows before it writes).
+
+    In the windows-everywhere mode (`windows`) every call has exactly that many rows, padded."""
     n = src.shape[0]
+    fixed = windows()
+    if fixed:
+        window, pad = fixed, True
     if EVEN_WINDOWS and not pad:
         ranges = [(0, n)] if n <= window else even_windows(n, window)
         if ranges is not None:
@@ -223,10 +362,16 @@ def norm_silu(norm: Any, feats: torch.Tensor) -> torch.Tensor:
 def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool, window: Optional[int] = None) -> sp.SparseTensor:
     """SparseConvNeXtBlock3d: conv, then LayerNorm and the MLP on windows of rows, in place in the conv's output
     (`rowwise`; a box's windows are BOX_WINDOW rows, a whole level's COARSE_SLAB_BYTES of hidden rows unless
-    `window` says how many), then the input added in place."""
+    `window` says how many; on spconv a whole level's are the level itself: the reference's own calls, see
+    `whole_level_calls`), then the input added in place."""
     h = conv(block.conv, x)
     if window is None:
-        window = BOX_WINDOW if boxed else _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
+        if boxed:
+            window = box_window()
+        elif whole_level_calls():
+            window = max(1, h.shape[0])
+        else:
+            window = _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
     rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed,
             into=lambda rows, out: mlp_into(block, rows, out))
     h.add_(x.feats)
@@ -237,7 +382,11 @@ def mlp_into(block: Any, rows: torch.Tensor, out: torch.Tensor) -> None:
     """block.mlp(block.norm(rows)) written into `out` (which may be `rows` itself): the same calls as the
     Sequential's - Linear, SiLU over its input, Linear (addmm, as F.linear calls it) - the last one with out=."""
     first, act, last = block.mlp
-    hidden = act(first(block.norm(rows)))
+    if whole_level_calls():         # a whole level at once: LayerNorm32's float32 copies a slab of rows at a time
+        from .sparse_unet_vae import norm_rows
+        hidden = act(first(norm_rows(block.norm, rows)))
+    else:
+        hidden = act(first(block.norm(rows)))
     if last.bias is not None:
         torch.addmm(last.bias, hidden, last.weight.t(), out=out)
     else:
@@ -260,11 +409,14 @@ def children(coords: torch.Tensor, sub: torch.Tensor) -> Tuple[torch.Tensor, tor
 
 
 def up_block(up: Any, x: sp.SparseTensor, sub: torch.Tensor, parents: Optional[torch.Tensor], conv2: Callable,
-             sliced: bool, forget: Callable) -> Tuple[sp.SparseTensor, torch.Tensor]:
+             sliced: bool, forget: Callable, fixed: Any = None) -> Tuple[sp.SparseTensor, torch.Tensor]:
     """SparseResBlockC2S3d on x for the parent rows `parents` (ascending local rows; None: all), x's subdivision
     `sub` [n, 8] bool: the finer level's rows - the children of those parents in the reference's order - and for
     each child its parent's position in `parents`. conv1 runs a slab of parents at a time (`sliced`; else whole,
-    the reference's call) and is gathered straight into the finer level; conv2 by `conv2`."""
+    the reference's call) and is gathered straight into the finer level; conv2 by `conv2`. On spconv's products
+    the offsets the whole level pairs fewer rows than the floor for come from the level's own calls: `fixed` (a box:
+    computed on the whole level beforehand, with the level's row of each of x's rows), or made here for a whole
+    level's slabs."""
     n, C = x.feats.shape
     C2 = up.out_channels
     hx = x.replace(norm_silu(up.norm1, x.feats))
@@ -274,15 +426,24 @@ def up_block(up: Any, x: sp.SparseTensor, sub: torch.Tensor, parents: Optional[t
     p, nf = psub.shape[0], coords.shape[0]
     if nf == 0:                     # no parent is subdivided: an empty finer level
         forget(x)
-        return sp.SparseTensor(torch.empty((0, C2), dtype=x.feats.dtype, device=x.device), coords), pidx
+        empty = torch.empty((0, C2), dtype=x.feats.dtype, device=x.device)
+        if _spconv():               # spconv's tensor takes the spatial shape from its coords: none for no rows
+            return SimpleNamespace(feats=empty, coords=coords), pidx
+        return sp.SparseTensor(empty, coords), pidx
     ends = torch.cumsum(psub.sum(dim=-1), 0)
     hf = torch.empty((nf, C2), dtype=x.feats.dtype, device=x.device)
     step = _slab_rows(8 * C2, budget=COARSE_SLAB_BYTES if parents is None else None) if sliced else max(p, 1)
     bounds = list(range(0, p, step)) + [p]
     fine_bounds = [0] + ends[torch.tensor(bounds[1:], device=ends.device) - 1].tolist() if p else [0]
+    if sliced and parents is None and len(bounds) > 2 and fixed is None and _spconv():
+        from ...modules.sparse.conv import conv_spconv
+        whole = conv_spconv.whole_offset_products(up.conv1, hx)
+        if whole:
+            fixed = (whole, torch.arange(n, device=x.device))
     for k, (a, b) in enumerate(zip(bounds[:-1], bounds[1:])):
         if sliced:
-            out = conv_rows(up.conv1, hx, slice(a, b) if parents is None else parents[a:b])
+            out = conv_rows(up.conv1, hx, slice(a, b) if parents is None else parents[a:b],
+                            reference=parents is None and a == 0 and b == p, fixed=fixed)
         else:
             out = up.conv1(hx).feats if parents is None else up.conv1(hx).feats[parents]
         fa, fb = fine_bounds[k], fine_bounds[k + 1]
@@ -307,20 +468,24 @@ def up_block(up: Any, x: sp.SparseTensor, sub: torch.Tensor, parents: Optional[t
 
 
 def tail(decoder: Any, feats: torch.Tensor, dtype: torch.dtype, boxed: bool) -> torch.Tensor:
-    """The decoder's tail: the float32 layer norm of every row and the output layer, on windows of rows."""
+    """The decoder's tail: the float32 layer norm of every row and the output layer, on windows of rows (a whole
+    level on spconv: the reference's own call, `whole_level_calls`)."""
     from .sparse_unet_vae import cast_norm_rows
 
     layer = decoder.output_layer
     out = torch.empty((feats.shape[0], layer.out_features), dtype=dtype, device=feats.device)
-    rowwise(lambda rows: torch.nn.Linear.forward(layer, cast_norm_rows(rows, dtype)), feats, out,
-            BOX_WINDOW if boxed else NORM_SLAB_ROWS * 4, pad=boxed)
+    if boxed:
+        window = box_window()
+    else:
+        window = max(1, feats.shape[0]) if whole_level_calls() else NORM_SLAB_ROWS * 4
+    rowwise(lambda rows: torch.nn.Linear.forward(layer, cast_norm_rows(rows, dtype)), feats, out, window, pad=boxed)
     return out
 
 
 def to_subdiv(up: Any, y: sp.SparseTensor) -> torch.Tensor:
-    """up.to_subdiv(y).feats, a box's table: BOX_WINDOW rows a call."""
+    """up.to_subdiv(y).feats, a box's table: box_window() rows a call."""
     out = torch.empty((y.feats.shape[0], up.to_subdiv.out_features), dtype=y.feats.dtype, device=y.device)
-    rowwise(lambda rows: torch.nn.Linear.forward(up.to_subdiv, rows), y.feats, out, BOX_WINDOW, pad=True)
+    rowwise(lambda rows: torch.nn.Linear.forward(up.to_subdiv, rows), y.feats, out, box_window(), pad=True)
     return out
 
 
@@ -405,20 +570,28 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
     stats: Dict[str, Any] = {"boxes": 0}
 
     def subdivision(i: int, h: sp.SparseTensor) -> sp.SparseTensor:
-        sub = blocks[i][-1].to_subdiv(h) if pred else _guide(h, guide_subs[i])
+        if pred and windows():
+            sub = h.replace(_linear(blocks[i][-1].to_subdiv, h.feats))
+        else:
+            sub = blocks[i][-1].to_subdiv(h) if pred else _guide(h, guide_subs[i])
         if pred:
             subs.append(sub)
         return sub
 
-    h = decoder.from_latent(x).type(decoder.dtype)
+    if windows():
+        h = x.replace(_linear(decoder.from_latent, x.feats)).type(decoder.dtype)
+    else:
+        h = decoder.from_latent(x).type(decoder.dtype)
+    level_rows: Dict[int, int] = {}
     for i in range(start + 1):
+        level_rows[i] = int(h.feats.shape[0])
         for j in range(nb[i]):
             h = convnext(blocks[i][j], h, whole_conv, False)
         sub = subdivision(i, h)
         if i == start:
             break
         up = blocks[i][-1]
-        sliced = reference_splitk(h.feats.shape[0], up.channels, 8 * up.out_channels) == 1
+        sliced = slices(up, h)
         h, _ = up_block(up, h, sub.feats > 0, None, whole_conv, sliced, forget_neighbors)
         decoder.trim()
     stats["whole_seconds"] = time.perf_counter() - began
@@ -438,18 +611,32 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         offs4 = torch.cumsum(cnt3, 0) - cnt3
         rows4 = int(cnt3.sum())
     fine_rows = rows4 if rows4 is not None else int(FINE_PER_LEVEL3 * rows3)
-    boxed = BOXES and min(rows3, fine_rows) >= BOX_WINDOW
+    boxed = BOXES and chunk_voxels(decoder) > 0 and min(rows3, fine_rows) >= box_window()
+    if chunk_voxels(decoder) > 0 and not boxed:
+        stats["not_boxed"] = (f"a small shape: {rows3:,} level-3 rows, about {fine_rows:,} fine ones (boxes from "
+                              f"{box_window():,})" if BOXES else "BOXES off")
+    if _spconv():
+        from ...modules.sparse.conv import products_floor
+        over = products_floor.beyond({**level_rows, start + 1: rows3, start + 2: fine_rows})
+        if over:
+            # the planner's covers_voxels keeps such props off the boxes; a decode that gets here all the same
+            # goes on (a whole decode would not fit where boxes were planned) and says so
+            stats["unverified"] = [list(o) for o in over]
+            print("[CHUNKED] WARNING: this decode's levels are larger than the whole calls this card's "
+                  "decode_products measurement verified (" + ", ".join(f"level {lv}: {r:,} rows, verified {v:,}"
+                                                                        for lv, r, v in over)
+                  + "): its boxes may differ from the whole-table decode in those levels' rows", flush=True)
 
     if not boxed:
         # A small shape (or BOXES off): the rest whole, the reference's calls.
-        sliced = reference_splitk(rows2, up2.channels, 8 * up2.out_channels) == 1
+        sliced = slices(up2, x2)
         h, _ = up_block(up2, x2, sub2, None, whole_conv, sliced, forget_neighbors)
         del x2
         decoder.trim()
         for j in range(nb[start + 1]):
             h = convnext(blocks[start + 1][j], h, whole_conv, False)
         sub3 = subdivision(start + 1, h)
-        sliced = reference_splitk(h.feats.shape[0], up3.channels, 8 * up3.out_channels) == 1
+        sliced = slices(up3, h)
         h, _ = up_block(up3, h, sub3.feats > 0, None, whole_conv, sliced, forget_neighbors)
         decoder.trim()
         forget_neighbors(h)
@@ -458,12 +645,28 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         LAST.update(stats, boxed=False, seconds=time.perf_counter() - began)
         return out, h.coords, subs
 
+    fixed2 = None
+    hold = False
+    if _spconv():
+        from ...modules.sparse.conv import conv_spconv, products_floor
+        # level 2's offsets that pair fewer rows than the floor: their products from the level's own calls, which
+        # every box then takes its rows of (the same bits, never a fall back to the whole table)
+        whole2 = conv_spconv.whole_offset_products(up2.conv1, x2, prep=lambda rows: norm_silu(up2.norm1, rows))
+        if whole2:
+            fixed2 = whole2
+            stats["level2_whole_offsets"] = sorted(whole2)
+            stats["level2_whole_offsets_mib"] = round(sum(p.numel() * p.element_size() for _, p in whole2.values())
+                                                      / 2 ** 20, 1)
+        # the output layer at a recorded launch boundary: the fine rows before it are kept and it makes the whole
+        # decode's own call once the fine level's size is known (the texture decoder knows it now)
+        hold = not windows() and products_floor.has_boundary() and (pred or products_floor.boundary_band(rows4))
     forget_neighbors(x2)                    # the boxes build their own
     decoder.trim()
     margin = halo(decoder, start)
-    budget = max(1, int(decoder.chunk_voxels * rows2 / max(fine_rows, 1)))
+    budget = max(1, int(chunk_voxels(decoder) * rows2 / max(fine_rows, 1)))
     boxes = cut_boxes(x2.coords[:, 1:], margin, budget)
-    stats.update(boxes=len(boxes), halo=margin, budget_level2=budget, rows=[rows2, rows3, rows4])
+    stats.update(boxes=len(boxes), halo=margin, budget_level2=budget, rows=[rows2, rows3, rows4],
+                 chunk_voxels=chunk_voxels(decoder), backend=backend())
     if pred:
         sub3_logits = torch.empty((rows3, 8), dtype=decoder.dtype, device=x2.device)
     pieces: List[Tuple[torch.Tensor, torch.Tensor, Dict[str, torch.Tensor]]] = []
@@ -485,7 +688,8 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         del d2
         xc = sp.SparseTensor(x2.feats[g2], x2.coords[g2])
         par2 = (dc <= margin - 1).nonzero().squeeze(1)
-        y, pidx2 = up_block(up2, xc, sub2[g2], par2, conv_rows, True, forget_neighbors)
+        y, pidx2 = up_block(up2, xc, sub2[g2], par2, conv_rows, True, forget_neighbors,
+                            fixed=(fixed2, g2) if fixed2 else None)
         del xc
         gp2 = g2[par2]
         cnt = cnt2[gp2]
@@ -514,7 +718,10 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
             decoder.trim()
             continue
         keep = own_par[pidx3].nonzero().squeeze(1)
-        piece = fields(tail(decoder, fine.feats[keep], x.dtype, True), fine.coords[keep])
+        if hold:
+            piece = {"pre": fine.feats[keep]}
+        else:
+            piece = fields(tail(decoder, fine.feats[keep], x.dtype, True), fine.coords[keep])
         piece["coords"] = fine.coords[keep]
         decoded += int(fine.feats.shape[0])
         gpar = g3[par3[own_par]]
@@ -538,6 +745,17 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         coords3, _, _ = children(coords2, sub2)
         subs.append(sp.SparseTensor(sub3_logits, coords3))
     coords = out.pop("coords")
+    if hold:
+        from ...modules.sparse.conv import products_floor
+        pre = out.pop("pre")
+        band = products_floor.boundary_band(rows4)
+        # in the band: the output layer's one call on the whole fine level, the whole decode's own; outside it the
+        # boxes' 64 Ki-row calls on the assembled rows (the same calls a box makes on its own rows)
+        rows_out = tail(decoder, pre, x.dtype, boxed=not band)
+        del pre
+        out = fields(rows_out, coords)
+        del rows_out
+        stats["tail"] = "the whole call (a launch-boundary band)" if band else "64 Ki calls on the assembled rows"
     stats.update(rows=[rows2, rows3, rows4], decoded_fine_rows=decoded, overhead=decoded / max(rows4, 1),
                  seconds=time.perf_counter() - began)
     LAST.clear()

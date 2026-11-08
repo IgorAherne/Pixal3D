@@ -28,7 +28,7 @@ if os.getenv("PIXAL3D_KERNELS_PTXAS_V", "") == "1":
 
 setup(
     name="pixal3d_kernels",
-    version="0.2.0" + os.environ.get("PIXAL3D_KERNELS_VERSION_SUFFIX", ""),
+    version="0.2.1" + os.environ.get("PIXAL3D_KERNELS_VERSION_SUFFIX", ""),
     description="Spellcast3D's CUDA kernels for Pixal3D below sm_80: a group-scaled W8A8 GEMM (Turing IMMA, Pascal dp4a) "
                 "and the flows' element-wise chains; on sm_80+ the group-scaled GEMM in the Triton kernel's bits",
     packages=find_packages(),
@@ -36,7 +36,8 @@ setup(
     ext_modules=[
         CUDAExtension(
             name="pixal3d_kernels._C",
-            sources=["csrc/ops.cpp", "csrc/int8_gemm_imma.cu", "csrc/int8_gemm_dp4a.cu", "csrc/elementwise.cu",
+            sources=["csrc/ops.cpp", "csrc/int8_gemm_imma.cu", "csrc/int8_gemm_dp4a.cu", "csrc/int8_gemm_dp4a_twins.cu",
+                     "csrc/elementwise.cu",
                      "csrc/int8_gemm_sm80.cu", "csrc/ops_sm80.cpp"],
             extra_compile_args={"cxx": CXX_FLAGS, "nvcc": NVCC_FLAGS},
             py_limited_api=True,

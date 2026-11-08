@@ -94,6 +94,12 @@ developer's test of another card's path). The Turing extension carries the int8 
 mma shapes, with its own v quantiser): the calibration's trial times it against the fp16 op as on sm_8x and records
 the race, but it serves only where PIXAL3D_INT8PV asks for it (on / force) while INT8PV_TURING_DEFAULT is False -
 the same marked blocks, the same self-check and race as on sm_8x.
+The Pascal extension carries twins of its op from the wheel post8 on (Spellcast3D round O: PASCAL_TWINS, each the
+shipped op's arithmetic in its order - the same bits, proven by torch.equal - with another code shape, which only a
+GTX 10xx can time): the calibration's trial races them against the shipped op per P.V mode (`_pascal_twins_trial`,
+the record's "pascal_twins"), and a process takes the recorded twin once it gave the shipped op's bits on the
+self-check's table (`_pascal_twin`); the shipped op serves without a record, with an older wheel, or with
+PIXAL3D_PASCAL_TWIN=shipped (developers: =<twin> or "fp32=<twin>,int8=<twin>" forces one).
 """
 
 from __future__ import annotations
@@ -129,6 +135,18 @@ PASCAL_OP = "sageattn_pascal"   # torch.ops.sageattention_qattn_sm61.<this> (Spe
 #                     and out (the pascal profile's torso); its int8 P.V is the round K scheme with 32-key blocks
 TUNED_OP = "qk_int8_sv_f16_accum_f16_attn_inst_buf_sc3d"    # torch.ops.sageattention_qattn_sm80.<this>: the tuned
 #                     kernel (Spellcast3D's wheel post5 on; the shipped op's arguments, the same bits)
+PASCAL_TWINS = ("u28", "u44", "s28", "s24")     # torch.ops.sageattention_qattn_sm61.sageattn_pascal_<twin>
+#                     (Spellcast3D round O, the wheel from post8): PASCAL_OP's arithmetic in its order - the same bits
+#                     for every input - with another code shape: the main loop under Pascal's ~8 KB instruction cache
+#                     (the shipped one is 8,216 bytes; u28 its score loop unrolled by 2, u44 its P.V loop by 4) and
+#                     the P.V by channel slices (s28, s24: half the shared-memory traffic a key). No card of the round
+#                     could time them: the calibration's trial races them against the shipped op on the user's card
+#                     (`_pascal_twins_trial`) and the record's "pascal_twins" names the one that serves, per P.V mode
+PASCAL_TWINS_FP32 = ("u28", "u44")  # the twins raced for the fp32 P.V (ss, lr, hr's block 0): the slice twins' fp32
+#                     form holds 48.9 KB of shared memory, one block an SM against the shipped kernel's two
+PASCAL_TWIN_MARGIN = 0.05   # a twin serves only where it is at least this much faster than the shipped op at every
+#                     size timed (they give the same bits, so the margin only guards against the timing's noise:
+#                     interleaved medians of 12-16 calls; 5 %, as the project's other races)
 OLD_CARD = {6: "pascal", 7: "turing"}   # the candidate kernel of a card below sm_80, by the capability's major
 TRIAL_SECONDS = 600                     # the calibration's child process trying that kernel: its time limit
 RACE_TOKENS = ((21504, 4), (8192, 6))   # the shipped and the tuned op timed at first use: (tokens, calls of each)
@@ -306,6 +324,8 @@ def _candidates(device: torch.device, want: str, trial: bool = False) -> dict[st
         why = None if trial else _old_card_unchecked(device, name)
         if why is not None:
             raise RuntimeError(f"the {name} kernel is not used: {why}")
+        if not trial:       # the twin the record chose (it runs on the self-check's table: only once allowed above)
+            name, call, label = _old_card_candidate(major, device)
         return {name: (call, label)}
 
     def wheel_cuda(q, k, v):
@@ -334,13 +354,14 @@ def _candidates(device: torch.device, want: str, trial: bool = False) -> dict[st
     return found
 
 
-def _old_card_candidate(major: int) -> tuple[str, Optional[Callable], str]:
+def _old_card_candidate(major: int, device: Optional[torch.device] = None) -> tuple[str, Optional[Callable], str]:
     """(name, the call - None where the wheel lacks the extension -, label) of the kernel a card below sm_80 may run:
-    the Pascal op on sm_6x, the Turing op on sm_7x (OLD_CARD)."""
+    the Pascal op on sm_6x, the Turing op on sm_7x (OLD_CARD). With `device` (the engine's use; not the calibration's
+    trial, which tries the shipped op) the Pascal op's twin the record chose for the fp32 P.V (`_pascal_twin`)."""
     if major == 6:
-        op = _pascal_op()
+        op, twin = _pascal_twin(device, False) if device is not None else (_pascal_op(), "shipped")
         call = _pascal_call(op, False) if op is not None else None
-        return "pascal", call, f"{PASCAL_OP} (int8 Q.K^T by dp4a, fp32 P.V)"
+        return "pascal", call, f"{_pascal_name(twin)} (int8 Q.K^T by dp4a, fp32 P.V)"
     op = _turing_op()
     return "turing", (_wheel_call(op) if op is not None else None), f"{TURING_OP} for sm_75 (per_warp, fp16+fp32)"
 
@@ -436,6 +457,10 @@ def _old_card_trial_run(device: torch.device, major: int, call: Callable, label:
                                          for n, a, b in rows8],
                          int8pv_summary=", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
                                                   for n, a, b in rows8) or "not timed")
+    if major == 6:
+        if progress is not None:        # a twin that takes the process down leaves the races above standing
+            progress(dict(found))
+        found["pascal_twins"] = _pascal_twins_trial(device, q, k, vs)
     return found
 
 
@@ -482,7 +507,9 @@ def _old_card_trial_in_child(major: int, minor: int) -> dict:
     that faults takes its process's CUDA context with it, so the parent (the calibration) stays up and records the
     failure, and the engine never tries that kernel on this card. The child's last line of JSON is the result; it
     also prints the candidate's fields before its int8 P.V twin runs, so a twin that takes the process down leaves
-    the candidate's own trial standing (the twin recorded as left out)."""
+    the candidate's own trial standing (the twin recorded as left out). A process that printed its whole answer and
+    then ended with an error (or ran out of time after it: its output is salvaged the same way) keeps that answer,
+    with "exit_code" and "exit_note", the Pascal op's twins left out."""
     import json
     import subprocess
     import sys
@@ -491,32 +518,58 @@ def _old_card_trial_in_child(major: int, minor: int) -> dict:
     code = ("import json, torch\nfrom pixal3d.modules import sage\n"
             "say = lambda found: print(json.dumps(found), flush=True)\n"
             "say(sage._old_card_trial(torch.device('cuda'), progress=say))")
+    def text(out: object) -> str:
+        return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out or "")
+
     try:
         run = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]),
                              env=os.environ.copy(), capture_output=True, text=True, encoding="utf-8",
                              errors="replace", timeout=TRIAL_SECONDS)
-    except subprocess.TimeoutExpired:
-        return {"candidate": name, "candidate_ok": False, "summary": "not run",
-                "why": f"the trial did not finish in {TRIAL_SECONDS} s"}
-    lines = [line for line in run.stdout.splitlines() if line.startswith("{")]
+        stdout, stderr, returncode = run.stdout or "", run.stderr or "", run.returncode
+        ended = f"the trial process ended with code {returncode}"
+    except subprocess.TimeoutExpired as exc:   # what it printed before its time ran out is salvaged like a crash's
+        stdout, stderr, returncode = text(exc.stdout), text(exc.stderr), None
+        ended = f"the trial did not finish in {TRIAL_SECONDS} s"
+    lines = [line for line in stdout.splitlines() if line.startswith("{")]
     found = None
     if lines:
         try:
             found = json.loads(lines[-1])
         except ValueError:
             found = None
-    if found is not None and run.returncode == 0:
+    if found is not None and returncode == 0:
         found.setdefault("summary", found.get("why", ""))
         return found
-    tail = " | ".join((run.stderr or run.stdout).strip().splitlines()[-3:])
+    tail = " | ".join((stderr or stdout).strip().splitlines()[-3:])
+    if found is not None and found.get("candidate_ok") and ("pascal_twins" in found if major == 6
+                                                            else "int8pv" in found if major == 7 else True):
+        # the trial finished (its last line is the whole answer) and the process went wrong after it - in its
+        # teardown, say, with a twin's sticky CUDA error: the candidate's and the int8 P.V race's results stand,
+        # the Pascal op's twins are left out (they are only speed; a process that ended so promotes none)
+        found.setdefault("summary", found.get("why", ""))
+        found["exit_code"] = returncode
+        found["exit_note"] = f"{ended} after the trial's last line: {tail[:300]}"
+        twins = found.get("pascal_twins")
+        if isinstance(twins, dict):
+            chose = {mode: twins.get(mode) for mode in ("fp32", "int8") if twins.get(mode) not in (None, "shipped")}
+            twins.update(fp32="shipped", int8="shipped")
+            twins["error"] = "; ".join(filter(None, (twins.get("error"), f"{ended} after the twins ran"
+                                                     + (f" (the race chose {chose}: left out)" if chose else "")
+                                                     + f": {tail[:300]}")))
+        return found
     if found is not None and found.get("candidate_ok") and "int8pv" not in found:
         found.setdefault("summary", found.get("why", ""))
         found.update(int8pv=False, int8pv_summary="not timed",
-                     int8pv_why=f"the int8 P.V kernel is left out: the trial process ended with code "
-                                f"{run.returncode} while it ran: {tail[:300]}")
+                     int8pv_why=f"the int8 P.V kernel is left out: {ended} while it ran: {tail[:300]}")
         return found
-    return {"candidate": name, "candidate_ok": False, "summary": "the trial failed",
-            "why": f"the trial process ended with code {run.returncode}: {tail[:300]}"}
+    if found is not None and found.get("candidate_ok") and major == 6 and "pascal_twins" not in found:
+        found.setdefault("summary", found.get("why", ""))     # the Pascal op's twins took the trial down
+        found["pascal_twins"] = {"present": [], "fp32": "shipped", "int8": "shipped",
+                                 "error": f"{ended} while the twins ran: {tail[:300]}"}
+        return found
+    if returncode is None:
+        return {"candidate": name, "candidate_ok": False, "summary": "not run", "why": ended}
+    return {"candidate": name, "candidate_ok": False, "summary": "the trial failed", "why": f"{ended}: {tail[:300]}"}
 
 
 def _tuned_op() -> Optional[Callable]:
@@ -602,6 +655,178 @@ def _pascal_call(op: Callable, int8pv: bool) -> Callable:
         return o
 
     return run
+
+
+def _pascal_name(twin: str) -> str:
+    return PASCAL_OP if twin == "shipped" else f"{PASCAL_OP}_{twin} (the shipped kernel's twin {twin}, its bits)"
+
+
+def _pascal_twin_op(twin: str) -> Optional[Callable]:
+    """The wheel's twin `twin` of the Pascal op (sageattn_pascal_<twin>, PASCAL_TWINS), or None (an older wheel)."""
+    if _pascal_op() is None:        # (imports the extension)
+        return None
+    try:
+        return getattr(torch.ops.sageattention_qattn_sm61, f"{PASCAL_OP}_{twin}")
+    except (AttributeError, RuntimeError):
+        return None
+
+
+_pascal_twins: dict = {}            # (device, int8pv) -> (op, twin name): this process's choice
+
+
+def _pascal_twin_wanted(device: torch.device, mode: str) -> tuple[str, str]:
+    """(the twin for the P.V mode "fp32" / "int8", why): PIXAL3D_PASCAL_TWIN (developers: a twin's name for both
+    modes, or "fp32=<twin>,int8=<twin>", or shipped / off), else the calibration record's race ("pascal_twins", made
+    on this card with the installed wheel: `_stored`), else "shipped"."""
+    text = os.environ.get("PIXAL3D_PASCAL_TWIN", "").strip().lower()
+    if text:
+        named: dict = {}
+        for part in (p.strip() for p in text.split(",") if p.strip()):
+            if "=" in part:
+                key, value = (s.strip() for s in part.split("=", 1))
+                named[key] = value
+            else:
+                named.setdefault("fp32", part)
+                named.setdefault("int8", part)
+        name = named.get(mode, "shipped")
+        return ("shipped" if name in ("off", "shipped", "") else name), f"PIXAL3D_PASCAL_TWIN={text}"
+    stored = _stored(device)
+    race = stored.get("pascal_twins") if stored is not None else None
+    if isinstance(race, dict) and race.get(mode) in PASCAL_TWINS:
+        return race[mode], (f"timed on this card when Spellcast3D was installed: "
+                            f"{race.get(mode + '_summary', 'calibration record')}")
+    return "shipped", "no race recorded"
+
+
+def _pascal_twin(device: torch.device, int8pv: bool) -> tuple[Optional[Callable], str]:
+    """The Pascal op for the P.V mode (`int8pv`) in this process: the twin `_pascal_twin_wanted` names, once it gave
+    the shipped op's bits on the self-check's table (torch.equal; on a card or wheel where it does not, one line
+    says so and the shipped op serves), else the shipped op. (op, the twin's name or "shipped"); cached."""
+    key = (str(device), bool(int8pv))
+    if key in _pascal_twins:
+        return _pascal_twins[key]
+    shipped = _pascal_op()
+    mode = "int8" if int8pv else "fp32"
+    name, why = _pascal_twin_wanted(device, mode)
+    chosen = (shipped, "shipped")
+    if name != "shipped" and shipped is not None:
+        twin = _pascal_twin_op(name)
+        if twin is None:
+            print(f"[SAGE] the Pascal kernel's twin {name} is not in the installed wheel: the shipped kernel serves "
+                  f"the {mode} P.V calls", flush=True)
+        else:
+            try:
+                q, k, vs, _want = _check_table(device)
+                same = torch.equal(_pascal_call(shipped, int8pv)(q, k, vs), _pascal_call(twin, int8pv)(q, k, vs))
+                del q, k, vs, _want
+            except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the shipped op
+                same, why = False, f"{type(exc).__name__}: {str(exc)[:200]}"
+            if same:
+                chosen = (twin, name)
+                print(f"[SAGE] the Pascal kernel's twin {name} serves the {mode} P.V calls ({why})", flush=True)
+            else:
+                print(f"[SAGE] the Pascal kernel's twin {name} did not give the shipped kernel's bits on this card "
+                      f"({why}): the shipped kernel serves the {mode} P.V calls", flush=True)
+    _pascal_twins[key] = chosen
+    return chosen
+
+
+def _pascal_twins_trial(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor) -> dict:
+    """The calibration trial's race of the Pascal op's twins (PASCAL_TWINS in the wheel) against the shipped op, per
+    P.V mode (fp32: PASCAL_TWINS_FP32; int8 unless PIXAL3D_INT8PV is off): each twin's answer on the self-check's
+    table (q, k, vs) and on the race's tables must be the shipped op's bits (torch.equal), then whole calls at
+    CALIBRATION_RACE's sizes, interleaved in a rotating order, CUDA events, medians (`_race_pascal_twins`); the twin
+    with the best worst-size ratio serves where it is PASCAL_TWIN_MARGIN faster at every size. Returns the record's
+    "pascal_twins": {"present", "fp32", "int8" (a twin or "shipped"), "<mode>_timings", "<mode>_summary",
+    "<mode>_why"}. Never raises: a failure records the shipped op ("error")."""
+    found: dict = {"present": [], "fp32": "shipped", "int8": "shipped"}
+    try:
+        shipped = _pascal_op()
+        found["present"] = [t for t in PASCAL_TWINS if _pascal_twin_op(t) is not None]
+        for mode, int8pv in (("fp32", False), ("int8", True)):
+            names = [t for t in found["present"] if int8pv or t in PASCAL_TWINS_FP32]
+            if not names:
+                found[f"{mode}_why"] = "no twin in the installed wheel"
+                continue
+            if int8pv and int8pv_switch() == "off":
+                found[f"{mode}_why"] = "PIXAL3D_INT8PV is off"
+                continue
+            calls = {"shipped": _pascal_call(shipped, int8pv)}
+            want = calls["shipped"](q, k, vs)
+            differ = []
+            for t in names:
+                call = _pascal_call(_pascal_twin_op(t), int8pv)
+                if torch.equal(call(q, k, vs), want):
+                    calls[t] = call
+                else:
+                    differ.append(t)
+            del want
+            winner, line, rows = _race_pascal_twins(device, calls, CALIBRATION_RACE)
+            found[mode] = winner
+            found[f"{mode}_why"] = line + (f"; left out (other bits on the self-check's table): "
+                                           f"{', '.join(differ)}" if differ else "")
+            found[f"{mode}_timings"] = rows
+            found[f"{mode}_summary"] = "; ".join(
+                f"{r['tokens']:,} tokens: shipped {r['ms']['shipped']:.2f} ms, " + ", ".join(
+                    f"{t} {ms:.2f} ({100 * (ms / r['ms']['shipped'] - 1):+.1f} %)" for t, ms in r["ms"].items()
+                    if t != "shipped") for r in rows) or "not timed"
+    except Exception as exc:        # noqa: BLE001 - the twins never cost the shipped op its place
+        found["error"] = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}"
+        found["fp32"] = found["int8"] = "shipped"
+    return found
+
+
+def _race_pascal_twins(device: torch.device, calls: dict, plan: tuple) -> tuple[str, str, list]:
+    """The shipped call and its twins (`calls`: name -> call, "shipped" first) timed on this card at each of `plan`'s
+    sizes on the same random q, k, v (12 heads x 128, the torso's dtype), the calls in a rotating order, CUDA events,
+    the medians; a twin whose answer at a size differs from the shipped op's is left out. Returns (the winner or
+    "shipped", the [SAGE] line, rows [{"tokens", "ms": {name: median ms}, "differ": [names]}])."""
+    names = list(calls)
+    heads, began = 12, time.perf_counter()
+    rows, skipped, out = [], [], set()
+    torch.cuda.synchronize(device)
+    for n, reps in plan:
+        need = n * heads * HEAD_DIM * 4 * 7                # q, k, v, two answers, the quantised copies
+        free = torch.cuda.mem_get_info(device)[0]
+        spare = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+        if need * 1.25 > free + spare:
+            skipped.append(n)
+            continue
+        g = torch.Generator(device=device).manual_seed(n)
+        dt = precision.torso()
+        q, k, v = (torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g) for _ in range(3))
+        want = calls["shipped"](q, k, v)
+        differ = [t for t in names[1:] if t not in out and not torch.equal(calls[t](q, k, v), want)]
+        out.update(differ)
+        del want
+        live = [t for t in names if t not in out]
+        events: dict = {t: [] for t in live}
+        for i in range(reps):
+            for t in live[i % len(live):] + live[:i % len(live)]:
+                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                start.record()
+                calls[t](q, k, v)
+                end.record()
+                events[t].append((start, end))
+        torch.cuda.synchronize(device)
+        rows.append({"tokens": n, "ms": {t: round(statistics.median(a.elapsed_time(b) for a, b in pairs), 3)
+                                         for t, pairs in events.items()}, "differ": differ})
+        del q, k, v, events
+    seconds = time.perf_counter() - began
+    if not rows:
+        return "shipped", (f"[SAGE] the shipped Pascal kernel serves: its twins were not timed (no room for the "
+                           f"tables of {', '.join(f'{n:,}' for n in skipped)} tokens)"), rows
+    ratio = {t: max(r["ms"][t] / r["ms"]["shipped"] for r in rows) for t in names[1:]
+             if t not in out and all(t in r["ms"] for r in rows)}
+    best = min(ratio, key=ratio.get) if ratio else None
+    text = ", ".join(f"{t} {100 * (x - 1):+.1f} %" for t, x in sorted(ratio.items(), key=lambda kv: kv[1]))
+    if skipped:
+        text += f"; {', '.join(f'{n:,}' for n in skipped)} tokens not timed (no room)"
+    if best is not None and ratio[best] <= 1 - PASCAL_TWIN_MARGIN:
+        return best, (f"[SAGE] the Pascal kernel's twin {best} serves, timed against the shipped one (the worst "
+                      f"size: {text}; {seconds:.2f} s)"), rows
+    return "shipped", (f"[SAGE] the shipped Pascal kernel serves: no twin is {100 * PASCAL_TWIN_MARGIN:.0f} % faster "
+                       f"at every size timed ({text or 'none timed'}; {seconds:.2f} s)"), rows
 
 
 def _wheel_call(op: Callable) -> Callable:
@@ -898,10 +1123,14 @@ def _race_int8pv(device: torch.device, fp16: Callable, int8pv: Callable,
                    f"faster at every size timed: {text} ({seconds:.2f} s)"), rows
 
 
+_twin_device: Optional[torch.device] = None     # the card of this process's self-check (`_setup_int8pv` sets it):
+#                                                 the one whose record names the Pascal op's twin for the int8 P.V
+
+
 def _int8pv_candidate(major: int) -> tuple[Optional[Callable], str]:
     """The int8 P.V call of a card whose capability's major is `major`, and its label: on sm_8x INT8PV_OP of
-    _qattn_sm80, on sm_7x its twin in _qattn_sm75, on sm_6x the Pascal op's int8 P.V; (None, "") where the wheel
-    has none."""
+    _qattn_sm80, on sm_7x its twin in _qattn_sm75, on sm_6x the Pascal op's int8 P.V (once `_setup_int8pv` named the
+    card: the op's twin its record chose for the int8 P.V, `_pascal_twin`); (None, "") where the wheel has none."""
     if major == 8:
         op = _int8pv_op()
         return ((_int8pv_call(op) if op is not None else None),
@@ -911,9 +1140,9 @@ def _int8pv_candidate(major: int) -> tuple[Optional[Callable], str]:
         return ((_turing_int8pv_call(op) if op is not None else None),
                 f"{INT8PV_OP} for sm_75 (int8 P.V: u8 P per 64-key block, v per block and channel)")
     if major == 6:
-        op = _pascal_op()
+        op, twin = _pascal_twin(_twin_device, True) if _twin_device is not None else (_pascal_op(), "shipped")
         return ((_pascal_call(op, True) if op is not None else None),
-                f"{PASCAL_OP} (int8 P.V by dp4a: u8 P per 32-key block, v per block and channel)")
+                f"{_pascal_name(twin)} (int8 P.V by dp4a: u8 P per 32-key block, v per block and channel)")
     return None, ""
 
 
@@ -925,7 +1154,7 @@ def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: to
     of _check; it measures ~1.5 % there, the fp16 kernel ~1.2 %), then serves where the calibration record says
     so, or where it wins the race against the fp16 call (PIXAL3D_INT8PV=force: without the race). Off, or any
     failure, keeps the fp16 kernel for every block (the numbers as before)."""
-    global _kernel_int8pv, KERNEL_INT8PV
+    global _kernel_int8pv, KERNEL_INT8PV, _twin_device
     _kernel_int8pv, KERNEL_INT8PV = None, ""
     if _kernel is None:
         return
@@ -934,6 +1163,7 @@ def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: to
         switch = int8pv_switch(major)
         if switch == "off":
             return
+        _twin_device = device
         call, what = _int8pv_candidate(major)
         if call is None:
             return

@@ -65,6 +65,15 @@ if has("int8_gemm_group80"):
         return y, qs
 
 
+# Spellcast3D round O: the dp4a kernel's twins (csrc/int8_gemm_dp4a_twins.cu) - int8_gemm_group's arguments but
+# `kernel`, its bits; modules/int8mm.py races them against it at install (DP4A_TWINS) on the cards that run dp4a
+for _twin in ("int8_gemm_group_q4", "int8_gemm_group_f5"):
+    if has(_twin):
+        torch.library.register_fake(f"pixal3d_kernels::{_twin}")(
+            lambda xq, xs, wq, ws, bias, gelu, out_dtype, raster=0:
+            xq.new_empty((xq.shape[0], wq.shape[0]), dtype=out_dtype))
+
+
 def quantize_rows(x: torch.Tensor, group: int = 0,
                   inv_smooth: Optional[torch.Tensor] = None) -> tuple[torch.Tensor, torch.Tensor]:
     """x [..., K] (fp16 / fp32 / bf16) -> (int8 [M, K], fp32 scales [M] or [M, K // group])."""

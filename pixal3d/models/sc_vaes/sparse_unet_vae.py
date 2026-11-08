@@ -71,7 +71,8 @@ def add_into(h: sp.SparseTensor, other: sp.SparseTensor) -> sp.SparseTensor:
 def forget_neighbors(x: sp.SparseTensor) -> None:
     """
     Drop the convolutions' neighbour tables of x's level (the flex_gemm backend keeps them in the level's
-    spatial cache, shared by every tensor of the level). For after the level's last convolution, when
+    spatial cache, shared by every tensor of the level; so does the spconv backend its pair tables, under keys
+    with the same prefix: conv_spconv.CACHE_KEY). For after the level's last convolution, when
     gradients are off; a convolution that came later would build them again.
 
     The level's cache holds other things under keys of other types (the attention's sequence lengths are

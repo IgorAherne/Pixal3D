@@ -25,6 +25,11 @@ its eager chain on this card at two of the flows' sizes, on only where it is RAC
 record (or one of another card, profile or kernels build): every kind serves, as before the race. Either way the
 numbers are the same; only the time differs. PIXAL3D_OLD_CARD_KERNELS = off: none; force: every kind, whatever the
 race chose (the first-use check still decides).
+
+The same step races the dp4a GEMM's twins on the cards that run it (Spellcast3D round O: int8mm.calibrate_dp4a_twins,
+the section's "dp4a"; int8mm reads it through `dp4a_race`): the same bits, other code shapes, the faster one per
+scale form recorded - in a child process (calibrate_dp4a_twins_in_child), so that a twin that faults costs only
+its own race.
 """
 
 from __future__ import annotations
@@ -114,6 +119,23 @@ def race_holds(section: Optional[dict]) -> bool:
     profile, with the installed pixal3d_kernels build (another build's timings say nothing of this one's)."""
     return (isinstance(section, dict) and section.get("ok") is True and isinstance(section.get("on"), dict)
             and section.get("profile") == precision.profile().name and section.get("kernels") == _kernels_build())
+
+
+def dp4a_race(device: Any = None) -> Optional[dict]:
+    """The install's race of the dp4a GEMM's twins (the record's old_cards.dp4a, int8mm.calibrate_dp4a_twins) where
+    it ran on this card, for this profile, with the installed pixal3d_kernels build; None otherwise (int8mm then runs
+    the shipped kernel)."""
+    try:
+        from .. import calibration
+
+        found = calibration.section(SECTION, device)
+    except Exception:       # noqa: BLE001 - no record
+        return None
+    if (not isinstance(found, dict) or found.get("profile") != precision.profile().name
+            or found.get("kernels") != _kernels_build()):
+        return None
+    race = found.get("dp4a")
+    return race if isinstance(race, dict) and race.get("ok") is True and not race.get("skipped") else None
 
 
 def _kernels_build() -> str:
@@ -343,16 +365,22 @@ def _median_ms(calls: dict, device: torch.device, reps: int, iters: int) -> dict
 def calibrate(device: torch.device, reps: int = 6, iters: int = 5) -> dict:
     """The install's race (calibrate.py's step "old_cards"): every kind's kernel against its eager chain at
     RACE_SHAPES, after the first-use check; a kind serves where its kernel is RACE_MARGIN faster in every form at
-    every size. Returns the record's section {"ok", "profile", "kernels", "on", "timings", "summary"}."""
+    every size. Before it, on a dp4a card, the dp4a GEMM's twins against its shipped kernel in a child process
+    (int8mm.calibrate_dp4a_twins_in_child: "dp4a"; a twin that faults costs only its own race, never this process's
+    CUDA context). Returns the record's section {"ok", "profile", "kernels", "on", "timings", "summary", "dp4a"}."""
     name = precision.profile().name
     if name == "ampere":
         return {"ok": True, "skipped": "the flows' element-wise chains run Triton's fused kernels on this card "
                                        "(ampere profile)"}
+    from . import int8mm
+
+    dp4a = int8mm.calibrate_dp4a_twins_in_child(device)
+    torch.cuda.empty_cache()
     found: dict = {"ok": True, "profile": name, "kernels": _kernels_build(), "torch": torch.__version__,
-                   "on": dict.fromkeys(KINDS, True), "timings": []}
+                   "on": dict.fromkeys(KINDS, True), "timings": [], "dp4a": dp4a}
     ok, why = _check(device)
     if not ok:
-        return {"ok": False, "profile": name, "kernels": found["kernels"],
+        return {"ok": False, "profile": name, "kernels": found["kernels"], "dp4a": dp4a,
                 "error": f"the kernels do not give the eager chains' bits here ({why})"}
     g = torch.Generator(device=device).manual_seed(0)
     with torch.no_grad():
@@ -371,4 +399,6 @@ def calibrate(device: torch.device, reps: int = 6, iters: int = 5) -> dict:
         f"{kind} {'on' if found['on'][kind] else 'off'} (" + ", ".join(
             f"{t['rows']:,}x{t['channels']}{' ' + t['form'] if t['form'] else ''} {t['kernel_ms']:.3f} vs "
             f"{t['eager_ms']:.3f} ms" for t in found["timings"] if t["kind"] == kind) + ")" for kind in KINDS)
+    if dp4a.get("summary"):
+        found["summary"] += f"; the dp4a GEMM: {dp4a['summary']}"
     return found

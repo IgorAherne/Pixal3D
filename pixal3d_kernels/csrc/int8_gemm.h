@@ -49,4 +49,9 @@ cudaError_t int8_gemm_dp4a(const Int8GemmParams & p, bool a_group, bool b_group,
 bool int8_gemm_imma_loaded();
 bool int8_gemm_dp4a_loaded();
 
+// Spellcast3D round O: the dp4a kernel's twins (int8_gemm_dp4a_twins.cu: twin 1 = q4, 2 = f5), the shipped kernel's
+// bits with another code shape, raced against it at install (pixal3d/modules/int8mm.py); sm_61+.
+cudaError_t int8_gemm_dp4a_twin(const Int8GemmParams & p, bool a_group, bool b_group, int twin, cudaStream_t stream);
+bool int8_gemm_dp4a_twins_loaded();
+
 }  // namespace pixal3d_kernels

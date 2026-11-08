@@ -34,7 +34,19 @@ process times or tunes anything while the artist works:
   7. Below sm_80 (RTX 20xx, GTX 10xx): pixal3d_kernels' element-wise kernels (modules/old_cards.py `calibrate`, the
      step "old_cards") each timed against the eager chain it stands for at two of the flows' sizes; a kind serves
      only where its kernel is 5 % faster at both (an fp32 chain on Pascal may be as fast as one kernel). They give
-     the same bits either way. A record without the section runs this step alone (--only old_cards).
+     the same bits either way. A record without the section runs this step alone (--only old_cards), and so does
+     one made with another pixal3d_kernels build. On the cards whose int8 GEMMs are dp4a (GTX 10xx) the step also
+     races the dp4a kernel's twins in a child process (the same bits, other code shapes: modules/int8mm.py
+     calibrate_dp4a_twins_in_child: a twin that faults costs only its own race), and
+     step 3 races the Pascal attention kernel's twins likewise (modules/sage.py PASCAL_TWINS).
+  8. Below sm_80, where the decoders run on spconv (RTX 20xx, GTX 10xx): the smallest cuBLAS call from which a
+     decoder row gets the same bits whatever the call's row count (modules/sparse/conv/products_floor.py `measure`,
+     the step "decode_products", ~3 GiB of the card, under a minute on an RTX 3060), which the decode in boxes pads
+     its calls to (models/sc_vaes/chunked.py); it skips itself where the decoders run on flex_gemm. It must run in a
+     process on the card's own profile (the pascal profile turns cuBLASLt's fused linear off before torch's first
+     addmm: precision.profile() is called before any step). A record without the section runs this step alone
+     (--only decode_products); without a section that passed, spconv decodes no boxes (products_floor.exact) and a
+     card under 10 GiB keeps a 1536 prop at 1024.
 
 Nothing here changes a result: every choice is between kernels that give the same numbers (the convolutions' split-K
 choice aside, which flex_gemm has always timed per install). A step that fails is recorded and the others go on; the
@@ -78,7 +90,8 @@ MAX_ATTEMPTS = 3         # (kept for the record's "attempts" count; the installe
 # Where the run's bar stands when each step begins (the installer shows it on its page: components._calibrate reads
 # the "NN%" of a progress line).
 SHARE = {"start": 0.0, "triton": 0.04, "sage": 0.14, "old_cards": 0.16, "convolutions": 0.18, "spconv_decoders": 0.18,
-         "spconv": 0.95, "done": 1.0}       # (convolutions: flex_gemm's cards; old_cards, spconv_decoders: the others)
+         "decode_products": 0.6, "spconv": 0.95, "done": 1.0}
+#         (convolutions: flex_gemm's cards; old_cards, spconv_decoders, decode_products: the others)
 
 
 def say(text: str) -> None:
@@ -552,7 +565,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     ap.add_argument("--quiet-wait", type=float, default=900.0, help="seconds to wait for a quiet card at most")
     ap.add_argument("--skip", default="",
                     help="comma-separated steps to leave out: triton, sage, old_cards, convolutions, spconv_decoders, "
-                         "spconv")
+                         "decode_products, spconv")
     ap.add_argument("--only", default="",
                     help="comma-separated steps to run alone, the earlier record's other sections standing (spconv "
                          "once Hi3D's models arrived, say)")
@@ -560,7 +573,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     if args.record:
         os.environ["PIXAL3D_CALIBRATION_FILE"] = args.record
     steps = {"triton": "triton", "sage": "sage", "old_cards": "old_cards", "convolutions": "flex_gemm",
-             "spconv_decoders": "spconv_decoders", "spconv": "spconv"}  # step -> section
+             "spconv_decoders": "spconv_decoders", "decode_products": "decode_products",
+             "spconv": "spconv"}  # step -> section
     skip = {part.strip() for part in args.skip.split(",") if part.strip()}
     only = {part.strip() for part in args.only.split(",") if part.strip()}
     if only:
@@ -687,6 +701,22 @@ def main(argv: Optional[list[str]] = None) -> int:
                 others=calibration.section("spconv", device)), record)
             if found:
                 say(f"spconv (decoders): {found.get('summary') or found.get('skipped')}")
+    if "decode_products" not in skip:
+        from pixal3d.modules.sparse.conv import products_floor
+
+        held = earlier.get(products_floor.SECTION) or {}
+        if lacking is not None and held.get("ok") and held.get("profile") == card.name:
+            record[products_floor.SECTION] = held       # the earlier record's floors stand
+        else:                                           # (flex_gemm's decoders: "skipped", nothing timed)
+            if card.conv == "spconv":
+                progress(SHARE["decode_products"], "checking the 3D decoders' GEMM calls for the decode in boxes "
+                                                   "(step 3 of 4)")
+                quiet.wait(quick=True)
+            found = _timed(products_floor.SECTION, lambda: products_floor.measure(
+                device, say=say, pause=lambda: quiet.wait(quick=True)), record)
+            products_floor.forget()                     # readers in this process re-read the record
+            if found:
+                say(f"decoders' GEMM calls: {found.get('summary') or found.get('skipped')}")
     if "spconv" not in skip:
         if lacking is not None and (earlier.get("spconv") or {}).get("ok") and earlier["spconv"].get("entries"):
             record["spconv"] = earlier["spconv"]        # the earlier record's choices stand

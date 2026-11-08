@@ -235,6 +235,12 @@ quantiser, wired the same way (the self-check, the marked blocks, the race - the
 "sage" section, `_turing_int8pv_trial`), but on sm_7x an unset switch keeps the fp16 kernel
 (`sage.INT8PV_TURING_DEFAULT = False`): it serves only under `PIXAL3D_INT8PV=on` (where the race found it 5 %
 faster) or `force`, until the user decides on its end-to-end judgement on an RTX 2070.
+The wheel's Pascal extension (post8, `_qattn_sm61`) and pixal3d_kernels 0.2.1 carry twins of the Pascal attention
+kernel (`sage.PASCAL_TWINS`) and of the dp4a GEMM (`int8mm.DP4A_TWINS`, raced in the calibration's `old_cards` step):
+the shipped kernels' bits with other code shapes (main loops under Pascal's ~8 KB instruction cache), timed once at
+install on the card itself and kept only where 5 % faster at every size, after a bit check at first use in each
+process; without a record the shipped kernels serve (`PIXAL3D_PASCAL_TWIN`, `PIXAL3D_DP4A_TWIN` for developers). No
+GTX 10xx has timed them yet.
 
 Two savings around the attention change no bit. A guided sampling runs the flow once on the prop's conditioning
 and once on an all-zero conditioning per step inside the guidance interval (hr and lr: 9 of 21 passes, ss: 10 of
@@ -401,6 +407,13 @@ figures at the top of `parts.py`, measured on an RTX 3060):
   native tables: `parts.fill_mib`), the widest moment of `finish` (`parts.finish_mib`) - about 67 bytes a face
   since round G (cumesh 0.0.1.post2 frees its edge sort's buffers and sizes its tables exactly, `Mesh.fill_holes`
   takes no clones of the mesh; 160 before), so that the decode in boxes is the widest moment again.
+  Below sm_80 the decoders run on spconv, and since round O they decode in boxes too (`chunked.backend()`
+  "spconv"): spconv's implicit GEMM (Turing) or its products on torch.mm (Pascal) on per-level pair tables
+  (`conv_spconv.py`), a box's, a slab's and a row subset's GEMM calls padded to at least the install's floor (the
+  calibration's `decode_products`, `modules/sparse/conv/products_floor.py`; no boxes on spconv without a section that
+  passed), a whole level's calls the whole-table decode's own - the same meshes bit for bit on the RTX 3060 under
+  both forced profiles, unproven on real old cards. `parts.decode_figures()` gives each backend's measured figures.
+  `PIXAL3D_SPCONV_BOXES=off` turns spconv's boxes off.
 - **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
   down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
   AND whose finish (`finish_mib`: the decode, in boxes for a big shape, or the closing of the holes) fits the cap
@@ -646,12 +659,15 @@ spconv's answers on an RTX 2060 Super and decode in boxes (`chunked.py`), but th
 calibration took 25-95 minutes a shape there (13 shapes), so they are tried only on request:
 `PIXAL3D_TURING_FLEX_GEMM=on` at the calibration runs `modules/sparse/conv/backend_check.py` and records the
 `conv_backend` section the profile reads (Triton's Windows builds are untested on Turing besides).
-Where the levels are decoded whole (spconv) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
+Where the decoders cannot decode in boxes (`chunked.boxes_supported()` false: spconv's boxes off, no
+`decode_products` section that passed, or one that found them inexact) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
 `WHOLE_LEVEL_1536_MIB`: the knight's texture decode ran an RTX 2060 Super out of memory at 1536). The int8 GEMMs
 are pixal3d_kernels' (`int8mm.cuda_linear`: the fork's W8A8 kernel with the scaling, bias and GELU in its epilogue,
 per-row and group scales alike, so the whole int8 policy applies; self-checked at first use against the fp64
 reference); without that package torch._int_mm serves the per-row layers and the group-scaled ones keep the
-torso's dtype. The attention kernels of those cards (SageAttention's `_qattn_sm75` / `_qattn_sm61`, `sage.py`
+torso's dtype. An MLP whose hidden layer [tokens, 8192] would pass 256 MiB in the torso's dtype (fp32 on Pascal)
+runs in row slabs there (`int8mm.cuda_mlp`, `MLP_SLAB_MIB`: the kernels have fixed tiles and no split-K, so the
+same bits). The attention kernels of those cards (SageAttention's `_qattn_sm75` / `_qattn_sm61`, `sage.py`
 OLD_CARD) serve only after the install's calibration ran them at the flows' sizes on the card in a child process
 and recorded so (the record's `sage.candidate_ok`; a faulting kernel takes its process down, which must never be
 the engine's); until then torch's SDPA serves. NAF's attention follows the profile too (`naf_sliced._kernel`).
@@ -691,7 +707,8 @@ process to the next, which moved the decoded voxel count. The candidates are the
 accumulation alike (`FP32_ACCUM = False`: the decoders' numbers of before); spconv's Python rule (fp32 accumulation
 above 128 input channels, `FP32_ACCUM = None`) is steadier but a precision change, measured and not taken. Pascal
 needs no record (its products run on torch.mm). A record without the section on Turing, or without the old cards'
-race below sm_80, runs that step alone (`--only spconv_decoders`, `--only old_cards`; Spellcast3D's installer asks).
+race below sm_80, runs that step alone (`--only spconv_decoders`, `--only old_cards`; Spellcast3D's installer asks),
+and so does one without the decode in boxes' floor below sm_80 (`--only decode_products`).
 
 ## Extending it
 

@@ -1,17 +1,32 @@
 {
-  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post7-cp39-abi3-win_amd64.whl",
-  "sha256": "e208586ba86c90096a81a0756860d9f422d71eac081ffd396a2c8051d96513a6",
-  "size_bytes": 20962472,
-  "built": "2026-11-03T10:49:35+00:00",
-  "build_seconds": 652,
+  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post8-cp39-abi3-win_amd64.whl",
+  "sha256": "2cb32cf2164d9e6a2a0202dfda718bb9cd7c8d8159d23c924200604629d587ce",
+  "size_bytes": 21504557,
+  "built": "2026-11-08T15:43:29+00:00",
+  "build_seconds": 691,
   "source": {
-    "path": "C:\\_myDrive\\repos\\spellcast3d\\temp_code\\SageAttention-roundl",
+    "path": "C:\\_myDrive\\repos\\spellcast3d\\temp_code\\SageAttention-roundo",
     "commit": "135263532720876f1864cf9ea6b28f793dbfec30",
-    "branch": "spellcast3d-round-l"
+    "branch": "spellcast3d-round-o-pascal",
+    "uncommitted_files_sha256": {
+      "csrc/qattn/attn_cuda_sm61_variants.h": "b4badea467a468261b4e686eec487c6abdd3088338a8d8e11ac12b36717c811c",
+      "csrc/qattn/pascal/qattn_pascal_next.cu": "4bf85612bbb408f876bfe4143b66c07f082d462825a8dbac958806c79e33479c",
+      "csrc/qattn/pascal/variants/p61_n0.cu": "6e58a9b5091bea05d3d53d98f8dc686846cda77b9b4484e92dfee9ab88608b3f",
+      "csrc/qattn/pascal/variants/p61_s.cu": "f3f514b647e75821de469ccbeed84c0cf006eecfb15bf068c2b80b94e0877fa4",
+      "csrc/qattn/pascal/variants/p61_s24.cu": "1fc2c8a8746abf7eb0e71791bdbfbbf32fc291f9fcc02f0e410e77e1fae688be",
+      "csrc/qattn/pascal/variants/p61_s28.cu": "85e0a3e25a84484981c9438115acfd0c20d7cb476135c5c563773c2daf8ea93b",
+      "csrc/qattn/pascal/variants/p61_u24.cu": "fa3a098a705138a38a1db807b49212b8fa3f063498b122fa3d12c00c449214d2",
+      "csrc/qattn/pascal/variants/p61_u28.cu": "7a5d74c30f261ad737517bb0fdc3af6b9dd6ae987d27057567fd8d83dbf437d5",
+      "csrc/qattn/pascal/variants/p61_u44.cu": "195238126468171050147686a424a5603ca56f82e04135961293422e8c2c9561",
+      "csrc/qattn/pascal/variants/p61_variant_names.h": "cc5699d1e8c2f285984383dfb61c85962367ecb9dc7b1fda15f77a4a740026b5",
+      "csrc/qattn/pybind_sm61.cpp": "42448926eb2e699281914cf4f1fa3cdd135ee6b1fe02e1cb5dcf805978b1bcf6",
+      "setup.py": "d2b16945b85311336a778efc9c3116db909657310922c53a0696d4927159051c"
+    },
+    "uncommitted_files_note": "recomputed after the build (the build's own list missed the first status line); the files unchanged since"
   },
-  "what_for": "post6 plus the Turing (sm_75: _qattn_sm75, the tuned sm80 kernel's twin on Turing's mma shapes without cp.async, the fused quantisers built for 7.5 too) and Pascal (sm_61: _qattn_sm61, int8 Q.K^T and P.V by dp4a) kernels of Spellcast3D round L; every earlier extension built as before",
+  "what_for": "post7 plus the Pascal (sm_61) attention op's twins of Spellcast3D round O (_qattn_sm61: sageattn_pascal_u28 / _u44 / _s28 / _s24, the shipped op's bits with other code shapes, raced at install by the fork's sage.py); every other extension's source as post7's",
   "build": {
-    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\sage\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\round-l\\sage\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-l\\sage\\wheel-out",
+    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-o-pascal-wheels\\sage\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\ROUND-~4\\sage\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-o-pascal-wheels\\sage\\wheel-out",
     "env": {
       "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
       "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
@@ -19,7 +34,7 @@
       "MAX_JOBS": "6",
       "NVCC_THREADS": "1",
       "CUDA_VISIBLE_DEVICES": "-1",
-      "SAGEATTENTION_WHEEL_VERSION_SUFFIX": "+cu128torch2.8.0.post7",
+      "SAGEATTENTION_WHEEL_VERSION_SUFFIX": "+cu128torch2.8.0.post8",
       "SAGEATTENTION_SM80_PTX": "1",
       "TORCH_CUDA_ARCH_LIST": "6.1 7.5 8.0 8.6 8.9 9.0 12.0"
     },
@@ -79,5 +94,10 @@
       "ptx_compute": []
     }
   },
-  "wheel_files": 23
+  "wheel_files": 23,
+  "previous": "sageattention-2.2.0+cu128torch2.8.0.post7-cp39-abi3-win_amd64.whl",
+  "against_previous": {
+    "summary": "every kernel of every extension SASS-identical to post7's (_fused 220, _qattn_sm61 25, _qattn_sm75 9, _qattn_sm80 408, _qattn_sm89 448, _qattn_sm90 64), 100 new ones (the 4 race twins' and the 3 developer twins' kernels in _qattn_sm61), the same file list, every Python file byte-equal",
+    "record": "code/logs/profiling/pixal3d-lowmem/round-o/pascal-kernels/compare-sage-post7-post8.json"
+  }
 }

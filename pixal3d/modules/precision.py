@@ -13,14 +13,18 @@ and a GTX 1080):
              attention through torch SDPA or the SageAttention wheel's Turing kernel where the install's calibration
              ran it, xformers on request (flash_attn is sm_80+); the sparse
              decoders' convolutions on spconv (flex_gemm's are Triton kernels, which Windows cannot be trusted to
-             compile for Turing - Triton elementwise kernels stay optional, behind their self-checks); NAF's
-             neighborhood attention in plain torch (natten's wheel is sm_80+).
+             compile for Turing - Triton elementwise kernels stay optional, behind their self-checks), decoded in
+             boxes like flex_gemm's (models/sc_vaes/chunked.py); NAF's neighborhood attention in plain torch
+             (natten's wheel is sm_80+).
     pascal   below sm_70 (GTX 10xx): fp16 arithmetic runs at a 64th of the fp32 rate on consumer Pascal and bf16 is
-             emulated, so the torso is fp32 (its weights 0.9 GB: the token-sized linears are int8), the int8 GEMMs go
-             through torch._int_mm (cuBLASLt's dp4a kernels: exact, 12-22 TOPS on a GTX 1080 against 6-7 TFLOPS of
-             fp32), attention through torch SDPA in fp32 (its fp16 kernel takes 20 times longer there), the decoders
-             on spconv (in fp16, as their checkpoints say: fp32 decoders ran the biggest prop out of an 8 GB card), NAF in
-             plain torch, and no Triton at all (Triton does not support Pascal).
+             emulated, so the torso is fp32 (its weights 0.9 GB: the token-sized linears are int8), the int8 GEMMs
+             through pixal3d_kernels' dp4a kernel with group scales (int8mm.cuda_linear; torch._int_mm's per-row
+             layers where that package is missing), attention through the SageAttention wheel's Pascal kernel (int8
+             Q.K^T and P.V by dp4a) where the install's calibration ran it on the card, torch SDPA in fp32 otherwise
+             (its fp16 kernel takes 20 times longer there), the decoders on spconv with the products on torch.mm
+             (spconv has no prebuilt sm_61 GEMMs; in fp16, as their checkpoints say: fp32 decoders ran the biggest
+             prop out of an 8 GB card), decoded in boxes, NAF in plain torch, and no Triton at all (Triton does not
+             support Pascal).
 
 On both old profiles the flows' eager element-wise chains (norm modulations, gated residuals, the q / k RMS norm and
 rotary embedding, the int8 quantisers) run as pixal3d_kernels' CUDA kernels with the chains' own bits

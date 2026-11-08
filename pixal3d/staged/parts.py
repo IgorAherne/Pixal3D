@@ -97,23 +97,29 @@ SPENT = {"ss": ("cond_ss",), "cond_lr": ("dino512",), "lr": ("cond_lr", "rng_ss"
 # (8.8-12.3 M voxels, up to four in their finish at once): the launcher's private working set rose from 3.0 GB
 # before the finish part to 6.7 GB, 3.7 GB for all of them (round-e/e1536-full). These figures decide, in `upsample`, the
 # highest resolution a 1536 prop can be made at within the card and the RAM, and in `finish` whether both decoders
-# may share the card and whether a decode is hopeless under the cap. A big shape is decoded in boxes (below), so
-# its decode no longer grows with the prop; what then bounds a 1536 prop on a small card is the closing of its
-# holes, and the RAM.
+# may share the card and whether a decode is hopeless under the cap. Where the decoders decode in boxes
+# (_decodes_in_boxes), a big shape is decoded in boxes (below; on spconv only one whose whole-table decode would not
+# fit: SPCONV_BOXES_WHERE_NEEDED) and its decode no longer grows with the prop; what then
+# bounds a 1536 prop on a small card is the closing of its holes, the samplers, and the RAM. Where they do not, the
+# whole-table decode is what is counted. The decode's figures here are flex_gemm's; spconv's (the cards below sm_80)
+# are SPCONV_* below, and decode_figures() gives the ones of the backend in use.
 DECODER_MIB = 905
 DECODE_MIB_PER_KVOXEL = 0.52
 VOXELS_PER_OCCUPIED = 1.15          # decoded voxels per occupied 512-grid voxel scaled to the resolution, with margin
 VOXELS_PER_TOKEN = 400              # voxels a token decodes to at most (396 measured on the bulky prop): used only
-#                                     where the occupied voxels are not known (a resumed prop)
+#                                     where the occupied voxels are not known (a prop resumed from a checkpoint
+#                                     that does not carry them: one written before round O)
+CHECKPOINT_VOXELS = "decode_voxels"   # the key of the foreseen voxels in a checkpoint's notes (tex, runner._restore)
 # The decode in boxes (models/sc_vaes/chunked.py: the same values, bit for bit). A shape whose whole-table decode
 # would take more than CHUNK_ABOVE_MIB is decoded a box of CHUNK_VOXELS fine voxels at a time, and its peak stops
 # growing with the prop: DECODER_MIB, CHUNKED_MIB_PER_KVOXEL per thousand voxels of the prop (the coarse levels on
 # whole tables, the assembly, the mesh extraction; the texture decode's mesh on the card) and CHUNK_MIB_PER_KVOXEL
 # per thousand voxels of a box (measured: a 16.45 M-voxel shape 3,103-3,423 MiB with 1-2 M boxes, a 7.3 M one
 # 1,946 shape / 2,725 texture with 2 M boxes, the texture decode holding the mesh; the formula gives 4,002-4,302 and
-# 2,743). Every 1536 prop of the test set goes this way; a 1024 prop stays whole. Boxes cost 4-9 % of
-# the decode's time, and the first chunked decode of an install autotunes flex_gemm's kernels for the new row
-# counts (a few seconds, kept in its cache).
+# 2,743). On flex_gemm every 1536 prop of the test set goes this way, and a 1024 prop stays whole (on spconv the
+# threshold is the backend's own: SPCONV_CHUNK_ABOVE_MIB). Boxes cost 4-9 % of the decode's time, and the first
+# chunked decode of an install autotunes flex_gemm's kernels for the new row counts (a few seconds, kept in its
+# cache).
 CHUNK_ABOVE_MIB = 3_000
 CHUNK_VOXELS = 2_000_000
 CHUNKED_MIB_PER_KVOXEL = 0.17
@@ -134,8 +140,44 @@ FILL_MIB_PER_KVOXEL = 0.15
 FLOW_BF16_MIB = 2_680               # a flow network's weights in bf16 (the loader reports 2,678-2,679 MiB)
 FLOW_INT8_CONVERTED_MIB = 1_121     # the token-sized linears as int8 (policy "detail"; 2,242 MiB in bf16)
 FLOW_REST_MIB = 436                 # what stays in the torso's dtype beside them, in bf16
-SAMPLER_MIB_PER_KTOKEN = 50
+SAMPLER_MIB_PER_KTOKEN = 50        # bf16 and fp16 torsos: the turing profile's fp16 torso with its fp32 stream
+#                                     allocates 57.4-58.2 MiB a thousand tokens beyond the weights and the tables
+#                                     (hr: the RTX 2070's boy at 1024, the 3060 forced to turing at 1024 (n5) and
+#                                     1536 (M1); R3 section 1), inside the 62.5 this gives with the slack, which adds
+#                                     a quarter of the weights (~390 MiB) on top: 530-590 MiB of margin at 30-44k tokens
 SAMPLER_SLACK = 1.25
+# An fp32 torso (the pascal profile, GTX 10xx) allocates 87.0-87.2 MiB a thousand tokens beyond the weights and the
+# tables in hr (the boy at 1024, 5.1k tokens, round N's forced-pascal pas-on; the boy at 1536, 12.1k tokens, M1's
+# pas-a: 5,114 - 2,129 of tables - 1,929 of weights), 73-74 in tex: the same rate at both token counts, its activations
+# in fp32 twice bf16's. With bf16's 50 sampler_mib said 62.5 and let a GTX 10xx's bulkiest props through at 1536 with
+# ~0.6 GB too little (R3 section 2c: the tree's hr at 43.5k tokens 5,130 counted against ~5,714). 90 (3 % over the
+# measured rate), with the same slack. Checked under the pessimistic 8 GB cap (round O, runs/tree-pas-hr: the tree,
+# the 3060 forced to pascal, PyTorch's cap 6,061 MiB from hr on, no proj tables): the first hr step allocated 4,482
+# MiB at ~30k tokens (the tree made at 1280: its whole-table decode at 1536 does not fit a 12 GB card on the products
+# path), 84.5 a thousand tokens beyond the weights, conditioning included; this rule counts 5,809 there. At 43.5k
+# tokens it counts 7,305, so a GTX 10xx with 6-7 GB for PyTorch makes such a prop at 1280-1408 (unmeasured at
+# 43.5k under that cap: ~5.7-6.0 GB allocated foreseen, within 5 % of it).
+#   Since round O's finish-up the old cards' int8 MLP runs in row slabs on pixal3d_kernels' GEMM path
+# (modules/int8mm.py mlp_slab_rows: 256 MiB of hidden rows, 8,192 rows a slab in fp32, 16,384 in fp16; the same bits),
+# so beyond the slab the MLP's hidden table no longer grows with the prop: the MLP alone took 547 / 900 / 1,378 /
+# 1,967 MiB whole and 393 / 439 / 501 / 578 slabbed at 12,110 / 19,928 / 30,500 / 43,529 tokens (pascal, isolated:
+# finish-up-REPORT section 4) - 45.2 a thousand tokens whole, ~5.9 a thousand beyond the slab. The boy at 1536
+# (12.1k tokens) then allocated 76.5 a thousand in hr (63.2 in tex) where it took 86.6 (M1's pas-a; finish/runs/
+# pas1536-slab), the rest of a block ~44 a thousand (926 - 393 MiB of the MLP over 12.11k). So the fp32 figure is
+# piecewise: SAMPLER_FP32_MIB_PER_KTOKEN for the tokens of the first slab (or all of them where nothing is slabbed),
+# SAMPLER_FP32_SLABBED_MIB_PER_KTOKEN beyond it - the rest of a block (44) and the slabbed MLP's growth (5.9), 4 %
+# over - both with SAMPLER_SLACK. The boy: 941 MiB counted against 926 measured beyond the weights (3,588 with the
+# slack against 2,863 allocated beyond the proj tables). The tree at 43.5k tokens: 2,575 counted against ~2,492
+# foreseen (44 x 43.5 + the MLP's measured 578), 5,710 with the weights before their load (1,993) and the slack,
+# under the pessimistic 6,061 MiB cap: a GTX 10xx makes it at 1536, foreseen at ~4.4 GB allocated (1,936 + 2,492),
+# ~27 % under that cap - a foresight, to be checked by the tree's run under the forced pascal profile and the
+# emulated cap. Where the MLP is not slabbed (no pixal3d_kernels GEMM, the int8 policy off, PIXAL3D_MLP_SLAB_MIB=0)
+# the whole figure stands for every token (_mlp_slab_rows). The fp16 torso (turing) keeps bf16's figure: its slabs
+# start at 16,384 tokens and only lower its need (the MLP at 43,529 tokens 1,159 -> 516 MiB), inside a rule that
+# already counts 62.5 a thousand against the 57.4-58.2 measured whole.
+SAMPLER_FP32_MIB_PER_KTOKEN = 90
+SAMPLER_FP32_SLABBED_MIB_PER_KTOKEN = 52
+FLOW_MLP_HIDDEN = 8_192             # the 1024-grid flows' MLP hidden channels (4 x 2,048): what a slab is cut by
 PROJ_CACHE_SLACK = 1.1              # over the kept proj_linear answers' bytes (proj_cache_count)
 PROJ_CACHE_MARGIN_MIB = 512         # free under the cap beside the sampler and the kept tables (proj_cache_count).
 #                                     sampler_mib is itself above a bf16 sampling's peak: on a 7.2 GiB card's 6.2 GB cap
@@ -215,6 +257,99 @@ HOOK_TORCH_MIB_PER_MFACE = 120      # what the GLB GPU steps reserve through PyT
 UNLEAN_WHOLE = 2.1
 UNLEAN_BOXES = 1.3
 
+# The figures above are flex_gemm's (the Ampere cards, and a Turing card whose calibration found flex_gemm right).
+# The cards below sm_80 decode on spconv (modules/precision.py), whose convolutions allocate otherwise: spconv's
+# implicit GEMM with its own kernels ("spconv": the RTX 20xx / GTX 16xx), or spconv's gather-scatter with the
+# products on torch.mm ("spconv_torch": a card spconv has no prebuilt kernels for, the GTX 10xx; conv_spconv.py).
+# decode_figures() gives the figures of the backend this process decodes on; each one says what it was measured on.
+# SPCONV_* hold the spconv figures per backend; a backend that cannot decode in boxes (_decodes_in_boxes) never
+# uses its box figures: chunk_for gives it whole tables, and resolution_fits keeps a card under
+# WHOLE_LEVEL_1536_MIB at 1024 (below).
+#
+# Whole tables, what a decode allocates per thousand voxels above its decoders' weights (round O, the RTX 3060 under
+# the forced profiles, the finish part replayed from captured checkpoints: code/devtools/pixal3d-lowmem/round-o/
+# memory, records code/logs/profiling/pixal3d-lowmem/round-o/memory/runs):
+#   spconv        0.606-0.618: the boy single view at 1536 (3.49 M voxels) 0.615 with both decoders, 0.612 with one,
+#                 0.618 with both beside the texture network (boy-tur), the ork multi view (10.57 M) 0.607 / 0.608 with
+#                 one / both (whole-tur), 0.609 with both (M1's tur-ork); the real RTX 2070 at 1024 0.610-0.613 (R3,
+#                 2070-u6). 0.63 keeps ~2 % over the largest. With conv_spconv.py's per-level pair tables (the
+#                 default since the boxes landed; PIXAL3D_SPCONV_PAIRS=off is the way back, these figures' "before")
+#                 a whole table takes less: 0.506-0.523 (boxes-tur: the boy 0.523, the ork 0.506, the tree 0.514),
+#                 which 0.63 covers (the products path then 0.683-0.689: boxes-pas-b).
+#   spconv_torch  0.80-0.81: the boy at 1536 (3.55 M) 0.807 with both decoders, 0.809 with both beside the
+#                 texture network, 0.805 with one beside it (boy-pas), 0.797 / 0.796 with both / one (boy-pas2:
+#                 conv_spconv.py with round O's product windows), 0.80 (M1's pas-a); the ork (10.56 M) 0.784 with one
+#                 (whole-pas); the boy at 1024 on the products path 0.81 (R3, fp-pas). 0.84 keeps ~4 % over the largest.
+# Without decoder.lean a whole-table decode reserved, times what it allocated, with no cap: spconv 1.69 (both
+# decoders) and 1.94 (one: its shape decode leaves the cache the texture decode cannot reuse), boy-tur;
+# spconv_torch 1.80 (both) and 2.02 (one), boy-pas2 (1.80 in M1's pas-a); the ork's one-decoder decode without
+# the trims ran out of a 12 GB card's 10,414 MiB cap at 8,085 allocated / 10,258 reserved, and lean it fitted at
+# 9,190 / 10,398 (whole-pas). 2.0 and 2.1. On the products path even
+# the lean form reserves 1.45-1.56 times what it allocates with no cap (boy-pas2: the per-offset gathers and
+# products of a level stay cached until the level ends); under a cap the allocator gives them back: the boy's
+# both-decoder decode allocated 4,642 MiB, reserved 5,760, under the pessimistic 8 GB decode cap of 5,761 and fitted
+# (boy-pas2 cap6861-auto), so what decides a fit there is the allocation, which decoders_fit takes with its 10 %.
+SPCONV_DECODE_MIB_PER_KVOXEL = {"spconv": 0.63, "spconv_torch": 0.84}
+SPCONV_UNLEAN_WHOLE = {"spconv": 2.0, "spconv_torch": 2.1}
+# (R1's prototype on the tree capture, the same 3060 and profiles, gives whole decodes of 0.577 / 0.754 MiB a
+# thousand voxels above the weights without the shape decoder's mesh, which the texture decode holds beside it:
+# 36 bytes a voxel, 0.034; with it 0.611 / 0.788, the figures above. Round O, r1-boxes-REPORT section 3.)
+# In boxes (models/sc_vaes/chunked.py on spconv, round O: on by default, PIXAL3D_SPCONV_BOXES=off), measured
+# with the replay (runs/boxes-tur, boxes-pas-a / -b; both decoders, lean, 2 M-voxel boxes), above the decoders' weights:
+#   the boy 3.49 / 3.55 M voxels   1,353 MiB (turing), 1,568 (pascal)
+#   the ork 10.57 M                2,535 (turing), 2,549 (pascal); one decoder 2,525 / 2,539, beside the texture
+#                                  network too
+#   the tree 12.24 M               3,152 (turing), 3,154 (pascal)
+# The same with 1 M boxes as with 2 M, and for the big props the same on both paths: the peak is the texture decode's
+# whole-table part (the coarse levels, the assembly of the kept rows, the shape decoder's mesh beside it), not a box's
+# convolutions (R1's prototype on a 10.59 M crop: 1,908 / 1,980 MiB without the mesh, 2,361 with it;
+# r1-boxes-REPORT section 3). 0.22 a thousand voxels of the prop with 0.33 a thousand voxels of a 2 M box (660) holds
+# spconv's (1,427 / 2,984 / 3,353 counted: 5 %, 18 %, 6 % over); the products path's boy needs 0.42 (840: 1,621 /
+# 3,164 / 3,533 counted, 3 %, 24 %, 12 % over). Without decoder.lean the boxes reserved 1.44 (the ork, both decoders)
+# to 1.61 (the tree, one) times what they allocated on spconv, 1.56-1.70 on the products path, whose lean form itself
+# reserves 1.23-1.61 times: 1.8.
+# The boxes gave the whole tables' meshes bit for bit wherever both ran (the boy and the ork on both paths, the tree
+# on spconv: the decoded meshes' SHA-256), and take +2-10 % of the decode's time on spconv (the boy 4.2 s against 3.8
+# whole, the ork 11.6 against 11.4) and ~0-10 % on the products path (the ork 26.4 against 25.1-25.8 s, the boy 8.9
+# against 8.1).
+#
+# WHERE spconv boxes (chunk_for): only where the whole-table decode does not fit. The boxes' bit-equality with the
+# whole tables is proven on this PC's RTX 3060 under the forced profiles only; no real RTX 20xx / GTX 10xx has run
+# them (R1 section 5). Before round O those cards decoded every prop on whole tables, so a prop whose whole-table
+# decode fits the finish's cap stays on that path - every 1024 prop that fitted before, and the boy at 1536 on an
+# 8 GB card - and only a decode that could not run whole goes into boxes (the ork and the tree at 1536 on 8 GB). The
+# test is decode_mib with one decoder on whole tables against the finish decode's cap with decoders_fit's margin
+# (limit / 1.1): the tightest form a whole-table decode takes. The cap is the finish's own (the decode), or as
+# card_limits foresees it (upsample's ladder, pair_keep), or what the card has left less the finish's reserves
+# (tail_room, the uncapped rung). With no cap to judge (a CPU run) a spconv decode is whole. Once a real card has
+# passed the whole-against-boxed gate, SPCONV_BOXES_WHERE_NEEDED = False boxes every decode above
+# SPCONV_CHUNK_ABOVE_MIB as on flex_gemm (with these whole figures from ~3.3 M voxels on spconv and ~2.5 M on the
+# products path, against 4.0 M on flex_gemm: some 1024 props too - the same meshes where the boxes are bit-equal).
+# flex_gemm (Ampere) is not affected: it boxes above CHUNK_ABOVE_MIB as it always did.
+SPCONV_BOXES_WHERE_NEEDED = True
+# The hold mode (chunked.py, round O's review): where this card's decode_products record lists an output-layer
+# boundary band (products_floor.has_boundary: this PC's pascal record does, its turing one does not), the shape
+# decoder keeps the boxes' rows before the output layer (fp16 [n, 64] and their coords) and runs that layer at the
+# end, so its box peak grows with the prop again: above the decoders, the boy (3.55 M voxels) 809 -> 1,082 MiB at
+# 2 M boxes, the ork (10.56 M) 2,131 -> 3,077 (boxes-REPORT section 11.5); without it the shape decode peaked at 807 /
+# 2,128 / 2,672 for the boy / ork / tree (12.24 M; runs/boxes-pas-a/-b), the texture decode at 1,568 / 2,549 / 3,154
+# (unchanged by the hold). So with the band the box decode counts the larger of the box figures above and
+# SPCONV_HOLD_MIB_PER_KVOXEL a thousand voxels of the prop with SPCONV_HOLD_BASE_MIB: the shape decode's ~0.215 a
+# thousand (its fit over the three props) and the held rows' ~0.09 (946 MiB over the ork's 10.56 M), 0.31 with 100.
+# Measured with the boxes agent's pascal record (runs/hold-pas, 2 M boxes, lean): the ork's shape decode 3,102 MiB
+# above both decoders (3,375 counted, 9 % over), the tree's 3,594 (3,894, 8 %), the boy's 1,082 (1,201); under the
+# pessimistic 8 GB cap the ork then decodes one decoder at a time, 4,001 / 5,550 MiB allocated / reserved under 5,761,
+# the same mesh. The band's own sizes (a fine level
+# within 1,024 rows above a multiple of 2,097,088 rows: about one prop in 2,000) also make the output layer's whole
+# call once, fp32 [n, 64] beside the held rows (the boy 1,082 -> ~1,660-1,760 MiB, forced): not counted here, as no
+# plan can tell those sizes before the decode (the residual risk named in the memory report).
+SPCONV_HOLD_MIB_PER_KVOXEL = 0.31
+SPCONV_HOLD_BASE_MIB = 100
+SPCONV_CHUNKED_MIB_PER_KVOXEL = {"spconv": 0.22, "spconv_torch": 0.22}
+SPCONV_CHUNK_MIB_PER_KVOXEL = {"spconv": 0.33, "spconv_torch": 0.42}
+SPCONV_UNLEAN_BOXES = {"spconv": 1.8, "spconv_torch": 1.8}
+SPCONV_CHUNK_ABOVE_MIB = {"spconv": 3_000, "spconv_torch": 3_000}     # with SPCONV_BOXES_WHERE_NEEDED off only
+
 
 def hook_torch_mib(hooks: Any, req: Any) -> int:
     """MiB the finish hook's GPU steps reserve through PyTorch for `req`: what the hook says
@@ -275,7 +410,10 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
     finish will set (with decoders_fit's margin), the closing of the holes beside it does, and so do the finish
     steps: the largest of this prop's and of each prop in its steps of their native reserve (glb_reserve of the
     faces the voxels foresee, or the prop's own) and what they reserve through PyTorch (steps_torch_mib of those
-    faces) within what the hook's cap leaves the card (the finish cap and its native reserve);
+    faces) within what the hook's cap leaves the card (the finish cap and its native reserve) - the decode counted
+    with the backend's figures and on whole tables where it has no boxes (decode_mib, chunk_for: on spconv's whole
+    tables the RTX 2070's ork at 1024 ran out of memory beside the texture network that flex_gemm's box figures had
+    kept, round N);
     the decoders stay only when, beside it, the holes and the steps fit as well and the next prop's texture sampling
     (next_sampler_mib: its sampler, and its proj_linear answers where it will keep them) fits beside them under the
     cap in force."""
@@ -305,9 +443,11 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
     steps_room = finish_limit + NATIVE_RESERVE["finish"]
     sampler = next_sampler_mib(loader.get(flow), tokens, cap_now, flow_mib)
 
+    chunk = chunk_for(voxels, finish_limit)          # the decode's own decision, under the cap foreseen for it
+
     def fits(decoders: bool) -> bool:
         after = flow_mib + (decoders_mib if decoders else 0)
-        return (flow_mib + decode_mib(voxels, 2, chunk_for(voxels)) <= budget and after + fill_mib(voxels) <= budget
+        return (flow_mib + decode_mib(voxels, 2, chunk) <= budget and after + fill_mib(voxels) <= budget
                 and after + steps <= steps_room
                 and (not decoders or sampler + decoders_mib <= cap_now))
 
@@ -318,9 +458,10 @@ def pair_keep(ctx: PartContext, prop: PropState, following: PropState, natives: 
 
 def lean_needed(voxels: int, decoders: int, chunk: int, room_mib: float) -> bool:
     """Must a decode of `voxels` voxels with `decoders` decoders on the card give its cache back level by level
-    (decoder.lean) to fit `room_mib` (the cap less what else is kept on the card)? A CPU run (no room known) needs
-    nothing."""
-    factor = UNLEAN_BOXES if chunk else UNLEAN_WHOLE
+    (decoder.lean) to fit `room_mib` (the cap less what else is kept on the card)? What a decode without it reserves
+    is the backend's unlean factor (decode_figures) times decode_mib. A CPU run (no room known) needs nothing."""
+    figures = decode_figures()
+    factor = figures["unlean_boxes"] if chunk else figures["unlean_whole"]
     return room_mib > 0 and factor * decode_mib(voxels, decoders, chunk) > room_mib / 1.1
 
 
@@ -349,18 +490,75 @@ def voxels_at(occupied: int, resolution: int) -> int:
     return int(VOXELS_PER_OCCUPIED * occupied * (resolution / 512) ** 2)
 
 
+def decode_backend() -> str:
+    """What this process's sparse decoders convolve on: "flex_gemm" (also any backend other than spconv: the
+    figures that always stood for it), "spconv" (spconv's own GEMM kernels) or "spconv_torch" (spconv's
+    gather-scatter with the products on torch.mm, conv_spconv._products_in_torch: a card spconv has no prebuilt
+    kernels for). Asked at every call: the configuration may be changed by a test."""
+    from ..modules.sparse import config as sparse_config
+
+    if sparse_config.CONV != "spconv":
+        return "flex_gemm"
+    from ..modules.sparse.conv import conv_spconv
+
+    return "spconv_torch" if conv_spconv._products_in_torch() else "spconv"
+
+
+def decode_figures() -> dict:
+    """The decode's figures for this process's backend (decode_backend): "whole" (MiB a thousand voxels on whole
+    tables), "chunked" / "chunk" (in boxes: a thousand voxels of the prop / of a box), "unlean_whole" /
+    "unlean_boxes" (what a decode without decoder.lean reserves, times what it allocates), "chunk_above" (the
+    whole-table decode above which boxes are used). flex_gemm's are this module's constants, read at the call."""
+    backend = decode_backend()
+    if backend == "flex_gemm":
+        return {"whole": DECODE_MIB_PER_KVOXEL, "chunked": CHUNKED_MIB_PER_KVOXEL, "chunk": CHUNK_MIB_PER_KVOXEL,
+                "unlean_whole": UNLEAN_WHOLE, "unlean_boxes": UNLEAN_BOXES, "chunk_above": CHUNK_ABOVE_MIB}
+    return {"whole": SPCONV_DECODE_MIB_PER_KVOXEL[backend], "chunked": SPCONV_CHUNKED_MIB_PER_KVOXEL[backend],
+            "chunk": SPCONV_CHUNK_MIB_PER_KVOXEL[backend], "unlean_whole": SPCONV_UNLEAN_WHOLE[backend],
+            "unlean_boxes": SPCONV_UNLEAN_BOXES[backend], "chunk_above": SPCONV_CHUNK_ABOVE_MIB[backend],
+            "hold": SPCONV_HOLD_MIB_PER_KVOXEL if _holds_tail_rows() else 0.0}
+
+
+def _holds_tail_rows() -> bool:
+    """Whether this card's decode_products record makes the shape decoder hold its boxes' rows before the output
+    layer (an output-layer boundary band: products_floor.has_boundary; SPCONV_HOLD_MIB_PER_KVOXEL)."""
+    try:
+        from ..modules.sparse.conv import products_floor
+
+        return bool(products_floor.has_boundary())
+    except Exception:       # noqa: BLE001 - no reader (an older checkout), no record: no hold
+        return False
+
+
 def decode_mib(voxels: int, decoders: int = 1, chunk: int = 0) -> float:
     """MiB PyTorch allocates to decode a shape of `voxels` voxels with `decoders` decoders on the card: on whole
-    tables (chunk 0), or in boxes of `chunk` fine voxels."""
+    tables (chunk 0), or in boxes of `chunk` fine voxels - with the figures of the backend the decoders run on
+    (decode_figures)."""
+    figures = decode_figures()
     if chunk:
-        return decoders * DECODER_MIB + CHUNKED_MIB_PER_KVOXEL * voxels / 1000 + CHUNK_MIB_PER_KVOXEL * chunk / 1000
-    return decoders * DECODER_MIB + DECODE_MIB_PER_KVOXEL * voxels / 1000
+        boxes = figures["chunked"] * voxels / 1000 + figures["chunk"] * chunk / 1000
+        if figures.get("hold"):         # spconv's hold mode: the shape decode's held rows (SPCONV_HOLD_MIB_PER_KVOXEL)
+            boxes = max(boxes, figures["hold"] * voxels / 1000 + SPCONV_HOLD_BASE_MIB)
+        return decoders * DECODER_MIB + boxes
+    return decoders * DECODER_MIB + figures["whole"] * voxels / 1000
 
 
-def chunk_for(voxels: int) -> int:
-    """The box size a shape of `voxels` voxels is decoded in (decoder.chunk_voxels), 0 for a whole-table decode:
-    boxes where the whole-table decode would take more than CHUNK_ABOVE_MIB."""
-    return CHUNK_VOXELS if decode_mib(voxels) > CHUNK_ABOVE_MIB else 0
+def chunk_for(voxels: int, limit_mib: float | None = None) -> int:
+    """The box size a shape of `voxels` voxels is decoded in (decoder.chunk_voxels), 0 for a whole-table decode -
+    the one decision the decode, upsample's ladder, pair_keep, decoders_fit, lean_needed and tail_room all count
+    with. Only where the backend decodes in boxes at all (_decodes_in_boxes: elsewhere every level is decoded whole
+    whatever chunk_voxels says). flex_gemm: boxes where the whole-table decode would take more than CHUNK_ABOVE_MIB
+    (`limit_mib` is not looked at). spconv: boxes only where the whole-table decode with one decoder does not fit
+    `limit_mib`, the finish decode's cap, with decoders_fit's margin; whole tables where it fits or where there is no
+    cap to judge (SPCONV_BOXES_WHERE_NEEDED: why)."""
+    if not _decodes_in_boxes(voxels):
+        return 0
+    figures = decode_figures()
+    if decode_backend() == "flex_gemm" or not SPCONV_BOXES_WHERE_NEEDED:
+        return CHUNK_VOXELS if decode_mib(voxels) > figures["chunk_above"] else 0
+    if not limit_mib or limit_mib <= 0:
+        return 0
+    return CHUNK_VOXELS if decode_mib(voxels) > limit_mib / 1.1 else 0
 
 
 def fill_mib(voxels: int) -> float:
@@ -369,24 +567,53 @@ def fill_mib(voxels: int) -> float:
     return FILL_MIB_PER_KVOXEL * voxels / 1000
 
 
-def finish_mib(voxels: int, decoders: int = 1) -> float:
+def finish_mib(voxels: int, decoders: int = 1, limit_mib: float | None = None, chunk: int | None = None) -> float:
     """MiB of the card the finish part's widest moment takes for a shape of `voxels` voxels: its decode (with
-    `decoders` decoders on the card, in boxes where chunk_for says so) or the closing of its holes, whichever is
-    more."""
-    return max(decode_mib(voxels, decoders, chunk_for(voxels)), fill_mib(voxels))
+    `decoders` decoders on the card, in the boxes `chunk` gives - by default chunk_for's under the finish decode's cap
+    `limit_mib` - with the backend's figures: decode_mib) or the closing of its holes, whichever is more."""
+    chunk = chunk_for(voxels, limit_mib) if chunk is None else chunk
+    return max(decode_mib(voxels, decoders, chunk), fill_mib(voxels))
 
 
 def sampler_mib(tokens: int, weights_mib: int | None = None) -> float:
     """MiB a 1024-grid flow sampler needs on the card for a prop of `tokens` tokens, fragmentation included:
-    the network's `weights_mib` (a bf16 network's when not known) and what the sampling allocates beyond them."""
+    the network's `weights_mib` (a bf16 network's when not known) and what the sampling allocates beyond them -
+    SAMPLER_MIB_PER_KTOKEN a thousand tokens for a bf16 or fp16 torso; for an fp32 one (the pascal profile)
+    SAMPLER_FP32_MIB_PER_KTOKEN up to the MLP's slab rows (_mlp_slab_rows) and SAMPLER_FP32_SLABBED_MIB_PER_KTOKEN
+    beyond them."""
     weights = FLOW_BF16_MIB if weights_mib is None else weights_mib
+    if precision.torso() == torch.float32:
+        slab = min(tokens, _mlp_slab_rows(tokens))
+        per_token = (SAMPLER_FP32_MIB_PER_KTOKEN * slab + SAMPLER_FP32_SLABBED_MIB_PER_KTOKEN * (tokens - slab)) / 1000
+        return SAMPLER_SLACK * (weights + per_token)
     return SAMPLER_SLACK * (weights + SAMPLER_MIB_PER_KTOKEN * tokens / 1000)
+
+
+def _mlp_slab_rows(tokens: int) -> int:
+    """The rows a slab of the hr / tex flows' int8 MLP holds for `tokens` tokens on this card (modules/int8mm.py
+    mlp_slab_rows), where it is slabbed: the int8 policy converts those flows and pixal3d_kernels' GEMM path serves
+    them (taken, or foreseen before the first conversion: the package loads); `tokens` (one call) elsewhere, and
+    where int8mm cannot say."""
+    try:
+        from ..modules import int8mm
+
+        if not (_int8_converts("hr") and _int8_converts("tex")):
+            return tokens
+        path = int8mm.gemm_path()
+        if path not in ("cuda", "") or (path == "" and int8mm.cuda_gemm_op() is None):
+            return tokens
+        slab = getattr(int8mm, "mlp_slab_rows", None)
+        return tokens if slab is None else int(slab(int(tokens), FLOW_MLP_HIDDEN, precision.torso()))
+    except Exception:       # noqa: BLE001 - an int8mm that cannot say: no slabs, the whole figure
+        return tokens
 
 
 def proj_cache_sampler_mib(tokens: int, weights_mib: int | None = None) -> float:
     """MiB a flow sampler needs on the card beside the proj_linear answers it keeps (the one figure of
-    proj_cache_blocks and next_sampler_mib): sampler_mib's, with its per-token part PROJ_CACHE_FP32_TOKENS times
-    as wide for an fp32 torso. Which props a card can make (resolution_fits) stays with sampler_mib."""
+    proj_cache_blocks and next_sampler_mib): sampler_mib's for a bf16 or fp16 torso; for an fp32 one bf16's
+    per-token part PROJ_CACHE_FP32_TOKENS times as wide (100 a thousand tokens: a little more than sampler_mib's
+    SAMPLER_FP32_MIB_PER_KTOKEN, kept as it was measured and tested for the tables). Which props a card can make
+    (resolution_fits) stays with sampler_mib."""
     if precision.torso() != torch.float32:
         return sampler_mib(tokens, weights_mib)
     weights = FLOW_BF16_MIB if weights_mib is None else weights_mib
@@ -502,13 +729,35 @@ def ram_available_mib() -> int | None:
         return None
 
 
-# Without the decode in boxes (models/sc_vaes/chunked.py: flex_gemm's masked kernel only), the decoders decode a
-# level whole: the texture decoder of a 1536 prop then ran out of an 8 GB card's memory (an RTX 2060 Super on spconv,
-# the knight; Spellcast3D round L), so such a card makes its props at 1024. A card with this much decodes 1536 whole.
+# Without the decode in boxes (_decodes_in_boxes false: a backend chunked.py cannot cut), the decoders decode a level
+# whole: the texture decoder of a 1536 prop then ran out of an 8 GB card's memory (an RTX 2060 Super on spconv, the
+# knight; Spellcast3D round L), so such a card makes its props at 1024. A card with this much decodes 1536 whole.
+# Since round O the finish test of resolution_fits counts such a decode on whole tables with the backend's own
+# figures (decode_figures), which would let a boy-sized prop through at 1536 on 8 GB; this rule stays as the safety
+# net for a backend without boxes, and does not apply where the decoders cut their levels into boxes.
 WHOLE_LEVEL_1536_MIB = 10 * 1024
 
 
-def _decodes_in_boxes() -> bool:
+def _decodes_in_boxes(voxels: int | None = None) -> bool:
+    """Whether the decoders of this process decode a level in boxes when told to (decoder.chunk_voxels) - for a
+    shape of `voxels` fine voxels where that is given: what models/sc_vaes/chunked.py says (boxes_supported: flex_gemm's
+    masked split-K; spconv where this card's decode_products measurement says its boxes are exact, and with
+    `voxels` where every level of such a shape is within the whole calls it verified - a shape it does not cover is
+    planned whole, or at 1024 below WHOLE_LEVEL_1536_MIB), or - a chunked.py without that question - flex_gemm's
+    masked split-K alone, the one algorithm whose rows its boxes reproduced before."""
+    try:
+        from ..models.sc_vaes import chunked
+
+        supported = getattr(chunked, "boxes_supported", None)
+        if supported is not None:
+            if voxels is not None:
+                try:
+                    return bool(supported(int(voxels)))
+                except TypeError:       # a chunked.py whose question takes no shape
+                    pass
+            return bool(supported())
+    except Exception:       # noqa: BLE001 - a chunked.py that cannot be asked: the test it always made
+        pass
     from ..modules.sparse import config as sparse_config
     from ..modules.sparse.conv import config as conv_config
 
@@ -525,25 +774,29 @@ def _card_total_mib(ctx: PartContext) -> float:
 def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: int,
                     voxels: int | None = None, req: Any = None) -> str | None:
     """Why a prop of `tokens` tokens at `resolution` would not fit the memory this PC leaves Pixal3D - "card" or
-    "ram" - or None when it fits. The card: the widest moment of `finish` (finish_mib: the decode, in boxes for a
-    big shape, or the closing of the holes) under the cap it will get, the 1024-grid samplers under the cap in
-    force, and the finish hook's GPU steps - what they reserve through PyTorch (steps_torch_mib, for the faces the
+    "ram" - or None when it fits. The card: the widest moment of `finish` (finish_mib: the decode with the figures of
+    the backend the decoders run on - in boxes for a big shape where that backend has boxes, on whole tables where it
+    has none - or the closing of the holes) under the cap it will get, the 1024-grid samplers (sampler_mib, with the
+    torso's own figure a thousand tokens) under the cap in force, and the finish hook's GPU steps - what they reserve
+    through PyTorch (steps_torch_mib, for the faces the
     voxels foresee) under the cap they get beside their native reserve (glb_reserve: on a card that leaves Pixal3D
     5.2 GB the ork of the test set at 1536, 21 M faces, got 1,089 MiB there and its geometry step ran out at about
     1,100); the RAM: what the finish hook needs beside the process. The voxels are foreseen from the `occupied`
     cells of the 512 grid, or given (a Hi3D prop's mesh has them exactly); `req`: the prop's request, for the
-    hook's own texture-size figure."""
+    hook's own texture-size figure. Where the decoders have no boxes, a card under WHOLE_LEVEL_1536_MIB keeps its
+    props at 1024 whatever the figures say (the safety net of round L)."""
     voxels = voxels_at(occupied, resolution) if voxels is None else voxels
     limits = card_limits(ctx)
     if limits is not None:
         finish_limit, cap_now = limits
-        if finish_mib(voxels) > finish_limit / 1.1 or sampler_mib(tokens, flow_weights_mib(ctx, "hr")) > cap_now:
+        if finish_mib(voxels, limit_mib=finish_limit) > finish_limit / 1.1 or \
+                sampler_mib(tokens, flow_weights_mib(ctx, "hr")) > cap_now:
             return "card"
         faces = int(FACES_PER_VOXEL * voxels)
         steps_cap = finish_limit + NATIVE_RESERVE["finish"] - glb_reserve(faces)
         if steps_torch_mib(getattr(ctx, "hooks", None), req, faces) > steps_cap:
             return "card"
-        if resolution > 1024 and not _decodes_in_boxes() and _card_total_mib(ctx) < WHOLE_LEVEL_1536_MIB:
+        if resolution > 1024 and not _decodes_in_boxes(voxels) and _card_total_mib(ctx) < WHOLE_LEVEL_1536_MIB:
             return "card"
     available = ram_available_mib()
     if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
@@ -554,18 +807,19 @@ def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: in
 def tail_room(ctx: PartContext, pending: list, held_mib: int) -> int:
     """MiB a finish hook's GPU step may keep on the card when it returns, for a later step of the same prop
     (runner: state["room_mib"]). `pending`: the props of the finish part still to be decoded; `held_mib`: what the
-    other props in their steps hold already. 0 when nothing may stay: a CPU run, a prop whose decode size is not
-    known, or no room."""
+    other props in their steps hold already (the pending props' finish_mib with both decoders: the backend's
+    figures). 0 when nothing may stay: a CPU run, a prop whose decode size is not known, or no room."""
     headroom = ctx.loader.headroom_mib() if hasattr(ctx.loader, "headroom_mib") else None
     if headroom is None:
         return 0
     need = 0.0
+    limit = headroom - (NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB)     # the finish cap a next decode would get
     for prop in pending:
         try:
             stored = ctx.store.get_small(prop.id, "coords_hr")
         except Exception:
             return 0
-        need = max(need, 1.1 * finish_mib(decode_voxels(stored), decoders=2))
+        need = max(need, 1.1 * finish_mib(decode_voxels(stored), decoders=2, limit_mib=limit))
     room = (headroom - (NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB) - max(need, HOLD_BESIDE_MIB) - held_mib
             - HOLD_SLACK_MIB)
     available = ram_available_mib()
@@ -924,8 +1178,11 @@ def upsample(ctx: PartContext, prop: PropState, mode: str) -> None:
     # The token cap of p2d:711-725: a 1536 prop with too many tokens is made at a lower resolution. The memory
     # this PC leaves Pixal3D caps it as well (resolution_fits): a prop that would not fit the card or the RAM at
     # a resolution is made at the next lower one, down to 1024, instead of spilling or failing at the end. With
-    # the decode in boxes, what can still lower a 1536 prop on an 8 GB card is the closing of the holes of a shape
-    # far bulkier than the test set's (fill_mib), or the RAM.
+    # the decode in boxes (flex_gemm; spconv where its whole-table decode would not fit: chunk_for), what can still
+    # lower a 1536 prop on an 8 GB card is a sampler at a bulky prop's token count (sampler_mib: an fp32 torso, a
+    # GTX 10xx), the closing of the holes of a shape far bulkier than the test set's (fill_mib), the finish hook's
+    # steps, or the RAM; without boxes, the whole-table decode with the backend's figures, and below
+    # WHOLE_LEVEL_1536_MIB 1024.
     resolution, unique = request.resolution, None
     unbounded, why = None, None            # the resolution the token cap alone gives, and what memory said against it
     while True:
@@ -1014,22 +1271,40 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
     store.put_small(prop.id, "tex_slat", {"feats": tex_feats})
     if request.request_hash:
         tensors = {"coords": stored["coords"], "res": stored["res"], "shape_slat": shape_feats, "tex_slat": tex_feats}
+        noted = prop.noted(store.get_small(prop.id, "notes"))
         if geometry(prop) == "hi3d":
             mesh = store.get_large(prop.id, "hi3d_mesh")
             tensors.update({"hi3d_vertices": mesh["vertices"], "hi3d_faces": mesh["faces"],
                             "voxels": stored["voxels"], **{f"hi3d_{key}": sub for key, sub in
                                                            store.get_small(prop.id, "hi3d_subs").items()}})
-        store.checkpoint(prop.id, request.request_hash, tensors, prop.noted(store.get_small(prop.id, "notes")))
+        elif stored.get("voxels") is not None:
+            # the voxels upsample foresaw, with the checkpoint's notes (runner._restore puts them back into
+            # coords_hr): without them a resumed prop's memory rules count VOXELS_PER_TOKEN a token (decode_voxels),
+            # 18-38 % above the props measured, and on spconv's whole tables a resumed 1536 tree (43.5k tokens, 17.4 M
+            # voxels counted for 12.2 M) was refused at once on a 12 GB card it fits (round O, runs/whole-tur)
+            noted = {**noted, CHECKPOINT_VOXELS: int(stored["voxels"][0])}
+        store.checkpoint(prop.id, request.request_hash, tensors, noted)
 
 
-def decoders_fit(voxels: int, limit_mib: int) -> bool:
-    """May both decoders stay on the card while a shape of `voxels` voxels is decoded under a cap of `limit_mib`."""
-    return decode_mib(voxels, decoders=2, chunk=chunk_for(voxels)) <= limit_mib / 1.1
+def decoders_fit(voxels: int, limit_mib: int, chunk: int | None = None) -> bool:
+    """May both decoders stay on the card while a shape of `voxels` voxels is decoded under a cap of `limit_mib`
+    (decode_mib with two decoders, in the decode's boxes `chunk` - by default chunk_for's under `limit_mib`: whole
+    tables on a backend without boxes, and on spconv where they fit)."""
+    chunk = chunk_for(voxels, limit_mib) if chunk is None else chunk
+    return decode_mib(voxels, decoders=2, chunk=chunk) <= limit_mib / 1.1
+
+
+def _finish_limit(ctx: PartContext) -> int | None:
+    """The finish decode's cap as the card stands now (what set_cap would give it): the room the loader reports
+    less the finish's reserves; None where the loader cannot say (a CPU run). For the box decision of an uncapped
+    rung (chunk_for)."""
+    headroom = ctx.loader.headroom_mib() if hasattr(ctx.loader, "headroom_mib") else None
+    return None if headroom is None else int(headroom - (NATIVE_RESERVE["finish"] + FINISH_SAFETY_MIB))
 
 
 def decode_voxels(stored: dict) -> int:
-    """The voxels the stored coords_hr decode to: as `upsample` foresaw them, or from the token count for a prop
-    that was resumed from a checkpoint."""
+    """The voxels the stored coords_hr decode to: as `upsample` foresaw them (a resumed prop: as its checkpoint
+    noted them), or from the token count for a prop resumed from a checkpoint without them."""
     voxels = stored.get("voxels")
     return int(voxels[0]) if voxels is not None else VOXELS_PER_TOKEN * int(stored["coords"].shape[0])
 
@@ -1050,14 +1325,17 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
     # the cap, which counts what is allocated as room; the decoders themselves are in decode_mib.
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
     room = limit - _kept_beside(ctx) if capped else 0
-    chunk = chunk_for(voxels)           # a big shape in boxes: the same mesh, a peak that does not grow with it
-    if capped and finish_mib(voxels / VOXELS_PER_OCCUPIED) > room:
+    # A big shape in boxes (the same mesh, a peak that does not grow with it), decided under the decode's own cap -
+    # with the cap lifted, under what the card has left (chunk_for) - and counted so everywhere below. On flex_gemm
+    # the hopeless check keeps the decision for the margin-free voxels it always made.
+    chunk = chunk_for(voxels, limit if capped else _finish_limit(ctx))
+    hopeless = finish_mib(voxels / VOXELS_PER_OCCUPIED, chunk=None if decode_backend() == "flex_gemm" else chunk)
+    if capped and hopeless > room:
         # Hopeless under the cap, even with every margin taken off: an attempt would run out of memory after a
         # minute and leave nothing. Said at once; the ladder lifts the cap when the caller allows a spill.
         raise PropFailed(f"Finishing this shape ({voxels / 1e6:.1f} M voxels) needs about "
-                         f"{finish_mib(voxels / VOXELS_PER_OCCUPIED):,.0f} MiB of video memory; the card has "
-                         f"{room:,} MiB free for it.", "oom")
-    together = mode == "normal" and decoders_fit(voxels, room)
+                         f"{hopeless:,.0f} MiB of video memory; the card has {room:,} MiB free for it.", "oom")
+    together = mode == "normal" and decoders_fit(voxels, room, chunk)
     # The lean form (each level's cache given back at once) where the decode needs it, and on the tight rung
     lean = mode != "normal" or lean_needed(voxels, 2 if together else 1, chunk, room)
     ctx.check()
@@ -1128,7 +1406,7 @@ def _finish_hi3d(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps |
     voxels = decode_voxels(stored)
     limit = loader.set_cap(NATIVE_RESERVE["finish"], safety_mib=FINISH_SAFETY_MIB) if capped else 0
     room = limit - _kept_beside(ctx) if capped else 0
-    chunk = chunk_for(voxels)
+    chunk = chunk_for(voxels, limit if capped else _finish_limit(ctx))
     lean = mode != "normal" or (capped and lean_needed(voxels, 1, chunk, room))
     if loader.get("shape_dec") is not None:
         loader.drop("shape_dec")

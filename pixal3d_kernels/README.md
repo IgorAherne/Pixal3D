@@ -92,6 +92,26 @@ ptxas (CUDA 12.8 for sm_75, 12.6 for sm_61; no spills anywhere):
 | group, group | 244 | 239, 25.5 KB |
 | per row, group | 245 | 208, 24.5 KB |
 
+## The dp4a kernel's twins (0.2.1, Spellcast3D round O)
+
+    torch.ops.pixal3d_kernels.int8_gemm_group_q4(xq, xs, wq, ws, bias, gelu, out_dtype, raster=0) -> y
+    torch.ops.pixal3d_kernels.int8_gemm_group_f5(xq, xs, wq, ws, bias, gelu, out_dtype, raster=0) -> y
+
+The dp4a kernel (`csrc/int8_gemm_dp4a.cu`) with other code shapes and its bits (`csrc/int8_gemm_dp4a_twins.cu`):
+int8_gemm_group's arguments but `kernel`, always the dp4a code (sm_61+; a build without code for the card refuses).
+The group kernels' K-stage loop is 8,832 bytes of sm_61 SASS, above Pascal's ~8 KB instruction cache for a loop; the
+twins bring it under: **q4** a stage as 4 trips of 4 k4 rows (5,920 B; ~2.6 % more issue slots a group: the shorter
+trips' overhead), **f5** a group's first k4 row taking 1.5 * 2^23 as its dp4a addend so the conversion needs no
+restart (64 moves less a group), then 3 trips of 5 rows (7,648 B; the shipped kernel's issue count). The per-row
+kernel (6,592 B, nothing to restart) runs q4's shape in both. Every output's integer sum is the same exact chain and
+its fp32 conversion the same `__fmaf_rn` in the same group order, the epilogue the shipped one: the same bits
+(torch.equal at the flows' shapes, M 1-43,529, every scale layout and output dtype, the flows' real operands - on an
+RTX 3060 through the compute_61 PTX's JIT; the executed FFMA / FADD / FMUL counts per stage of the sm_61 SASS equal
+the shipped kernel's). Which one serves is the install's race on the card itself (the fork's modules/int8mm.py
+`calibrate_dp4a_twins`, called by old_cards' calibration step; the record's old_cards.dp4a; the shipped kernel
+without a record): no GTX 10xx could time them when they were written
+(code/devtools/pixal3d-lowmem/round-o/pascal-kernels/: the checks, the SASS report, a pod's bench).
+
 ## Figures
 
 Kernel-only medians (CUDA events, every method once a round, 12 rounds; random int8 operands; ms and TOPS = 2MNK / t).

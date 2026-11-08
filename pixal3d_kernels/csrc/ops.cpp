@@ -75,9 +75,13 @@ at::Tensor vec16(const at::Tensor & t) {
 
 }  // namespace
 
-at::Tensor int8_gemm_group(const at::Tensor & xq_in, const at::Tensor & xs_in, const at::Tensor & wq_in,
-                           const at::Tensor & ws_in, const c10::optional<at::Tensor> & bias_in, const bool gelu,
-                           const at::ScalarType out_dtype, const int64_t raster, const int64_t kernel) {
+namespace {
+
+// the GEMM ops' common body; twin 0: the shipped kernels by `kernel` (int8_gemm_group), 1 / 2: the dp4a kernel's
+// twin q4 / f5 (int8_gemm_group_q4 / _f5, Spellcast3D round O; `kernel` unused)
+at::Tensor gemm_op(const at::Tensor & xq_in, const at::Tensor & xs_in, const at::Tensor & wq_in,
+                   const at::Tensor & ws_in, const c10::optional<at::Tensor> & bias_in, const bool gelu,
+                   const at::ScalarType out_dtype, const int64_t raster, const int64_t kernel, const int twin) {
     TORCH_CHECK(xq_in.is_cuda() && wq_in.is_cuda() && xs_in.is_cuda() && ws_in.is_cuda(), "CUDA tensors expected");
     TORCH_CHECK(xq_in.scalar_type() == at::kChar && wq_in.scalar_type() == at::kChar, "xq and wq must be int8");
     TORCH_CHECK(xs_in.scalar_type() == at::kFloat && ws_in.scalar_type() == at::kFloat, "xs and ws must be fp32");
@@ -153,10 +157,56 @@ at::Tensor int8_gemm_group(const at::Tensor & xq_in, const at::Tensor & xs_in, c
     p.raster = (int) raster;
 
     const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+    if (twin) {
+        const cudaError_t err = int8_gemm_dp4a_twin(p, a_group, b_group, twin, stream);
+        TORCH_CHECK(err == cudaSuccess, "int8_gemm_group_", twin == 1 ? "q4" : "f5", ": ", cudaGetErrorString(err));
+        return y;
+    }
     const cudaError_t err = use_imma(device, kernel) ? int8_gemm_imma(p, a_group, b_group, stream)
                                                      : int8_gemm_dp4a(p, a_group, b_group, stream);
     TORCH_CHECK(err == cudaSuccess, "int8_gemm_group: ", cudaGetErrorString(err));
     return y;
+}
+
+// a twin needs its own code for the card (a build whose code for it is JIT-compiled from compute_61 PTX has it)
+void check_twins(const at::Tensor & xq) {
+    TORCH_CHECK(xq.is_cuda(), "CUDA tensors expected");
+    const int device = xq.device().index();
+    const c10::cuda::CUDAGuard guard(xq.device());
+    const cudaDeviceProp * prop = at::cuda::getDeviceProperties(device);
+    const int cc = prop->major * 10 + prop->minor;
+    TORCH_CHECK(cc >= 61, "the dp4a twins need dp4a (sm_61 or newer), the card is sm_", cc);
+    static int known[64] = {};      // per device: 0 not asked yet, 1 the twins' code is there, 2 it is not
+    int have = device >= 0 && device < 64 ? known[device] : 0;
+    if (!have) {
+        have = int8_gemm_dp4a_twins_loaded() ? 1 : 2;
+        if (device >= 0 && device < 64) {
+            known[device] = have;
+        }
+    }
+    TORCH_CHECK(have == 1, "this build of pixal3d_kernels has no dp4a twin code for sm_", cc);
+}
+
+}  // namespace
+
+at::Tensor int8_gemm_group(const at::Tensor & xq_in, const at::Tensor & xs_in, const at::Tensor & wq_in,
+                           const at::Tensor & ws_in, const c10::optional<at::Tensor> & bias_in, const bool gelu,
+                           const at::ScalarType out_dtype, const int64_t raster, const int64_t kernel) {
+    return gemm_op(xq_in, xs_in, wq_in, ws_in, bias_in, gelu, out_dtype, raster, kernel, 0);
+}
+
+at::Tensor int8_gemm_group_q4(const at::Tensor & xq, const at::Tensor & xs, const at::Tensor & wq,
+                              const at::Tensor & ws, const c10::optional<at::Tensor> & bias, const bool gelu,
+                              const at::ScalarType out_dtype, const int64_t raster) {
+    check_twins(xq);
+    return gemm_op(xq, xs, wq, ws, bias, gelu, out_dtype, raster, 0, 1);
+}
+
+at::Tensor int8_gemm_group_f5(const at::Tensor & xq, const at::Tensor & xs, const at::Tensor & wq,
+                              const at::Tensor & ws, const c10::optional<at::Tensor> & bias, const bool gelu,
+                              const at::ScalarType out_dtype, const int64_t raster) {
+    check_twins(xq);
+    return gemm_op(xq, xs, wq, ws, bias, gelu, out_dtype, raster, 0, 2);
 }
 
 // ---- the element-wise chains ----------------------------------------------------------------------------------------
@@ -295,6 +345,12 @@ TORCH_LIBRARY(pixal3d_kernels, m) {
     // raster / kernel: developer knobs (the tile order; the kernel family), 0 = the defaults
     m.def("int8_gemm_group(Tensor xq, Tensor xs, Tensor wq, Tensor ws, Tensor? bias, bool gelu, "
           "ScalarType out_dtype, int raster=0, int kernel=0) -> Tensor");
+    // Spellcast3D round O: the dp4a kernel's twins (int8_gemm_dp4a_twins.cu), the same arguments but `kernel`, the
+    // same bits; the install's race picks one per card (pixal3d/modules/int8mm.py DP4A_TWINS)
+    m.def("int8_gemm_group_q4(Tensor xq, Tensor xs, Tensor wq, Tensor ws, Tensor? bias, bool gelu, "
+          "ScalarType out_dtype, int raster=0) -> Tensor");
+    m.def("int8_gemm_group_f5(Tensor xq, Tensor xs, Tensor wq, Tensor ws, Tensor? bias, bool gelu, "
+          "ScalarType out_dtype, int raster=0) -> Tensor");
     // the flows' element-wise chains below sm_80 (elementwise.cu): the eager torch code's bits
     m.def("quantize_rows(Tensor x, int group, Tensor? inv_smooth) -> (Tensor, Tensor)");
     m.def("modulate(Tensor h, Tensor scale1, Tensor shift, ScalarType out_dtype) -> Tensor");
@@ -304,6 +360,8 @@ TORCH_LIBRARY(pixal3d_kernels, m) {
 
 TORCH_LIBRARY_IMPL(pixal3d_kernels, CUDA, m) {
     m.impl("int8_gemm_group", &pixal3d_kernels::int8_gemm_group);
+    m.impl("int8_gemm_group_q4", &pixal3d_kernels::int8_gemm_group_q4);
+    m.impl("int8_gemm_group_f5", &pixal3d_kernels::int8_gemm_group_f5);
     m.impl("quantize_rows", &pixal3d_kernels::op_quantize_rows);
     m.impl("modulate", &pixal3d_kernels::op_modulate);
     m.impl("residual_gated", &pixal3d_kernels::op_residual_gated);

@@ -341,6 +341,9 @@ class StagedRunner:
         except KeyError:
             return False
         notes = dict(checkpoint.get("notes") or {})
+        # the voxels upsample foresaw (parts.tex notes them with the checkpoint, parts.CHECKPOINT_VOXELS): the
+        # memory rules of the prop's finish count them instead of a figure a token
+        voxels = notes.pop("decode_voxels", None)
         prop.slow = list(notes.get("slow") or [])
         store = self.ctx.store
         if hi3d:
@@ -349,7 +352,10 @@ class StagedRunner:
                                                    if key.startswith("hi3d_s")})
             store.put_small(prop.id, "coords_hr", stored)
         else:
-            store.put_small(prop.id, "coords_hr", {"coords": coords, "res": res})
+            stored = {"coords": coords, "res": res}
+            if isinstance(voxels, int) and not isinstance(voxels, bool) and voxels > 0:
+                stored["voxels"] = torch.tensor([voxels], dtype=torch.int64)
+            store.put_small(prop.id, "coords_hr", stored)
         store.put_small(prop.id, "shape_slat", {"feats": shape_slat})
         store.put_small(prop.id, "tex_slat", {"feats": tex_slat})
         store.put_small(prop.id, "notes", notes)

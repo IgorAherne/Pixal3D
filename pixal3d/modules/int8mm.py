@@ -44,6 +44,16 @@ Triton has no int8 MMA for sm_75 but its elementwise kernels run there). The qua
 or the Triton kernel). The outputs come in the torso's dtype (`out_dtype`: bf16, fp16 or fp32; modules/precision.py).
 Below sm_61, or when the first-use self-check (`self_check`) fails, every call runs F.linear on the dequantised
 weight (the fallback) and says so once.
+
+The dp4a kernel's twins (Spellcast3D round O; pixal3d_kernels 0.2.1 on: DP4A_TWINS): on the cards whose GEMMs are
+dp4a (below sm_75: the GTX 10xx, Volta) the package also holds the dp4a kernel with other code shapes and the same
+bits (csrc/int8_gemm_dp4a_twins.cu: q4 a K stage as 4 trips of 4 k4 rows, f5 a group's first row restarting the
+integer sums so that the conversion needs no reset - both bring the group kernels' stage loop under Pascal's ~8 KB
+instruction cache). The install's race times them against the shipped kernel on the card itself (old_cards'
+calibration step: `calibrate_dp4a_twins`, the record's old_cards.dp4a) per scale form (group / rows); a process takes
+the recorded twin (`_dp4a_twin`) once it gave the shipped kernel's bits on a small table at first use, the shipped
+kernel otherwise (no record, an older package, PIXAL3D_DP4A_TWIN=shipped). On the old cards' profiles an MLP whose
+hidden layer would pass MLP_SLAB_MIB runs in row slabs (`cuda_mlp`, round O: the same bits, a bounded table).
 """
 
 from __future__ import annotations
@@ -114,6 +124,15 @@ def has_group_gemm() -> bool:
 
 
 _cuda_op = None
+DP4A_TWINS = ("q4", "f5")   # torch.ops.pixal3d_kernels.int8_gemm_group_<twin> (pixal3d_kernels 0.2.1 on): the dp4a
+#                             kernel's twins, int8_gemm_group's arguments but `kernel`, its bits (the docstring)
+DP4A_TWIN_MARGIN = 0.05     # a twin serves only where it is this much faster than the shipped kernel at every size
+#                             (the same bits: the margin only guards against the timing's noise; 5 %, as the
+#                             project's other races)
+DP4A_RACE = {"group": (("qkv", 1536, 4608, False), ("fc1", 1536, 8192, True), ("fc2", 8192, 1536, False)),
+             "rows": (("out", 1536, 1536, False),)}     # the hr / tex flows' layers by scale form: (name, K, N, GELU)
+DP4A_RACE_ROWS = ((8192, 4), (21504, 4))    # (M, rounds): a 1024 prop's pass and a 1536 one's; 5 calls a round
+_dp4a: dict = {}            # (device, grouped) -> the twin's op or None (the shipped kernel): this process's choice
 
 
 def cuda_gemm_op() -> Optional[Callable]:
@@ -133,8 +152,240 @@ def cuda_gemm_op() -> Optional[Callable]:
 def cuda_linear(xq: torch.Tensor, xs: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor,
                 bias: Optional[torch.Tensor], *, gelu: bool = False, out_dtype: torch.dtype = torch.float16):
     """pixal3d_kernels' GEMM: int8 [M, K] with per-row or group scales x int8 [N, K] with per-channel or
-    per-channel-and-group scales -> out_dtype [M, N], the bias and GELU in its epilogue (int8mm.reference's sums)."""
+    per-channel-and-group scales -> out_dtype [M, N], the bias and GELU in its epilogue (int8mm.reference's sums).
+    On a dp4a card, the twin of the dp4a kernel the install's race chose for the scale form (`_dp4a_twin`)."""
+    twin = _dp4a_twin(xq.device, xs.dim() == 2)
+    if twin is not None:
+        return twin(xq, xs, w_q, w_s, bias, gelu, out_dtype, 0)
     return cuda_gemm_op()(xq, xs, w_q, w_s, bias, gelu, out_dtype, 0, 0)
+
+
+def _dp4a_card(device: torch.device) -> bool:
+    """Whether the shipped op runs its dp4a kernel on this card: below sm_75 (the profile's capability where one is
+    forced: PIXAL3D_CARD_SM)."""
+    major, minor = precision.profile().capability or torch.cuda.get_device_capability(device)
+    return (major, minor) < (7, 5)
+
+
+def _dp4a_twin_op(name: str) -> Optional[Callable]:
+    """pixal3d_kernels' twin `name` of the dp4a kernel (int8_gemm_group_<name>), or None (an older package)."""
+    if cuda_gemm_op() is None:
+        return None
+    try:
+        return getattr(torch.ops.pixal3d_kernels, f"int8_gemm_group_{name}")
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _dp4a_wanted(device: torch.device, form: str) -> Tuple[str, str]:
+    """(the twin for the scale form "group" / "rows", why): PIXAL3D_DP4A_TWIN (developers: a twin's name for both
+    forms, "group=<twin>,rows=<twin>", or shipped / off), else the install's race (the calibration record's
+    old_cards.dp4a, made on this card for this profile with the installed pixal3d_kernels build), else "shipped"."""
+    text = os.environ.get("PIXAL3D_DP4A_TWIN", "").strip().lower()
+    if text:
+        named: dict = {}
+        for part in (p.strip() for p in text.split(",") if p.strip()):
+            if "=" in part:
+                key, value = (s.strip() for s in part.split("=", 1))
+                named[key] = value
+            else:
+                named.setdefault("group", part)
+                named.setdefault("rows", part)
+        name = named.get(form, "shipped")
+        return ("shipped" if name in ("off", "shipped", "") else name), f"PIXAL3D_DP4A_TWIN={text}"
+    try:
+        from . import old_cards
+
+        race = old_cards.dp4a_race(device)
+    except Exception:       # noqa: BLE001 - no record: the shipped kernel
+        race = None
+    if isinstance(race, dict) and race.get(form) in DP4A_TWINS:
+        return race[form], f"timed on this card when Spellcast3D was installed: {race.get('summary', 'record')}"
+    return "shipped", "no race recorded"
+
+
+def _twin_table(device: torch.device, grouped: bool, M: int, K: int, N: int, gelu: bool, seed: int):
+    """Random int8 operands of the flows' kind (activations per row or per row and 128-K group, weights per channel,
+    a bias), from pixal3d_kernels' own quantiser (the torch quantiser's bits)."""
+    import pixal3d_kernels as pk
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn((M, K), device=device, generator=g)
+    x[:, torch.randint(0, K, (8,), device=device, generator=g)] *= 20.0
+    w = torch.randn((N, K), device=device, generator=g) * 0.05
+    b = torch.randn((N,), device=device, generator=g)
+    xq, xs = pk.quantize_rows(x, GROUP if grouped else 0)
+    wq, ws = pk.quantize_rows(w, 0)
+    return xq, xs, wq, ws, b, gelu
+
+
+def _dp4a_twin(device: torch.device, grouped: bool) -> Optional[Callable]:
+    """The twin of the dp4a kernel for this scale form in this process (`_dp4a_wanted`), once it gave the shipped
+    op's bits on a small table here (torch.equal; else one line and the shipped kernel), or None: the shipped
+    kernel (a card on the tensor cores, no twin wanted, an older package). Cached."""
+    key = (str(device), bool(grouped))
+    if key in _dp4a:
+        return _dp4a[key]
+    _dp4a[key] = None
+    form = "group" if grouped else "rows"
+    if not _dp4a_card(device):
+        return None
+    name, why = _dp4a_wanted(device, form)
+    if name == "shipped":
+        return None
+    op = _dp4a_twin_op(name)
+    if op is None:
+        print(f"[INT8] the dp4a GEMM's twin {name} is not in the installed pixal3d_kernels: the shipped kernel serves "
+              f"the {form} layers", flush=True)
+        return None
+    try:
+        xq, xs, wq, ws, b, gelu = _twin_table(device, grouped, 300, 1536, 4608, grouped, 3)
+        same = torch.equal(op(xq, xs, wq, ws, b, gelu, precision.torso(), 0),
+                           cuda_gemm_op()(xq, xs, wq, ws, b, gelu, precision.torso(), 0, 0))
+        del xq, xs, wq, ws, b
+    except Exception as exc:        # noqa: BLE001 - whatever the package or the card raises: the shipped kernel
+        same, why = False, f"{type(exc).__name__}: {str(exc)[:200]}"
+    if not same:
+        print(f"[INT8] the dp4a GEMM's twin {name} did not give the shipped kernel's bits on this card ({why}): the "
+              f"shipped kernel serves the {form} layers", flush=True)
+        return None
+    print(f"[INT8] the dp4a GEMM's twin {name} serves the {form} layers ({why})", flush=True)
+    _dp4a[key] = op
+    return op
+
+
+DP4A_RACE_SECONDS = 600     # the child process of the dp4a twins' race (calibrate_dp4a_twins_in_child): its limit
+
+
+def calibrate_dp4a_twins_in_child(device: torch.device) -> dict:
+    """calibrate_dp4a_twins in a child process with this process's environment and the fork on its path, as
+    sage._old_card_trial_in_child runs the attention's trial (old_cards' calibration step calls this): the twins'
+    sm_61 code has run on no GTX 10xx yet, and a kernel that faults leaves its process's CUDA context broken, which
+    must cost only this race - never the element-wise race after it, nor the calibration's later steps. The
+    child's last line of JSON is the result; a child that ends with an error, prints no result or runs out of time
+    gives {"ok": False, "group": "shipped", "rows": "shipped", "error"}: the shipped kernel serves. Where nothing is
+    to be raced (the tensor cores, no package, no twins) the answer comes without a child."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    if not _dp4a_card(device):
+        return {"ok": True, "skipped": "the card runs the tensor-core kernel"}
+    if cuda_gemm_op() is None:
+        return {"ok": True, "skipped": "pixal3d_kernels is not installed"}
+    if not any(_dp4a_twin_op(t) is not None for t in DP4A_TWINS):
+        return {"ok": True, "skipped": "the installed pixal3d_kernels has no twins", "group": "shipped",
+                "rows": "shipped"}
+    code = ("import json, torch\nfrom pixal3d.modules import int8mm\n"
+            "print(json.dumps(int8mm.calibrate_dp4a_twins(torch.device('cuda'))), flush=True)")
+
+    def text(out: object) -> str:
+        return out.decode("utf-8", "replace") if isinstance(out, bytes) else str(out or "")
+
+    try:
+        run = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]),
+                             env=os.environ.copy(), capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=DP4A_RACE_SECONDS)
+        stdout, stderr, returncode = run.stdout or "", run.stderr or "", run.returncode
+        ended = f"the race's process ended with code {returncode}"
+    except subprocess.TimeoutExpired as exc:
+        stdout, stderr, returncode = text(exc.stdout), text(exc.stderr), None
+        ended = f"the race did not finish in {DP4A_RACE_SECONDS} s"
+    lines = [line for line in stdout.splitlines() if line.startswith("{")]
+    found = None
+    if lines:
+        try:
+            found = json.loads(lines[-1])
+        except ValueError:
+            found = None
+    if isinstance(found, dict) and returncode == 0:
+        return found
+    tail = " | ".join((stderr or stdout).strip().splitlines()[-3:])
+    failed = {"ok": False, "group": "shipped", "rows": "shipped", "error": f"{ended}: {tail[:300]}",
+              "summary": "the shipped kernel serves (the twins' race did not finish)"}
+    if isinstance(found, dict) and found.get("timings"):
+        failed["timings"] = found["timings"]            # what it measured, for the record: no twin serves on it
+    return failed
+
+
+def calibrate_dp4a_twins(device: torch.device) -> dict:
+    """The install's race of the dp4a kernel's twins (old_cards' calibration step calls it; the record's
+    old_cards.dp4a): on a dp4a card, per scale form (DP4A_RACE: the hr / tex flows' group layers qkv, fc1 + GELU,
+    fc2; the per-row out), the shipped op and each twin at DP4A_RACE_ROWS' sizes on the same random operands - each
+    twin's answer must be the shipped op's bits (torch.equal) - timed in a rotating order (CUDA events, medians); the
+    form's time is the sum of its layers'. The twin with the best worst-size ratio serves where it is
+    DP4A_TWIN_MARGIN faster at every size. Returns {"ok", "group", "rows" (a twin or "shipped"), "timings",
+    "summary", "why"}, or {"ok": True, "skipped": why}. Never raises."""
+    import statistics
+
+    if not _dp4a_card(device):
+        return {"ok": True, "skipped": "the card runs the tensor-core kernel"}
+    if cuda_gemm_op() is None:
+        return {"ok": True, "skipped": "pixal3d_kernels is not installed"}
+    present = [t for t in DP4A_TWINS if _dp4a_twin_op(t) is not None]
+    if not present:
+        return {"ok": True, "skipped": "the installed pixal3d_kernels has no twins", "group": "shipped",
+                "rows": "shipped"}
+    found: dict = {"ok": True, "present": present, "group": "shipped", "rows": "shipped", "timings": []}
+    try:
+        shipped = cuda_gemm_op()
+        out_dtype = precision.torso()
+        lines = []
+        for form, layers in DP4A_RACE.items():
+            grouped = form == "group"
+            names = ["shipped", *present]
+            per_size: dict = {}
+            out: set = set()
+            for M, rounds in DP4A_RACE_ROWS:
+                totals = dict.fromkeys(names, 0.0)
+                for layer, K, N, gelu in layers:
+                    xq, xs, wq, ws, b, gelu = _twin_table(device, grouped, M, K, N, gelu, M + K + N)
+                    calls = {"shipped": (lambda: shipped(xq, xs, wq, ws, b, gelu, out_dtype, 0, 0))}
+                    for twin in present:
+                        calls[twin] = (lambda op=_dp4a_twin_op(twin): op(xq, xs, wq, ws, b, gelu, out_dtype, 0))
+                    want = calls["shipped"]()
+                    for twin in present:
+                        if twin not in out and not torch.equal(calls[twin](), want):
+                            out.add(twin)
+                    del want
+                    live = [n for n in names if n not in out]
+                    ms: dict = {n: [] for n in live}
+                    for i in range(rounds):
+                        for n in live[i % len(live):] + live[:i % len(live)]:
+                            calls[n]()
+                            events = []
+                            for _ in range(5):
+                                start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+                                start.record()
+                                calls[n]()
+                                end.record()
+                                events.append((start, end))
+                            torch.cuda.synchronize(device)
+                            ms[n] += [a.elapsed_time(e) for a, e in events]
+                    med = {n: statistics.median(v) for n, v in ms.items()}
+                    for n in live:
+                        totals[n] += med[n]
+                    found["timings"].append({"form": form, "layer": layer, "M": M, "K": K, "N": N,
+                                             "ms": {n: round(v, 4) for n, v in med.items()}})
+                    del xq, xs, wq, ws, b, calls, ms
+                    torch.cuda.empty_cache()
+                per_size[M] = totals
+            ratio = {t: max(per_size[M][t] / per_size[M]["shipped"] for M in per_size) for t in present if t not in out}
+            best = min(ratio, key=ratio.get) if ratio else None
+            text = ", ".join(f"{t} {100 * (x - 1):+.1f} %" for t, x in sorted(ratio.items(), key=lambda kv: kv[1]))
+            if out:
+                text += f"; other bits: {', '.join(sorted(out))} (left out)"
+            if best is not None and ratio[best] <= 1 - DP4A_TWIN_MARGIN:
+                found[form] = best
+            lines.append(f"{form} layers: {found[form]} (the worst size: {text or 'no twin timed'})")
+        found["summary"] = "; ".join(lines)
+        found["why"] = (f"a twin serves where it is {100 * DP4A_TWIN_MARGIN:.0f} % faster than the shipped kernel at "
+                        f"every size (M {', '.join(str(m) for m, _ in DP4A_RACE_ROWS)})")
+    except Exception as exc:        # noqa: BLE001 - the twins never cost the shipped kernel its place
+        found.update(ok=False, group="shipped", rows="shipped",
+                     error=f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}")
+    return found
 
 
 def kernel_name() -> str:
@@ -755,6 +1006,58 @@ def int8_linear(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w_q: 
 
 _OUT_NAME = {torch.bfloat16: "bf16", torch.float16: "fp16"}     # gemm()'s `out` for an output dtype
 
+# The old cards' MLP in row slabs (Spellcast3D round O): pixal3d_kernels' fc1 writes the hidden layer [M, 8192] in
+# the torso's dtype - fp32 on the pascal profile, 32 KB a token, plus its int8 re-quantisation, 8 KB more - which at
+# a 1536 prop's 43.5k tokens is 1.7 GB of one MLP's temporaries. Where that table would pass MLP_SLAB_MIB, fc1 ->
+# quantise -> fc2 run on row slabs of at most that much hidden layer, fc2's rows written into one output. The same
+# bits by construction: the dp4a and tensor-core kernels have fixed tiles and no split-K (csrc/int8_gemm_dp4a.cu,
+# int8_gemm_imma.cu: an output's integer sums and its fp32 group chain read its own row and channel only, rows past
+# M are not stored), the quantisers are per row; proven with torch.equal on random and captured real operands under
+# both profiles (code/logs/profiling/pixal3d-lowmem/round-o/reports/finish-up-REPORT.md). Only the old cards'
+# profiles slab (the ampere path is Triton's, untouched); PIXAL3D_MLP_SLAB_MIB = n sets the budget (checks; 0: never).
+MLP_SLAB_MIB = 256
+MLP_SLAB_ALIGN = 256        # slab rows a multiple of this (every operand's slice stays 16-byte aligned)
+MLP_SLAB_ENV = "PIXAL3D_MLP_SLAB_MIB"
+
+
+def mlp_slab_rows(M: int, hidden: int, dtype: torch.dtype) -> int:
+    """The rows of the old cards' MLP slabs for M tokens and a hidden layer of `hidden` channels in `dtype`: M (one
+    call, as before) on the ampere profile, where the hidden layer fits MLP_SLAB_MIB, or with the budget 0; else the
+    budget's rows, a multiple of MLP_SLAB_ALIGN."""
+    if precision.profile().name == "ampere":
+        return M
+    budget = MLP_SLAB_MIB
+    text = os.environ.get(MLP_SLAB_ENV, "").strip()
+    if text:
+        try:
+            budget = float(text)
+        except ValueError:
+            pass
+    if budget <= 0:
+        return M
+    per_row = hidden * torch.empty((), dtype=dtype).element_size()
+    rows = max(MLP_SLAB_ALIGN, int(budget * (1 << 20)) // per_row // MLP_SLAB_ALIGN * MLP_SLAB_ALIGN)
+    return M if rows >= M else rows
+
+
+def cuda_mlp(xq: torch.Tensor, xs: torch.Tensor, w1: tuple, w2: tuple, group: int,
+             inv_smooth2: Optional[torch.Tensor], out_dtype: torch.dtype, step: int) -> torch.Tensor:
+    """pixal3d_kernels' MLP (int8_mlp's "cuda" path): fc1 + GELU -> quantise (per row, or per row and `group`) ->
+    fc2, on row slabs of `step` rows (step >= M: one call each, as before), fc2's rows written into one output."""
+    M = xq.shape[0]
+    if step >= M:
+        h = cuda_linear(xq, xs, *w1, gelu=True, out_dtype=out_dtype)
+        return cuda_linear(*quantize_rows(h, group, inv_smooth2), *w2, out_dtype=out_dtype)
+    y = torch.empty((M, w2[0].shape[0]), dtype=out_dtype, device=xq.device)
+    for r0 in range(0, M, step):
+        r1 = min(M, r0 + step)
+        h = cuda_linear(xq[r0:r1], xs[r0:r1], *w1, gelu=True, out_dtype=out_dtype)
+        hq, hs = quantize_rows(h, group, inv_smooth2)
+        del h
+        y[r0:r1] = cuda_linear(hq, hs, *w2, out_dtype=out_dtype)
+        del hq, hs
+    return y
+
 
 def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tuple, w2: tuple, *,
              path: str = "rows", cfg1: Optional[tuple] = None,
@@ -775,11 +1078,12 @@ def int8_mlp(x: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], w1: tupl
         raise ValueError("the residual epilogue is the Triton GEMM's")
     if _state["gemm"] == "cuda" and path in ("rows", "group"):
         # pixal3d_kernels: fc1 with its GELU in the epilogue, the hidden layer quantised again for fc2 with the
-        # scales fc1's input had (per row, or per row and group)
+        # scales fc1's input had (per row, or per row and group); on the old cards' profiles in row slabs where the
+        # hidden layer would be big (mlp_slab_rows: the same bits)
         group = GROUP if path == "group" else 0
         xq, xs = x if isinstance(x, tuple) else quantize_rows(x, group)
-        h = cuda_linear(xq, xs, *w1, gelu=True, out_dtype=out_dtype)
-        return cuda_linear(*quantize_rows(h, group, inv_smooth2), *w2, out_dtype=out_dtype)
+        return cuda_mlp(xq, xs, w1, w2, group, inv_smooth2, out_dtype, mlp_slab_rows(xq.shape[0], w1[0].shape[0],
+                                                                                     out_dtype))
     if path == "rows" and out_dtype not in _OUT_NAME:
         path = "intmm"
     if path == "rows":
