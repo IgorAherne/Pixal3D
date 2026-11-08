@@ -525,11 +525,14 @@ def _triton_stands(earlier: dict, device: Any) -> bool:
 
 def _sage_stands(earlier: dict) -> bool:
     """Whether the earlier record's attention section was made with the installed SageAttention wheel (the fork
-    reads the section only then: modules/sage.py `_stored`); a section of another wheel is measured again."""
+    reads the section only then: modules/sage.py `_stored`); a section of another wheel is measured again, and so is
+    a Turing card's without the race of the int8 P.V twin (sage.int8pv_race_lacking; Spellcast3D's installer runs
+    --only sage for it)."""
     from pixal3d.modules import sage
 
     section = earlier.get("sage") or {}
-    return bool(section) and section.get("wheel") == sage._wheel_version()
+    return (bool(section) and section.get("wheel") == sage._wheel_version()
+            and not sage.int8pv_race_lacking(section))
 
 
 def _merged(earlier: dict, added: dict) -> dict:
@@ -604,7 +607,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         say(f"the earlier calibration stands: {len(lacking)} new convolution shapes are measured"
             if lacking else "the earlier calibration stands: no new convolution shapes to measure")
         if "sage" not in skip:
-            say("the SageAttention wheel changed since: its kernels are timed again")
+            say("the attention kernels are timed again (another SageAttention wheel, or a race the record lacks)")
     began = time.monotonic()
     from pixal3d.modules import precision
 

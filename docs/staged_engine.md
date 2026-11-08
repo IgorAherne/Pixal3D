@@ -230,6 +230,11 @@ samples that flip the most), and the engine marks each block's self-attention mo
 record of this wheel, the first use) races the whole int8 call against the fp16 one and keeps it only where it is
 5 % faster at every size (`sage._race_int8pv`, `INT8PV_MARGIN`; the record's "sage" section carries "int8pv"),
 so no card gets slower; `PIXAL3D_INT8PV=off` keeps the fp16 kernel for every block, `force` skips the race.
+The wheel's Turing extension (post7, `_qattn_sm75`) carries the same twin on Turing's mma shapes with its own v
+quantiser, wired the same way (the self-check, the marked blocks, the race - the install's trial records it in the
+"sage" section, `_turing_int8pv_trial`), but on sm_7x an unset switch keeps the fp16 kernel
+(`sage.INT8PV_TURING_DEFAULT = False`): it serves only under `PIXAL3D_INT8PV=on` (where the race found it 5 %
+faster) or `force`, until the user decides on its end-to-end judgement on an RTX 2070.
 
 Two savings around the attention change no bit. A guided sampling runs the flow once on the prop's conditioning
 and once on an all-zero conditioning per step inside the guidance interval (hr and lr: 9 of 21 passes, ss: 10 of

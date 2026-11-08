@@ -90,7 +90,10 @@ with an int8 P.V twin raced as on sm_8x). Neither runs in a process until the in
 this card at the flows' sizes and recorded so (`calibrate` -> `_old_card_trial`, in a child process: a kernel
 that faults takes its process's CUDA context with it, which must never happen to the engine; the record's
 "candidate_ok"); without that record the card's SDPA serves, except under a forced profile (PIXAL3D_PRECISION: a
-developer's test of another card's path).
+developer's test of another card's path). The Turing extension carries the int8 P.V twin too (INT8PV_OP on Turing's
+mma shapes, with its own v quantiser): the calibration's trial times it against the fp16 op as on sm_8x and records
+the race, but it serves only where PIXAL3D_INT8PV asks for it (on / force) while INT8PV_TURING_DEFAULT is False -
+the same marked blocks, the same self-check and race as on sm_8x.
 """
 
 from __future__ import annotations
@@ -196,6 +199,8 @@ INT8PV_OP = "qk_int8_sv_i8_accum_i32_attn_inst_buf_sc3d"   # torch.ops.sageatten
 INT8PV_MARGIN = 0.05        # the int8 P.V kernel serves only where it is at least this much faster than the fp16 P.V
 #                             kernel at every size timed (the user's rule: no card may get slower; the two round
 #                             differently, so a card that gains nothing keeps the fp16 kernel's numbers)
+INT8PV_TURING_DEFAULT = False   # what an unset PIXAL3D_INT8PV means on sm_7x (RTX 20xx): the fp16 P.V kernel for every
+#                                 block; the user decides after the twin's end-to-end judgement on an RTX 2070
 
 
 def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
@@ -354,27 +359,30 @@ def _old_card_unchecked(device: torch.device, name: str) -> Optional[str]:
     return "the install's calibration has not run it on this card (python -m pixal3d.calibrate)"
 
 
-def _old_card_trial(device: torch.device) -> dict:
+def _old_card_trial(device: torch.device, progress: Optional[Callable[[dict], None]] = None) -> dict:
     """The kernel of a card below sm_80 tried on this card, as the calibration's child process runs it: the
     self-check's table (the 3 % bar of _check), then calls at RACE_TOKENS' sizes, timed (the flows' sizes: a kernel
-    that faults does so here, not in the engine), and on sm_6x the int8 P.V call against the fp32 P.V one on the
-    table and in the race (_race_int8pv, CALIBRATION_RACE). Returns the record's fields: "candidate",
-    "candidate_ok", "why", "timings", "summary", and on sm_6x "int8pv", "int8pv_timings", "int8pv_summary",
-    "int8pv_why"."""
+    that faults does so here, not in the engine), and its int8 P.V twin against it on the table and in the race
+    (_race_int8pv, CALIBRATION_RACE; sm_6x unless PIXAL3D_INT8PV is off, sm_7x always: `_turing_int8pv_trial`).
+    `progress` is given the fields once the candidate's own trial has passed, before its twin runs. Returns the
+    record's fields: "candidate", "candidate_ok", "why", "timings", "summary", and where the twin was tried "int8pv",
+    "int8pv_timings", "int8pv_summary", "int8pv_why"."""
     major, _minor = precision.profile().capability or torch.cuda.get_device_capability(device)
     name, call, label = _old_card_candidate(major)
     found: dict = {"candidate": name, "candidate_ok": False}
     if call is None:
         found["why"] = f"the installed wheel has no {name} kernel"
         return found
+    told = (lambda part: progress({**found, **part})) if progress is not None else None
     try:
-        return {**found, **_old_card_trial_run(device, major, call, label)}
+        return {**found, **_old_card_trial_run(device, major, call, label, told)}
     except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: recorded, SDPA serves
         found["why"] = f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}"
         return found
 
 
-def _old_card_trial_run(device: torch.device, major: int, call: Callable, label: str) -> dict:
+def _old_card_trial_run(device: torch.device, major: int, call: Callable, label: str,
+                        progress: Optional[Callable[[dict], None]] = None) -> dict:
     found: dict = {}
     q, k, vs, want_out = _check_table(device)
 
@@ -408,6 +416,10 @@ def _old_card_trial_run(device: torch.device, major: int, call: Callable, label:
     found.update(candidate_ok=True, why=f"{label} ran at the flows' sizes",
                  timings=[{"tokens": n, "ms": round(ms, 3)} for n, ms in rows],
                  summary=", ".join(f"{n:,} tokens {ms:.2f} ms" for n, ms in rows))
+    if progress is not None:
+        progress(dict(found))
+    if major == 7:
+        found.update(_turing_int8pv_trial(device, call, q, k, vs, off))
     if major == 6 and int8pv_switch() != "off":
         int8 = _pascal_call(_pascal_op(), True)
         got = int8(q, k, vs)
@@ -427,17 +439,58 @@ def _old_card_trial_run(device: torch.device, major: int, call: Callable, label:
     return found
 
 
+def _turing_int8pv_trial(device: torch.device, fp16: Callable, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor,
+                         off: Callable[[torch.Tensor], Optional[str]]) -> dict:
+    """The Turing int8 P.V twin in the calibration's trial, after the fp16 op passed: the self-check's table (`off`,
+    the 3 % bar), then the race against the fp16 call (_race_int8pv, CALIBRATION_RACE). Timed whatever
+    PIXAL3D_INT8PV says: the record holds how fast the twin is on this card, the switch decides in the engine
+    whether it serves. Always returns "int8pv" (False where the wheel lacks the twin, it answers wrongly or raises),
+    so that the race counts as made (int8pv_race_lacking); a failure here leaves the fp16 op's trial standing."""
+    def left_out(why: str) -> dict:
+        return {"int8pv": False, "int8pv_summary": "not timed", "int8pv_why": f"the int8 P.V kernel is left out: {why}"}
+
+    try:
+        op = _turing_int8pv_op()
+        if op is None:
+            return left_out("the installed wheel has no int8 P.V kernel for sm_75")
+        int8 = _turing_int8pv_call(op)
+        got = int8(q, k, vs)
+        torch.cuda.synchronize(device)
+        why = off(got)
+        del got
+        if why is not None:
+            return left_out(why)
+        wins, line, rows8 = _race_int8pv(device, fp16, int8, CALIBRATION_RACE)
+    except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the fp16 op serves
+        return left_out(f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}")
+    return {"int8pv": wins, "int8pv_why": line,
+            "int8pv_timings": [{"tokens": n, "fp16_ms": round(a, 3), "int8_ms": round(b, 3)} for n, a, b in rows8],
+            "int8pv_summary": ", ".join(f"{n:,} tokens {a:.2f} -> {b:.2f} ms ({100 * (b / a - 1):+.1f} %)"
+                                        for n, a, b in rows8) or "not timed"}
+
+
+def int8pv_race_lacking(section: object) -> bool:
+    """Whether a calibration record's "sage" section lacks the race of the int8 P.V twin that `_old_card_trial` now
+    makes on sm_7x: a Turing section whose fp16 op ran at the flows' sizes, without "int8pv". The installer's due
+    rule (code/spellcast/install/components.py in Spellcast3D) is the same."""
+    return (isinstance(section, dict) and section.get("candidate") == "turing" and bool(section.get("candidate_ok"))
+            and "int8pv" not in section)
+
+
 def _old_card_trial_in_child(major: int, minor: int) -> dict:
     """`_old_card_trial` in a child process with this process's environment and the fork on its path: a kernel
     that faults takes its process's CUDA context with it, so the parent (the calibration) stays up and records the
-    failure, and the engine never tries that kernel on this card. The child's last line of JSON is the result."""
+    failure, and the engine never tries that kernel on this card. The child's last line of JSON is the result; it
+    also prints the candidate's fields before its int8 P.V twin runs, so a twin that takes the process down leaves
+    the candidate's own trial standing (the twin recorded as left out)."""
     import json
     import subprocess
     import sys
 
     name = OLD_CARD.get(major, f"sm_{major}{minor}")
     code = ("import json, torch\nfrom pixal3d.modules import sage\n"
-            "print(json.dumps(sage._old_card_trial(torch.device('cuda'))), flush=True)")
+            "say = lambda found: print(json.dumps(found), flush=True)\n"
+            "say(sage._old_card_trial(torch.device('cuda'), progress=say))")
     try:
         run = subprocess.run([sys.executable, "-c", code], cwd=str(Path(__file__).resolve().parents[2]),
                              env=os.environ.copy(), capture_output=True, text=True, encoding="utf-8",
@@ -446,14 +499,22 @@ def _old_card_trial_in_child(major: int, minor: int) -> dict:
         return {"candidate": name, "candidate_ok": False, "summary": "not run",
                 "why": f"the trial did not finish in {TRIAL_SECONDS} s"}
     lines = [line for line in run.stdout.splitlines() if line.startswith("{")]
-    if run.returncode == 0 and lines:
+    found = None
+    if lines:
         try:
             found = json.loads(lines[-1])
-            found.setdefault("summary", found.get("why", ""))
-            return found
         except ValueError:
-            pass
+            found = None
+    if found is not None and run.returncode == 0:
+        found.setdefault("summary", found.get("why", ""))
+        return found
     tail = " | ".join((run.stderr or run.stdout).strip().splitlines()[-3:])
+    if found is not None and found.get("candidate_ok") and "int8pv" not in found:
+        found.setdefault("summary", found.get("why", ""))
+        found.update(int8pv=False, int8pv_summary="not timed",
+                     int8pv_why=f"the int8 P.V kernel is left out: the trial process ended with code "
+                                f"{run.returncode} while it ran: {tail[:300]}")
+        return found
     return {"candidate": name, "candidate_ok": False, "summary": "the trial failed",
             "why": f"the trial process ended with code {run.returncode}: {tail[:300]}"}
 
@@ -478,6 +539,44 @@ def _turing_op() -> Optional[Callable]:
         return getattr(torch.ops.sageattention_qattn_sm75, TURING_OP)
     except (AttributeError, RuntimeError):
         return None
+
+
+def _turing_int8pv_op() -> Optional[Callable]:
+    """The Turing extension's int8 P.V op (INT8PV_OP in _qattn_sm75, beside its v quantiser), or None for a wheel
+    without it."""
+    if _turing_op() is None:        # (imports the extension)
+        return None
+    try:
+        ops = torch.ops.sageattention_qattn_sm75
+        getattr(ops, "quant_per_block_int8_v_cuda")
+        return getattr(ops, INT8PV_OP)
+    except (AttributeError, RuntimeError):
+        return None
+
+
+def _turing_int8pv_call(op: Callable) -> Callable:
+    """The int8 P.V attention on sm_7x ([B, N, H, 128] NHD fp16 -> the same): _int8pv_call's steps, with the v
+    quantiser of the Turing extension (sageattention.quant.per_block_int8_v imports _qattn_sm80, which a build for
+    sm_75 alone lacks; the extension compiles the same quantiser source)."""
+    from sageattention.quant import per_warp_int8
+
+    quantise_v = torch.ops.sageattention_qattn_sm75.quant_per_block_int8_v_cuda
+
+    def run(q, k, v):
+        torch.cuda.set_device(v.device)
+        km = k.mean(dim=1, keepdim=True)
+        q_int8, q_scale, k_int8, k_scale = per_warp_int8(q, k, km, tensor_layout="NHD", BLKQ=128, WARPQ=16, BLKK=64)
+        b, n, h, d = v.shape
+        padded = (n + 63) // 64 * 64
+        v_int8 = torch.empty((b, h, d, padded), dtype=torch.int8, device=v.device)
+        v_scale = torch.empty((b, h, padded // 64, d), dtype=torch.float32, device=v.device)
+        v_mean = torch.empty((b, h, d), dtype=torch.float32, device=v.device)
+        quantise_v(v, v_int8, v_scale, v_mean, 0, 1)
+        o = torch.empty(q.size(), dtype=q.dtype, device=q.device)
+        op(q_int8, k_int8, v_int8, o, q_scale, k_scale, v_scale, v_mean, 0, 0, 2, q.size(-1) ** -0.5, 0)
+        return o
+
+    return run
 
 
 def _pascal_op() -> Optional[Callable]:
@@ -709,13 +808,18 @@ def _choose(device: torch.device, cands: dict, tried: dict[str, Optional[torch.T
     return _by_length(cuda[0], triton[0], ranges), f"{cuda[1]}; at {text} tokens {triton[1]}"
 
 
-def int8pv_switch() -> str:
+def int8pv_switch(major: Optional[int] = None) -> str:
     """PIXAL3D_INT8PV: "on" / unset (the int8 P.V kernel where the wheel has it, after its self-check and the
-    race), "off" (never), "force" (developers: without the race)."""
+    race), "off" (never), "force" (developers: without the race). Unset on a card whose capability's major is
+    `major` 7 (Turing): INT8PV_TURING_DEFAULT decides ("off" while it is False)."""
     text = os.environ.get("PIXAL3D_INT8PV", "").strip().lower()
     if text in _OFF:
         return "off"
-    return "force" if text == "force" else "on"
+    if text == "force":
+        return "force"
+    if text == "" and major == 7 and not INT8PV_TURING_DEFAULT:
+        return "off"
+    return "on"
 
 
 def _int8pv_op() -> Optional[Callable]:
@@ -794,30 +898,43 @@ def _race_int8pv(device: torch.device, fp16: Callable, int8pv: Callable,
                    f"faster at every size timed: {text} ({seconds:.2f} s)"), rows
 
 
+def _int8pv_candidate(major: int) -> tuple[Optional[Callable], str]:
+    """The int8 P.V call of a card whose capability's major is `major`, and its label: on sm_8x INT8PV_OP of
+    _qattn_sm80, on sm_7x its twin in _qattn_sm75, on sm_6x the Pascal op's int8 P.V; (None, "") where the wheel
+    has none."""
+    if major == 8:
+        op = _int8pv_op()
+        return ((_int8pv_call(op) if op is not None else None),
+                f"{INT8PV_OP} (int8 P.V: u8 P per 64-key block, v per block and channel)")
+    if major == 7:
+        op = _turing_int8pv_op()
+        return ((_turing_int8pv_call(op) if op is not None else None),
+                f"{INT8PV_OP} for sm_75 (int8 P.V: u8 P per 64-key block, v per block and channel)")
+    if major == 6:
+        op = _pascal_op()
+        return ((_pascal_call(op, True) if op is not None else None),
+                f"{PASCAL_OP} (int8 P.V by dp4a: u8 P per 32-key block, v per block and channel)")
+    return None, ""
+
+
 def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor,
                   want_out: torch.Tensor) -> None:
-    """The int8 P.V kernel beside the chosen fp16 one (`_kernel_int8pv`): where the wheel has the op, the switch
-    allows it and the card is sm_8x, it runs once on the self-check's table against fp32 attention (the 3 % bar
+    """The int8 P.V kernel beside the chosen fp16 one (`_kernel_int8pv`): where the wheel has the op for the card
+    (sm_8x, sm_7x, sm_6x: `_int8pv_candidate`) and the switch allows it (int8pv_switch: on sm_7x only when asked
+    for, INT8PV_TURING_DEFAULT), it runs once on the self-check's table against fp32 attention (the 3 % bar
     of _check; it measures ~1.5 % there, the fp16 kernel ~1.2 %), then serves where the calibration record says
     so, or where it wins the race against the fp16 call (PIXAL3D_INT8PV=force: without the race). Off, or any
     failure, keeps the fp16 kernel for every block (the numbers as before)."""
     global _kernel_int8pv, KERNEL_INT8PV
     _kernel_int8pv, KERNEL_INT8PV = None, ""
-    switch = int8pv_switch()
-    if switch == "off" or _kernel is None:
+    if _kernel is None:
         return
     try:
         major, _minor = precision.profile().capability or torch.cuda.get_device_capability(device)
-        if major == 8:
-            op = _int8pv_op()
-            call = _int8pv_call(op) if op is not None else None
-            what = f"{INT8PV_OP} (int8 P.V: u8 P per 64-key block, v per block and channel)"
-        elif major == 6:
-            op = _pascal_op()
-            call = _pascal_call(op, True) if op is not None else None
-            what = f"{PASCAL_OP} (int8 P.V by dp4a: u8 P per 32-key block, v per block and channel)"
-        else:
-            call = None
+        switch = int8pv_switch(major)
+        if switch == "off":
+            return
+        call, what = _int8pv_candidate(major)
         if call is None:
             return
         got = call(q, k, vs)

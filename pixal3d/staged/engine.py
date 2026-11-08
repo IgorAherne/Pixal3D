@@ -32,7 +32,7 @@ import torch
 
 from ..pipelines import samplers
 from . import parts
-from ..modules import int8, sage
+from ..modules import fp16acc, int8, sage
 from .runner import PartContext, PipelineArgs, StagedRunner
 from .types import EngineOptions, Event, Hooks, PropRequest
 
@@ -53,7 +53,8 @@ def _prepare_flow(model: Any, kind: str = "", checkpoint: str = "") -> Any:
     once its weights are on the card (the loader's convert hook): SageAttention's scaling of v folded into its
     weights when the switch is on (modules/sage.py, exact), then its token-sized linears as int8 GEMMs where
     PIXAL3D_INT8's policy says so for that kind (modules/int8.py; the fold comes first so that the int8 scales
-    carry it)."""
+    carry it), and the ss / lr flows' linears in fp16 with fp16 accumulation where PIXAL3D_FP16ACC asks for it
+    (modules/fp16acc.py: off by default)."""
     try:
         from ..modules.sparse import config as sparse_config
 
@@ -65,7 +66,7 @@ def _prepare_flow(model: Any, kind: str = "", checkpoint: str = "") -> Any:
     except Exception as exc:        # noqa: BLE001 - a network that cannot be folded runs as before
         print(f"[SAGE] the fold of {type(model).__name__} failed ({type(exc).__name__}: {str(exc)[:200]}); the "
               f"network runs unfolded", flush=True)
-    return int8.convert(model, kind, checkpoint=checkpoint)
+    return fp16acc.convert(int8.convert(model, kind, checkpoint=checkpoint), kind)
 
 
 def _import_ahead() -> None:
