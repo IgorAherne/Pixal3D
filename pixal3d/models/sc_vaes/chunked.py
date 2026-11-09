@@ -42,7 +42,7 @@ kept in its spatial cache (modules/sparse/conv/conv_spconv.py `subm_rows`; whole
 - the products on torch.mm (sm_61) are spconv's Native sums - centre, offsets 0..26, bias, one fp16 rounding an
   offset. The whole levels' convolutions are the whole-table decode's own calls (unpadded: today's calls on any
   card); every call that stands in for one - a box's, a slab's, a row subset's - has at least
-  products_floor.floor("products") rows a product (padded with zero rows): from there cuBLAS gives a row the
+  products_floor.floor_for(its shape) rows a product (padded with zero rows): from there cuBLAS gives a row the
   same bits whatever the call's size, for the shapes the boxes and slabs run (measured at install, the record's
   "decode_products"). An offset the whole level pairs fewer rows for (0 < n < the floor) is the whole level's own
   call once (conv_spconv.whole_offset_products), and every slab or box adds its rows of it at that offset's turn
@@ -56,8 +56,22 @@ kept in its spatial cache (modules/sparse/conv/conv_spconv.py `subm_rows`; whole
   a decode that gets here all the same says so). Where the record found a launch-boundary band for the output layer
   (products_floor.boundary_band) the fine rows before it are kept and, for a fine level in the band, the output
   layer makes the whole decode's own call. Without this card's ok decode_products section, or where it found a
-  shape the boxes call with no such floor (products_floor.exact() False), spconv does not decode in boxes
-  (`backend`).
+  shape the boxes call with no such floor at both levels the boxes may start at (products_floor.exact() False),
+  spconv does not decode in boxes (`backend`).
+- the level-4 form (Spellcast3D round P; products_floor.box_level() 4): where the record makes a level-3 shape
+  whole-only (its padded calls cannot keep the whole call's bits: the real GTX 1080 Ti's 128 -> 128 product), levels
+  0-3 are decoded whole - level 3's convolutions and subdivision head as the whole-table decode makes them, its MLP in
+  BOX_WINDOW-row calls where both layers are box-safe at the level's size (`_level_windows`) - and the boxes start at
+  the up-block to the finest level (boxes of level-3 voxels, halo 2: `_finest_in_boxes`), each slab's and box's calls
+  padded to their own shape's floor (products_floor.floor_for). The finest level's size is then known before the
+  boxes: above the output layer's reach on the card (products_floor.output_whole) the boxes gather its normalised fp32
+  input rows into one table (level 3's table meanwhile in RAM, HOST_LEVEL3) and the output layer makes the whole
+  decode's one call on it; else the boxes' own windows. Every row is the unwindowed whole decode's. A level-3 count
+  in a launch-boundary band of a shape the boxes stand in for is taken from the whole level's own call (the up-block's
+  conv1 offsets and centre: conv_spconv.whole_offset_products, their products in RAM; the MLP: whole-level calls,
+  `_level_mlp_windows`) where that call fits the card's room beside what it holds; where it does not, the boxes'
+  own calls are made and a warning says the band's last rows may differ (the planner does not count those calls:
+  a few props in a hundred land in such a band, and their whole calls are 2-2.5 GiB).
 
 PIXAL3D_CHUNK_VOXELS = n (> 0) decodes every decode that can be decoded in boxes in boxes of about n fine voxels,
 whatever `decoder.chunk_voxels` says (0: none in boxes) - for the identity checks of a prop the memory model would
@@ -91,6 +105,13 @@ NORM_SLAB_ROWS = 1 << 16    # rows normalised at a time (LayerNorm32 makes two f
 BOX_WINDOW = 1 << 16        # rows of every Linear call inside a box (a box's tables are padded to it)
 KERNEL_VOLUME = 27
 MIN_BOX = 8                 # level-2 voxels: a box is not cut below this side
+HOST_LEVEL3 = True          # the level-4 form with the output layer's whole call: level 3's table in RAM while the
+#                             boxes run beside the whole fine level's fp32 table (64 bytes a fine voxel off the card).
+#                             Pageable (round P's review): torch's pinned host cache rounds a block up to a power of
+#                             two and keeps it locked for the process's life (1 GiB for the tree's 0.74 GB), with no
+#                             fallback where Windows refuses to lock it; the boxes gather their rows through a
+#                             pageable index_select anyway, so only the one copy off the card is slower (parts.py
+#                             counts the table in the finish's RAM test: SPCONV_L4_RAM_*)
 FINE_PER_LEVEL3 = 4.6       # fine voxels per level-3 voxel the shape decoder's boxes are cut for (4.12-4.47 on the
 #                             golden props; the texture decoder knows its own)
 LAST: Dict[str, Any] = {}   # what the last chunked decode did (boxes, rows, seconds): for measuring
@@ -160,12 +181,73 @@ def _spconv() -> bool:
 
 def slices(up: Any, x: sp.SparseTensor) -> bool:
     """Whether a whole level x's up-block conv1 may run a slab of parents at a time with the whole call's values: on
-    flex_gemm where its split-K wrapper would not split the reference's call (reference_splitk); on spconv always
-    (the implicit GEMM's rows do not depend on the call; the products' offsets that pair fewer rows than the floor
-    are taken from the level's own calls: up_block, conv_spconv.whole_offset_products)."""
+    flex_gemm where its split-K wrapper would not split the reference's call (reference_splitk); on spconv where the
+    shape is box-safe (products_floor.box_safe: always on the implicit GEMM, whose rows do not depend on the call;
+    the products' offsets that pair fewer rows than the floor, or a count in a launch-boundary band, are taken from
+    the level's own calls: up_block, conv_spconv.whole_offset_products) - a whole-only shape makes the whole call."""
     if _spconv():
-        return True
+        from ...modules.sparse.conv import products_floor
+        return products_floor.box_safe("products", int(up.channels), 8 * int(up.out_channels))
     return reference_splitk(x.feats.shape[0], up.channels, 8 * up.out_channels) == 1
+
+
+def first_box_level(decoder: Any) -> int:
+    """The decoder level the boxes start at (forward_chunked): the second-last (3 of the five levels: round O's
+    form, and flex_gemm's), or on spconv where this card's record makes a shape of that level whole-only the last
+    (products_floor.box_level: level 3 decoded whole, the boxes from the up-block to the finest level on)."""
+    last = len(decoder.blocks) - 1
+    if _spconv():
+        from ...modules.sparse.conv import products_floor
+        if products_floor.box_level() == last:
+            return last
+    return last - 1
+
+
+def _level_windows(block: Any, rows: int, bands: bool = True) -> bool:
+    """Whether a whole level's ConvNeXt MLP (the level the level-4 form decodes whole before its boxes) may run in
+    BOX_WINDOW-row calls with the whole level's own calls' values: both layers box-safe, the level at least their
+    floors, and its size in neither layer's launch-boundary band (products_floor; `bands` False: the bands not
+    looked at) - else the whole-level calls."""
+    from ...modules.sparse.conv import products_floor
+    first, _, last = block.mlp
+    for kind, layer in (("mlp1", first), ("mlp2", last)):
+        ci, co = int(layer.in_features), int(layer.out_features)
+        if not products_floor.box_safe(kind, ci, co) or rows < products_floor.floor_for(kind, ci, co) \
+                or (bands and products_floor.in_band(kind, ci, co, rows)):
+            return False
+    return True
+
+
+def _level_mlp_windows(blocks: List[Any], rows: int, device: Any, itemsize: int = 2) -> Tuple[bool, str]:
+    """Whether the level-4 form's level 3 runs its ConvNeXt MLPs in BOX_WINDOW-row calls (`_level_windows` for every
+    block), and a note where its size is in a launch-boundary band: there the whole level's own calls - a hidden table
+    of rows x 4C beside the normalised rows, 1.25 KiB a row, about 2.5 GiB at 2^21 rows, which no planner figure
+    counts - are made only where they fit the card's room now (conv_spconv.fits); else the windows, with a warning
+    (the band's last rows may differ from the whole-table decode). A layer that is whole-only, or a level under the
+    floors, makes the whole calls whatever the room (parts.py counts them: SPCONV_L4_WHOLE_MLP_MIB_PER_KVOXEL)."""
+    if all(_level_windows(block, rows) for block in blocks):
+        return True, ""
+    if not all(_level_windows(block, rows, bands=False) for block in blocks):
+        return False, ""
+    from ...modules.sparse.conv import conv_spconv
+    first = blocks[0].mlp[0]
+    need = rows * (int(first.in_features) + int(first.out_features)) * itemsize
+    if conv_spconv.fits(need, device):
+        return False, f"level 3's {rows:,} rows in its MLP's launch-boundary band: the whole level's own calls"
+    note = (f"level 3's {rows:,} rows are in its MLP's launch-boundary band, but the whole level's calls "
+            f"({need / 2 ** 20:,.0f} MiB) do not fit the card now: the boxes' {box_window():,}-row windows instead "
+            f"(the band's last rows may differ from the whole-table decode)")
+    print(f"[CHUNKED] WARNING: {note}", flush=True)
+    return True, note
+
+
+PHASE_HOOK: Optional[Callable[[str], None]] = None     # called at the decode's phase ends ("whole", "boxes",
+#                                                        "tail"): for measuring their peaks (None in the product)
+
+
+def _phase(name: str) -> None:
+    if PHASE_HOOK is not None:
+        PHASE_HOOK(name)
 
 
 def min_call_rows() -> int:
@@ -359,11 +441,13 @@ def norm_silu(norm: Any, feats: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool, window: Optional[int] = None) -> sp.SparseTensor:
+def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool, window: Optional[int] = None,
+             pad: Optional[bool] = None) -> sp.SparseTensor:
     """SparseConvNeXtBlock3d: conv, then LayerNorm and the MLP on windows of rows, in place in the conv's output
     (`rowwise`; a box's windows are BOX_WINDOW rows, a whole level's COARSE_SLAB_BYTES of hidden rows unless
     `window` says how many; on spconv a whole level's are the level itself: the reference's own calls, see
-    `whole_level_calls`), then the input added in place."""
+    `whole_level_calls`), then the input added in place. `pad` (default `boxed`): every call exactly `window` rows
+    (a whole level in the boxes' windows: the level-4 form's level 3)."""
     h = conv(block.conv, x)
     if window is None:
         if boxed:
@@ -372,7 +456,7 @@ def convnext(block: Any, x: sp.SparseTensor, conv: Callable, boxed: bool, window
             window = max(1, h.shape[0])
         else:
             window = _slab_rows(block.mlp[0].out_features, budget=COARSE_SLAB_BYTES)
-    rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed,
+    rowwise(lambda rows: block.mlp(block.norm(rows)), h, h, window, pad=boxed if pad is None else pad,
             into=lambda rows, out: mlp_into(block, rows, out))
     h.add_(x.feats)
     return x.replace(h)
@@ -564,7 +648,7 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
     began = time.perf_counter()
     blocks, nb = decoder.blocks, decoder.num_blocks
     last = len(blocks) - 1                  # the finest level: no blocks of its own
-    start = last - 2                        # from its up-block on, in boxes
+    start = first_box_level(decoder) - 1    # the last level decoded whole: from its up-block on, in boxes
     pred = decoder.pred_subdiv
     subs: List[sp.SparseTensor] = []
     stats: Dict[str, Any] = {"boxes": 0}
@@ -583,10 +667,25 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
     else:
         h = decoder.from_latent(x).type(decoder.dtype)
     level_rows: Dict[int, int] = {}
+    windowed = False
+    if _spconv():
+        from ...modules.sparse.conv import conv_spconv
+        conv_spconv.BAND_NOTES.clear()      # what whole_offset_products leaves to the boxes (stats["band_notes"])
     for i in range(start + 1):
         level_rows[i] = int(h.feats.shape[0])
+        # the level-4 form's level 3, before its boxes: the MLP in the boxes' windows where they keep its bits
+        windowed = False
+        if (start == last - 1 and i == start and _spconv() and not windows() and BOXES
+                and chunk_voxels(decoder) > 0 and level_rows[i] >= box_window()):
+            windowed, note = _level_mlp_windows([blocks[i][j] for j in range(nb[i])], level_rows[i],
+                                                h.feats.device, h.feats.element_size())
+            if note:
+                stats["level3_band"] = note
         for j in range(nb[i]):
-            h = convnext(blocks[i][j], h, whole_conv, False)
+            if windowed:
+                h = convnext(blocks[i][j], h, whole_conv, False, window=box_window(), pad=True)
+            else:
+                h = convnext(blocks[i][j], h, whole_conv, False)
         sub = subdivision(i, h)
         if i == start:
             break
@@ -595,6 +694,12 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         h, _ = up_block(up, h, sub.feats > 0, None, whole_conv, sliced, forget_neighbors)
         decoder.trim()
     stats["whole_seconds"] = time.perf_counter() - began
+    _phase("whole")
+    if start == last - 1:
+        stats.update(form=4, level3_windows=windowed)
+        held = [h, sub]                     # handed over, so that level 3's table goes when the boxes are done
+        del h, sub
+        return _finest_in_boxes(decoder, x, held, subs, fields, stats, level_rows, began)
 
     x2, sub2 = h, sub.feats > 0
     up2, up3 = blocks[start][-1], blocks[start + 1][-1]
@@ -657,9 +762,11 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
             stats["level2_whole_offsets"] = sorted(whole2)
             stats["level2_whole_offsets_mib"] = round(sum(p.numel() * p.element_size() for _, p in whole2.values())
                                                       / 2 ** 20, 1)
+        if conv_spconv.BAND_NOTES:
+            stats["band_notes"] = list(conv_spconv.BAND_NOTES)
         # the output layer at a recorded launch boundary: the fine rows before it are kept and it makes the whole
         # decode's own call once the fine level's size is known (the texture decoder knows it now)
-        hold = not windows() and products_floor.has_boundary() and (pred or products_floor.boundary_band(rows4))
+        hold = not windows() and products_floor.output_may_be_whole() and (pred or products_floor.output_whole(rows4))
     forget_neighbors(x2)                    # the boxes build their own
     decoder.trim()
     margin = halo(decoder, start)
@@ -734,6 +841,7 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
         del piece, gpar, counts
         decoder.trim()
 
+    _phase("boxes")
     coords2 = x2.coords                     # level 2's features are no longer needed: not beside the assembly
     del x2, h
     if pred:
@@ -748,18 +856,156 @@ def forward_chunked(decoder: Any, x: sp.SparseTensor, guide_subs: Optional[List[
     if hold:
         from ...modules.sparse.conv import products_floor
         pre = out.pop("pre")
-        band = products_floor.boundary_band(rows4)
-        # in the band: the output layer's one call on the whole fine level, the whole decode's own; outside it the
-        # boxes' 64 Ki-row calls on the assembled rows (the same calls a box makes on its own rows)
+        band = products_floor.output_whole(rows4)
+        # in the band (or above the windows' reach): the output layer's one call on the whole fine level, the whole
+        # decode's own; else the boxes' 64 Ki-row calls on the assembled rows (the same calls a box makes on its own)
         rows_out = tail(decoder, pre, x.dtype, boxed=not band)
         del pre
         out = fields(rows_out, coords)
         del rows_out
         stats["tail"] = "the whole call (a launch-boundary band)" if band else "64 Ki calls on the assembled rows"
+    _phase("tail")
     stats.update(rows=[rows2, rows3, rows4], decoded_fine_rows=decoded, overhead=decoded / max(rows4, 1),
                  seconds=time.perf_counter() - began)
     LAST.clear()
     LAST.update(stats, boxed=True)
+    return out, coords, subs
+
+
+def _finest_in_boxes(decoder: Any, x: sp.SparseTensor, held: list, subs: List[sp.SparseTensor],
+                     fields: Callable[[torch.Tensor, torch.Tensor], Dict[str, torch.Tensor]], stats: Dict[str, Any],
+                     level_rows: Dict[int, int], began: float
+                     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor, List[sp.SparseTensor]]:
+    """forward_chunked's level-4 form (Spellcast3D round P): the levels down to the last but one were decoded whole
+    (`held` = [the last of them, its subdivision], emptied here: the whole level's own calls, its whole-only shapes
+    the whole-table decode's), so
+    the finest level's size is known before the boxes. The up-block to the finest level runs on boxes of level-3
+    voxels (a box and the voxels within halo() of it: conv1 on the parents within reach of the box's own fine
+    voxels, conv2 on their children, only the box's own children kept), and the output layer either in the boxes'
+    BOX_WINDOW-row calls or - above the windows' reach on this card or in a launch-boundary band
+    (products_floor.output_whole) - as the whole decode's one call on the whole fine level, its normalised fp32 rows
+    gathered from the boxes in the reference's order. Every row as the whole-table decode computes it."""
+    from .sparse_unet_vae import cast_norm_rows, forget_neighbors
+    from ...modules.sparse.conv import conv_spconv, products_floor
+
+    blocks = decoder.blocks
+    start = len(blocks) - 2
+    up = blocks[start][-1]
+    x3, sub = held
+    held.clear()
+    sub3 = sub.feats > 0
+    del sub
+    cnt3 = sub3.sum(dim=-1)
+    offs4 = torch.cumsum(cnt3, 0) - cnt3
+    rows3, rows4 = int(x3.feats.shape[0]), int(cnt3.sum())
+    boxed = BOXES and chunk_voxels(decoder) > 0 and min(rows3, rows4) >= box_window()
+    over = products_floor.beyond({**level_rows, start + 1: rows4})
+    if over:
+        stats["unverified"] = [list(o) for o in over]
+        print("[CHUNKED] WARNING: this decode's levels are larger than the whole calls this card's decode_products "
+              "measurement verified (" + ", ".join(f"level {lv}: {r:,} rows, verified {v:,}" for lv, r, v in over)
+              + "): its boxes may differ from the whole-table decode in those levels' rows", flush=True)
+    if not boxed:
+        if chunk_voxels(decoder) > 0:
+            stats["not_boxed"] = (f"a small shape: {rows3:,} level-3 rows, {rows4:,} fine ones (boxes from "
+                                  f"{box_window():,})" if BOXES else "BOXES off")
+        fine, _ = up_block(up, x3, sub3, None, whole_conv, slices(up, x3), forget_neighbors)
+        del x3
+        decoder.trim()
+        forget_neighbors(fine)
+        out = fields(tail(decoder, fine.feats, x.dtype, False), fine.coords)
+        LAST.clear()
+        LAST.update(stats, boxed=False, rows=[rows3, rows4], seconds=time.perf_counter() - began)
+        _phase("tail")
+        return out, fine.coords, subs
+
+    whole_out = products_floor.output_whole(rows4)
+    # the offsets of the level that pair fewer rows than the floor, or a count in a launch-boundary band: their
+    # products from the level's own calls, which every box takes its rows of
+    fixed = conv_spconv.whole_offset_products(up.conv1, x3, prep=lambda rows: norm_silu(up.norm1, rows))
+    if fixed:
+        stats["level3_whole_offsets"] = sorted(fixed)
+        for where, on_card in (("mib", True), ("ram_mib", False)):
+            stats[f"level3_whole_offsets_{where}"] = round(sum(p.numel() * p.element_size() for _, p in fixed.values()
+                                                               if p.is_cuda == on_card) / 2 ** 20, 1)
+    if conv_spconv.BAND_NOTES:
+        stats["band_notes"] = list(conv_spconv.BAND_NOTES)
+    forget_neighbors(x3)                    # the boxes build their own
+    decoder.trim()
+    margin = halo(decoder, start)
+    budget = max(1, int(chunk_voxels(decoder) * rows3 / max(rows4, 1)))
+    boxes = cut_boxes(x3.coords[:, 1:], margin, budget)
+    stats.update(boxes=len(boxes), halo=margin, budget_level3=budget, rows=[rows3, rows4],
+                 chunk_voxels=chunk_voxels(decoder), backend=backend(),
+                 tail="the whole call" if whole_out else f"{box_window():,}-row calls in the boxes")
+    layer = decoder.output_layer
+    device = x3.device
+    coords3, feats3 = x3.coords, x3.feats
+    del x3
+    normed: Optional[torch.Tensor] = None
+    if whole_out:                           # the output layer's input, the whole fine level's, filled box by box
+        if HOST_LEVEL3 and feats3.is_cuda:
+            # level 3's table off the card while the boxes run beside that fp32 table (the same values: a copy, in
+            # pageable RAM - HOST_LEVEL3)
+            moved = time.perf_counter()
+            feats3 = feats3.cpu()
+            stats["level3_on_host_mib"] = round(feats3.numel() * feats3.element_size() / 2 ** 20, 1)
+            stats["level3_to_host_s"] = round(time.perf_counter() - moved, 3)
+            decoder.trim()
+        normed = torch.empty((rows4, layer.in_features), dtype=x.dtype, device=device)
+    out: Optional[Dict[str, torch.Tensor]] = None
+    decoded = 0
+    for lo, hi in boxes:
+        d3 = distance(coords3[:, 1:], lo, hi)
+        g3 = (d3 <= margin).nonzero().squeeze(1)
+        dc = d3[g3]
+        del d3
+        rows = feats3[g3] if feats3.is_cuda else feats3.index_select(0, g3.cpu()).to(device)
+        xc = sp.SparseTensor(rows, coords3[g3])
+        del rows
+        par3 = (dc <= margin - 1).nonzero().squeeze(1)
+        fine, pidx3 = up_block(up, xc, sub3[g3], par3, conv_rows, True, forget_neighbors,
+                               fixed=(fixed, g3) if fixed else None)
+        del xc
+        own_par = dc[par3] == 0
+        if fine.feats.shape[0] == 0:        # nothing within reach is subdivided
+            del fine
+            decoder.trim()
+            continue
+        keep = own_par[pidx3].nonzero().squeeze(1)
+        decoded += int(fine.feats.shape[0])
+        gpar = g3[par3[own_par]]
+        counts = cnt3[gpar]
+        dest = torch.repeat_interleave(offs4[gpar], counts) + _rank(counts)
+        del g3, dc, par3, pidx3, own_par, gpar, counts
+        if normed is not None:
+            normed[dest] = cast_norm_rows(fine.feats[keep], x.dtype)
+        else:
+            piece = fields(tail(decoder, fine.feats[keep], x.dtype, True), fine.coords[keep])
+            if out is None:
+                out = {k: torch.empty((rows4, *v.shape[1:]), dtype=v.dtype, device=v.device) for k, v in piece.items()}
+            for k, v in piece.items():
+                out[k][dest] = v
+            del piece
+        del fine, keep, dest
+        decoder.trim()
+    _phase("boxes")
+    del feats3, fixed, cnt3, offs4
+    decoder.trim()
+    if normed is not None:
+        # the whole decode's own call of the output layer, on its whole normalised fine level (the fine coords made
+        # after it: not beside its input)
+        rows_out = torch.nn.Linear.forward(layer, normed)
+        del normed
+        coords, _, _ = children(coords3, sub3)
+        out = fields(rows_out, coords)
+        del rows_out
+    else:
+        coords, _, _ = children(coords3, sub3)
+    stats.update(decoded_fine_rows=decoded, overhead=decoded / max(rows4, 1), seconds=time.perf_counter() - began)
+    LAST.clear()
+    LAST.update(stats, boxed=True)
+    _phase("tail")
     return out, coords, subs
 
 

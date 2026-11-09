@@ -32,7 +32,7 @@ is the convolution of the rows `rows` of x only (models/sc_vaes/chunked.py, the 
         centre offset's product first, then offsets 0..26 ascending, each added into the output rows it pairs
         (one fp16 rounding per offset), then the bias - with two changes that keep every value: (i) a call that
         stands in for the whole table's (a box's, a slab's, a subset's: `reference` False) has no product call of
-        fewer than `products_floor.floor()` rows (M0, 8,192 unless the install measured the card higher): a
+        fewer than `products_floor.floor_for(shape)` rows (M0, 8,192 unless the install measured the shape higher): a
         smaller call is padded with zero rows and only its real rows are used, because cuBLAS chooses its kernel
         by the row count and some kernels round differently (sliced-K, split-K: measured on sm_86, round O), while
         from M0 rows on every call of the shapes the boxes run gives a row the same bits; the whole table's own
@@ -347,7 +347,49 @@ def _window() -> Optional[int]:
 
 
 Fixed = Tuple[dict, torch.Tensor]     # ({offset: (the whole level's output rows ascending, their product)}, the
-#                                       global row of each local output row)
+#                                       global row of each local output row). A product may lie in RAM (a band's whole
+#                                       call, whole_offset_products): its rows are copied to the card per call
+BAND_ROOM_MARGIN = 256 << 20           # free under the cap beside a band's whole call (whole_offset_products)
+BAND_NOTES: List[str] = []             # what the last whole_offset_products calls left to the boxes' own calls, for
+#                                        chunked's stats (cleared by the caller)
+
+
+def card_room(device: Any) -> Optional[int]:
+    """Bytes PyTorch may still allocate on `device`: the cap the staged loader set (set_per_process_memory_fraction)
+    less what is allocated, and at most what the card has free plus PyTorch's idle reserve; None off the card."""
+    device = torch.device(device)
+    if device.type != "cuda":
+        return None
+    free, total = torch.cuda.mem_get_info(device)
+    allocated = torch.cuda.memory_allocated(device)
+    room = free + torch.cuda.memory_reserved(device) - allocated
+    try:
+        fraction = torch.cuda.memory.get_per_process_memory_fraction(device)
+        room = min(room, int(fraction * total) - allocated)
+    except Exception:       # noqa: BLE001 - a torch without the question: the card's own figure
+        pass
+    return int(room)
+
+
+def fits(need: int, device: Any) -> bool:
+    """Whether `need` bytes fit the card's room now with BAND_ROOM_MARGIN beside them (always off the card)."""
+    room = card_room(device)
+    return room is None or need + BAND_ROOM_MARGIN <= room
+
+
+def _rows_of(product: torch.Tensor, index: torch.Tensor) -> torch.Tensor:
+    """product[index] on index's device: a product kept in RAM is gathered there and copied (the same values)."""
+    if product.device == index.device:
+        return product.index_select(0, index)
+    return product.index_select(0, index.to(product.device)).to(index.device)
+
+
+def _hits(fixed: Fixed, k: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    """(this call's output rows that offset k's whole-level entry covers, their rows in the entry)."""
+    whole_dest = fixed[0][k][0]
+    at = torch.searchsorted(whole_dest, fixed[1]).clamp_(max=max(whole_dest.shape[0] - 1, 0))
+    hit = (whole_dest.index_select(0, at) == fixed[1]).nonzero().squeeze(1) if whole_dest.shape[0] else at[:0]
+    return hit, at.index_select(0, hit)
 
 
 def products(features: torch.Tensor, filters: torch.Tensor, pairs: LevelPairs, rows: Optional[torch.Tensor] = None,
@@ -355,18 +397,24 @@ def products(features: torch.Tensor, filters: torch.Tensor, pairs: LevelPairs, r
              window: Optional[int] = None, fixed: Optional[Fixed] = None) -> torch.Tensor:
     """The submanifold convolution of the output rows `rows` (int64, ascending; None: all) in spconv's Native order
     with the products on torch.mm (the module's docstring): the centre offset's product, then offsets 0..kv-1
-    ascending added in, then the bias. `floor`: the smallest product call (1: none; None: the install's,
-    products_floor.floor()); `window`: every product call of exactly that many rows (0: none; None: the install's
+    ascending added in, then the bias. `floor`: the smallest product call (1: none; None: the install's for this
+    shape, products_floor.floor_for); `window`: every product call of exactly that many rows (0: none; None: the install's
     windows-everywhere mode, `_window`). `fixed`: offsets whose product comes from the whole level's own call
-    (whole_offset_products: the offsets that pair fewer rows than the floor there), with the global row of each of
-    this call's output rows - added in at their offset's turn, in place of this table's own product."""
-    floor = products_floor.floor() if floor is None else max(1, floor)
-    window = _window() if window is None else (window or None)
+    (whole_offset_products: the offsets that pair fewer rows than the floor there, or a count in a launch-boundary
+    band), with the global row of each of this call's output rows - added in at their offset's turn, in place of this
+    table's own product; the centre's entry (a level whose own count is in a band) replaces the rows it covers of this
+    call's centre product before any offset is added."""
     co, ci = filters.shape[0], filters.shape[-1]
+    floor = products_floor.floor_for("products", ci, co) if floor is None else max(1, floor)
+    window = _window() if window is None else (window or None)
     w = filters.reshape(co, -1, ci)                         # [Co, kv, Ci], the views indice_conv_torch multiplies by
     kv = w.shape[1]
     centre = kv // 2
     out = _product(features, rows, w[:, centre].t(), floor, window)
+    if fixed is not None and centre in fixed[0]:
+        hit, at = _hits(fixed, centre)
+        if hit.shape[0]:
+            out.index_copy_(0, hit, _rows_of(fixed[0][centre][1], at))
     if rows is not None:
         where = torch.full((pairs.n,), -1, dtype=torch.int32, device=features.device)
         where[rows] = torch.arange(rows.shape[0], dtype=torch.int32, device=features.device)
@@ -374,11 +422,9 @@ def products(features: torch.Tensor, filters: torch.Tensor, pairs: LevelPairs, r
         if k == centre:
             continue
         if fixed is not None and k in fixed[0]:
-            whole_dest, whole_product = fixed[0][k]
-            at = torch.searchsorted(whole_dest, fixed[1]).clamp_(max=max(whole_dest.shape[0] - 1, 0))
-            hit = (whole_dest.index_select(0, at) == fixed[1]).nonzero().squeeze(1) if whole_dest.shape[0] else at[:0]
+            hit, at = _hits(fixed, k)
             if hit.shape[0]:
-                _accumulate(out, hit, whole_product.index_select(0, at.index_select(0, hit)))
+                _accumulate(out, hit, _rows_of(fixed[0][k][1], at))
             continue
         dest, src = pairs.offsets[k]
         if rows is not None:
@@ -445,29 +491,67 @@ def subm_rows(conv, x: SparseTensor, rows: Any = None, reference: bool = False,
 
 
 def whole_offset_products(conv, x: SparseTensor, prep: Any = None, floor: Optional[int] = None) -> dict:
-    """The offsets of x's whole level that pair fewer rows than the floor (0 < n < floor), each with the whole-table
-    decode's own product of it: {offset: (output rows ascending, int64; prep(rows) @ W_offset, the unpadded call)}.
-    A box or a slab of that level then takes those rows from here (`products`' `fixed`) instead of a padded call of
-    its own, whose rows could be another kernel's: the same bits in a bounded memory (each under floor x Co).
-    `prep`: what the convolution's input is made of the level's rows (a row-wise function: the up-block's norm and
-    SiLU). Empty on the implicit GEMM and in the windows-everywhere mode."""
+    """The offsets of x's whole level that pair fewer rows than the shape's floor (0 < n < floor), or a count of rows
+    in one of the shape's launch-boundary bands (products_floor.in_band: the whole call's last rows are another
+    kernel's there), each with the whole-table decode's own product of it: {offset: (output rows ascending, int64;
+    prep(rows) @ W_offset, the unpadded call)}. A box or a slab of that level then takes those rows from here
+    (`products`' `fixed`) instead of a call of its own, whose rows could be another kernel's: the same bits. Under
+    the floor each entry stays on the card (under floor x Co rows). A band's entry - its whole product, n x Co (2 GiB
+    for 2^21 rows of 128 -> 512), a count in about one in a thousand of a million rows - is copied to RAM once made
+    (pageable: the boxes gather their rows there and copy them up, the same values), so the card holds it only while
+    the call is made; and that call is made only where the card has room for its input and output beside what it
+    holds (card_room): else the offset is left to the boxes' own calls, whose rows in the band's tail may then differ,
+    and BAND_NOTES and a warning say so. The same for the level's own centre call where the level's row count is in a
+    band (its rows from products_floor.band_from on). `prep`: what the convolution's input is made of the level's rows
+    (a row-wise function: the up-block's norm and SiLU). Empty on the implicit GEMM and in the windows-everywhere
+    mode."""
     if path() != "products" or _window():
         return {}
-    floor = products_floor.floor() if floor is None else floor
-    pairs = level_pairs(conv, x)
     filters = conv.weight
     co, ci = filters.shape[0], filters.shape[-1]
+    floor = products_floor.floor_for("products", ci, co) if floor is None else floor
+    pairs = level_pairs(conv, x)
     w = filters.reshape(co, -1, ci)
+    itemsize = x.feats.element_size()
     found = {}
+
+    def banded(n: int, what: str) -> bool:
+        """Whether the band's whole call of n rows fits the card now (else noted, and left to the boxes)."""
+        need = n * (max(2 * ci, ci + co) if prep is not None else ci + co) * itemsize
+        if fits(need, x.feats.device):
+            return True
+        note = (f"{what} of {n:,} rows ({ci} -> {co}) is in a launch-boundary band, but its whole call "
+                f"({need / 2 ** 20:,.0f} MiB) does not fit the card now: the boxes' own calls instead (its last rows "
+                f"may differ from the whole-table decode)")
+        BAND_NOTES.append(note)
+        print(f"[SPCONV] WARNING: {note}", flush=True)
+        return False
+
     for k, pair in enumerate(pairs.offsets):
-        if pair is None or not 0 < pair[0].shape[0] < floor:
+        if pair is None or not pair[0].shape[0]:
+            continue
+        n = int(pair[0].shape[0])
+        band = n >= floor
+        if band and not products_floor.in_band("products", ci, co, n):
+            continue
+        if band and not banded(n, f"offset {k}"):
             continue
         dest, src = pair
         rows = x.feats.index_select(0, src)
         if prep is not None:
             rows = prep(rows)
-        found[k] = (dest.long(), torch.mm(rows.contiguous(), w[:, k].t()))
+        product = torch.mm(rows.contiguous(), w[:, k].t())
         del rows
+        found[k] = (dest.long(), product.cpu() if band else product)
+        del product
+    total, centre = int(x.feats.shape[0]), w.shape[1] // 2
+    lo = products_floor.band_from("products", ci, co, total) if total else None
+    if lo is not None and banded(total, "the centre"):
+        rows = x.feats if prep is None else prep(x.feats)
+        product = torch.mm(rows.contiguous(), w[:, centre].t())
+        del rows
+        found[centre] = (torch.arange(lo, total, device=x.feats.device), product[lo:].cpu())
+        del product
     return found
 
 
@@ -494,10 +578,18 @@ def _note_choices() -> None:
                   f"in boxes on it, so a 1536 prop that does not fit whole is made at 1024; measure it with "
                   f"`python -m pixal3d.calibrate --version <N> --only decode_products` (the calibration's "
                   f"\"Measure the graphics card again\")", flush=True)
+        elif products_floor.box_level() is None:
+            print(f"[SPCONV] WARNING: no decode in boxes on this card ({products_floor.plan()['why']}): a 1536 prop "
+                  f"that does not fit whole is made at 1024", flush=True)
+        elif products_floor.box_level() == 4 and not _window():
+            print("[SPCONV] the decode in boxes starts at level 4 on this card (level 3 decoded whole: "
+                  + (products_floor.plan().get("why_not_3") or "; ".join(
+                      f"{w['kind']} {w['ci']} -> {w['co']} {w['why']}" for w in products_floor.plan()["whole_only"]))
+                  + ")", flush=True)
     window = _window()
     if window:
-        print(f"[SPCONV] every GEMM of the decoders in windows of {window:,} rows (the install found a box shape "
-              f"whose rows change with the call's size: products_floor, the windows-everywhere mode)", flush=True)
+        print(f"[SPCONV] every GEMM of the decoders in windows of {window:,} rows (the windows-everywhere mode, "
+              f"forced by PIXAL3D_DECODE_WINDOW)", flush=True)
 
 
 def counts_at_least(conv, x: SparseTensor, floor: Optional[int] = None) -> bool:
@@ -507,7 +599,8 @@ def counts_at_least(conv, x: SparseTensor, floor: Optional[int] = None) -> bool:
     matters there) and in the windows-everywhere mode."""
     if path() != "products" or _window():
         return True
-    floor = products_floor.floor() if floor is None else floor
+    if floor is None:
+        floor = products_floor.floor_for("products", conv.weight.shape[-1], conv.weight.shape[0])
     pairs = level_pairs(conv, x)
     return all(pair[0].shape[0] == 0 or pair[0].shape[0] >= floor for pair in pairs.offsets if pair is not None)
 

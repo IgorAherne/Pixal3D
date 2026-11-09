@@ -1,32 +1,18 @@
 {
-  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post8-cp39-abi3-win_amd64.whl",
-  "sha256": "2cb32cf2164d9e6a2a0202dfda718bb9cd7c8d8159d23c924200604629d587ce",
-  "size_bytes": 21504557,
-  "built": "2026-11-08T15:43:29+00:00",
-  "build_seconds": 691,
+  "wheel": "sageattention-2.2.0+cu128torch2.8.0.post9-cp39-abi3-win_amd64.whl",
+  "sha256": "e7ee6463da6ed5eb0cb4959884d87c5c02d1ab4d66583466d004416bcc25b1de",
+  "size_bytes": 21660376,
+  "built": "2026-11-09T02:36:48+00:00",
+  "build_seconds": 660,
   "source": {
     "path": "C:\\_myDrive\\repos\\spellcast3d\\temp_code\\SageAttention-roundo",
-    "commit": "135263532720876f1864cf9ea6b28f793dbfec30",
-    "branch": "spellcast3d-round-o-pascal",
-    "uncommitted_files_sha256": {
-      "csrc/qattn/attn_cuda_sm61_variants.h": "b4badea467a468261b4e686eec487c6abdd3088338a8d8e11ac12b36717c811c",
-      "csrc/qattn/pascal/qattn_pascal_next.cu": "4bf85612bbb408f876bfe4143b66c07f082d462825a8dbac958806c79e33479c",
-      "csrc/qattn/pascal/variants/p61_n0.cu": "6e58a9b5091bea05d3d53d98f8dc686846cda77b9b4484e92dfee9ab88608b3f",
-      "csrc/qattn/pascal/variants/p61_s.cu": "f3f514b647e75821de469ccbeed84c0cf006eecfb15bf068c2b80b94e0877fa4",
-      "csrc/qattn/pascal/variants/p61_s24.cu": "1fc2c8a8746abf7eb0e71791bdbfbbf32fc291f9fcc02f0e410e77e1fae688be",
-      "csrc/qattn/pascal/variants/p61_s28.cu": "85e0a3e25a84484981c9438115acfd0c20d7cb476135c5c563773c2daf8ea93b",
-      "csrc/qattn/pascal/variants/p61_u24.cu": "fa3a098a705138a38a1db807b49212b8fa3f063498b122fa3d12c00c449214d2",
-      "csrc/qattn/pascal/variants/p61_u28.cu": "7a5d74c30f261ad737517bb0fdc3af6b9dd6ae987d27057567fd8d83dbf437d5",
-      "csrc/qattn/pascal/variants/p61_u44.cu": "195238126468171050147686a424a5603ca56f82e04135961293422e8c2c9561",
-      "csrc/qattn/pascal/variants/p61_variant_names.h": "cc5699d1e8c2f285984383dfb61c85962367ecb9dc7b1fda15f77a4a740026b5",
-      "csrc/qattn/pybind_sm61.cpp": "42448926eb2e699281914cf4f1fa3cdd135ee6b1fe02e1cb5dcf805978b1bcf6",
-      "setup.py": "d2b16945b85311336a778efc9c3116db909657310922c53a0696d4927159051c"
-    },
-    "uncommitted_files_note": "recomputed after the build (the build's own list missed the first status line); the files unchanged since"
+    "commit": "954bf705edaf7321b9ae9bb7815e648b4c102fa4",
+    "branch": "spellcast3d-round-p-pascal-attn",
+    "uncommitted_files_sha256": {}
   },
-  "what_for": "post7 plus the Pascal (sm_61) attention op's twins of Spellcast3D round O (_qattn_sm61: sageattn_pascal_u28 / _u44 / _s28 / _s24, the shipped op's bits with other code shapes, raced at install by the fork's sage.py); every other extension's source as post7's",
+  "what_for": "post8 plus the Pascal (sm_61) int8 P.V twin k64 of Spellcast3D round P (_qattn_sm61: sageattn_pascal_k64, 64 keys an iteration as the shipped kernel's two 32-key blocks in order, one score loop for both; its fp32 P.V the shipped kernel's code with the score loop unrolled fully; the shipped op's bits, raced at install by the fork's sage.py); every other extension's source as post8's",
   "build": {
-    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-o-pascal-wheels\\sage\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\ROUND-~4\\sage\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-o-pascal-wheels\\sage\\wheel-out",
+    "command": "C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-p-pascal-wheels\\sage\\venv\\Scripts\\python.exe -m pip wheel C:\\_myDrive\\repos\\SPELLC~1\\release\\cache\\wheels\\build\\ROCA37~1\\sage\\src --no-deps --no-build-isolation --disable-pip-version-check -v -w C:\\_myDrive\\repos\\spellcast3d\\release\\cache\\wheels\\build\\round-p-pascal-wheels\\sage\\wheel-out",
     "env": {
       "CUDA_HOME": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
       "CUDA_PATH": "C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.8",
@@ -34,7 +20,7 @@
       "MAX_JOBS": "6",
       "NVCC_THREADS": "1",
       "CUDA_VISIBLE_DEVICES": "-1",
-      "SAGEATTENTION_WHEEL_VERSION_SUFFIX": "+cu128torch2.8.0.post8",
+      "SAGEATTENTION_WHEEL_VERSION_SUFFIX": "+cu128torch2.8.0.post9",
       "SAGEATTENTION_SM80_PTX": "1",
       "TORCH_CUDA_ARCH_LIST": "6.1 7.5 8.0 8.6 8.9 9.0 12.0"
     },
@@ -95,9 +81,11 @@
     }
   },
   "wheel_files": 23,
-  "previous": "sageattention-2.2.0+cu128torch2.8.0.post7-cp39-abi3-win_amd64.whl",
+  "recipe": "code/devtools/pixal3d-lowmem/round-p/post9-wheel/build_post9.py (round O's build_wheels.py sage)",
+  "previous": "sageattention-2.2.0+cu128torch2.8.0.post8-cp39-abi3-win_amd64.whl",
   "against_previous": {
-    "summary": "every kernel of every extension SASS-identical to post7's (_fused 220, _qattn_sm61 25, _qattn_sm75 9, _qattn_sm80 408, _qattn_sm89 448, _qattn_sm90 64), 100 new ones (the 4 race twins' and the 3 developer twins' kernels in _qattn_sm61), the same file list, every Python file byte-equal",
-    "record": "code/logs/profiling/pixal3d-lowmem/round-o/pascal-kernels/compare-sage-post7-post8.json"
-  }
+    "summary": "every kernel of every extension SASS-identical to post8's (_fused 220, _qattn_sm61 125, _qattn_sm75 9, _qattn_sm80 408, _qattn_sm89 448, _qattn_sm90 64), 25 new ones (k64's kernels in _qattn_sm61), the same file list, every Python file byte-equal, _qattn_sm80's two compute_89 PTX files equal but for the per-build anonymous-namespace hashes",
+    "record": "code/logs/profiling/pixal3d-lowmem/round-p/post9-wheel/compare-sage-post8-post9.json"
+  },
+  "build_note": "nvcc 12.8 is not deterministic on k64's 16-bit-output int8 P.V kernels (qk_int8_attn_k64_kernel<__half> / <__nv_bfloat16>): the wheel's own nvcc command gave other sm_61 SASS for one of them in 1 of 5 runs (with one or all of the developer build's extra flags, the developer builds included: 4 of 7; where the PTX was kept, cicc's output differed by one ld.shared.u32 + add.s32), so a rebuild of this source can differ from this wheel in those two kernels; k64's fp32-output kernel (the one the Pascal profile runs) and its 22 other kernels came out the same in all 13 compilations of p61_k64.cu, every other source's kernels the same in the 3 full builds (code/devtools/pixal3d-lowmem/round-p/post9-wheel/repro_k64_obj.py)"
 }

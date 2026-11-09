@@ -100,12 +100,18 @@ GTX 10xx can time): the calibration's trial races them against the shipped op pe
 the record's "pascal_twins"), and a process takes the recorded twin once it gave the shipped op's bits on the
 self-check's table (`_pascal_twin`); the shipped op serves without a record, with an older wheel, or with
 PIXAL3D_PASCAL_TWIN=shipped (developers: =<twin> or "fp32=<twin>,int8=<twin>" forces one).
+The wheel from post10 also carries a precise Pascal op (PASCAL_PRECISE, Spellcast3D round P sage-bias: per-token
+scales and q's mean exact, ~30 % less error, other bits): the calibration's trial records its accuracy and timing on
+the card ("pascal_precise"), and where that record says ok it serves both P.V modes in place of the shipped op and its
+twins (PRECISE_DEFAULT; PIXAL3D_PASCAL_PRECISE=off keeps the shipped op, force skips the record). PIXAL3D_SAGE_FLOWS
+(developers) keeps the flows it leaves out on exact attention.
 """
 
 from __future__ import annotations
 
 import os
 import statistics
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -139,11 +145,43 @@ PASCAL_TWINS = ("u28", "u44", "s28", "s24")     # torch.ops.sageattention_qattn_
 #                     (Spellcast3D round O, the wheel from post8): PASCAL_OP's arithmetic in its order - the same bits
 #                     for every input - with another code shape: the main loop under Pascal's ~8 KB instruction cache
 #                     (the shipped one is 8,216 bytes; u28 its score loop unrolled by 2, u44 its P.V loop by 4) and
-#                     the P.V by channel slices (s28, s24: half the shared-memory traffic a key). No card of the round
-#                     could time them: the calibration's trial races them against the shipped op on the user's card
-#                     (`_pascal_twins_trial`) and the record's "pascal_twins" names the one that serves, per P.V mode
+#                     the P.V by channel slices (s28, s24: half the shared-memory traffic a key). A real GTX 1070 Ti
+#                     timed them after the round (0.4-2.8 % faster: under the margin); the calibration's trial races
+#                     them against the shipped op on the user's card
+#                     (`_pascal_twins_trial`) and the record's "pascal_twins" names the one that serves, per P.V mode.
+#                     Round P adds k64 (SageAttention branch spellcast3d-round-p-pascal-attn, the wheel from post9; an
+#                     older wheel lacks the op, so it is simply not present): the int8 P.V at 64 keys an
+#                     iteration as the shipped kernel's two 32-key blocks in order, one score loop reading a lane's q
+#                     rows once for both (about -11 % a call on a real GTX 1070 Ti at 5k-43.5k tokens, the same
+#                     bits); its fp32 P.V is the shipped kernel's code with the score loop unrolled fully (the same
+#                     bits, -1..-3 %: not raced there)
+PASCAL_TWINS = PASCAL_TWINS + ("k64",)
 PASCAL_TWINS_FP32 = ("u28", "u44")  # the twins raced for the fp32 P.V (ss, lr, hr's block 0): the slice twins' fp32
-#                     form holds 48.9 KB of shared memory, one block an SM against the shipped kernel's two
+#                     form holds 48.9 KB of shared memory, one block an SM against the shipped kernel's two; k64's
+#                     fp32 P.V is the shipped kernel's code (its score loop unrolled: -1..-3 %, under the margin)
+PASCAL_PRECISE = "px"   # torch.ops.sageattention_qattn_sm61.sageattn_pascal_px (Spellcast3D round P sage-bias, the
+#                     wheel from post10): the Pascal op with a more exact Q.K^T - q and k each minus its mean over the
+#                     tokens and one scale per token, q's mean times k added back to the scores exactly - on k64's
+#                     schedule; NOT the shipped op's bits (a precision change: its error against fp32 attention ~30 %
+#                     lower on the flows' operands), so it is no twin: the calibration's trial checks its accuracy on
+#                     this card against the shipped op's and records "pascal_precise" (`_pascal_precise_trial`); where
+#                     the record says ok it serves both P.V modes in place of the shipped op and its twins
+#                     (`_pascal_twin`), the shipped op (or its raced twin) being the way back. PIXAL3D_PASCAL_PRECISE:
+#                     "on" = the record decides, "off" = never, "force" = without a record (developers, forced
+#                     profiles), unset = PRECISE_DEFAULT
+PRECISE_DEFAULT = False  # what an unset PIXAL3D_PASCAL_PRECISE means. False (the orchestrator's decision at the end of
+#                     round P): the precise op is an OPT-IN until the user has looked at the sheets and pinned post10 -
+#                     set True for "the record decides" (the precise op serves where
+#                     the install's trial found it more exact on the card and at most PRECISE_MAX_SLOWDOWN slower; with a
+#                     wheel older than post10 there is no such op and nothing changes). Round P sage-bias: the shipped
+#                     op has no defect (it answers as its scheme's emulation to ~1.5e-5 inside real passes, its error in
+#                     the RTX 3060 kernel's class), the pale boys of seeds 11-13 were mostly samples; over six seeds on a
+#                     real GTX 1070 Ti the precise op's faces were the pinkest (face saturation 0.281 against the shipped
+#                     op's 0.247, exact attention's 0.265, the RTX 3060's 0.263) at +2.4..+3.3 % a call against k64:
+#                     the more exact kernel, which costs little, is the default once it is in the wheel. False keeps the
+#                     shipped op (and its raced twins) unless PIXAL3D_PASCAL_PRECISE=on / force
+PRECISE_MAX_SLOWDOWN = 0.10     # the precise op serves only where its whole call is at most this much slower than the
+#                     op it replaces at every size timed (round P on a GTX 1070 Ti: within 3 %); a guard, not a race
 PASCAL_TWIN_MARGIN = 0.05   # a twin serves only where it is at least this much faster than the shipped op at every
 #                     size timed (they give the same bits, so the margin only guards against the timing's noise:
 #                     interleaved medians of 12-16 calls; 5 %, as the project's other races)
@@ -219,6 +257,20 @@ INT8PV_MARGIN = 0.05        # the int8 P.V kernel serves only where it is at lea
 #                             differently, so a card that gains nothing keeps the fp16 kernel's numbers)
 INT8PV_TURING_DEFAULT = False   # what an unset PIXAL3D_INT8PV means on sm_7x (RTX 20xx): the fp16 P.V kernel for every
 #                                 block; the user decides after the twin's end-to-end judgement on an RTX 2070
+# PIXAL3D_SAGE_FLOWS (developers; Spellcast3D round P's localisation of the GTX 10xx colour bias): the flows whose
+# full self-attention runs SageAttention, "ss,lr,hr,tex" or a part of it; unset, "" or "all": every flow. A flow left
+# out keeps exact attention: mark_int8pv wraps the forward of its self-attention modules (`_exact_forward`) and
+# attention() answers the calls made inside them with torch's SDPA in the torso's dtype (the fold's powers of two
+# scale it exactly, as they do every path).
+_EXACT = threading.local()      # .depth > 0: inside the forward of a module of a flow PIXAL3D_SAGE_FLOWS leaves out
+
+
+def sage_flows() -> Optional[frozenset]:
+    """The flows PIXAL3D_SAGE_FLOWS names (a frozenset of ss / lr / hr / tex), or None: every flow."""
+    text = os.environ.get("PIXAL3D_SAGE_FLOWS", "").strip().lower()
+    if text in ("", "all"):
+        return None
+    return frozenset(part.strip() for part in text.split(",") if part.strip())
 
 
 def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
@@ -242,6 +294,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaled: bool = 
     q's dtype. Call only where usable() said True. `scaled`: v already carries the 2^-V_SHIFT (the weights were
     folded, `fold`): the answer keeps it, and the folded to_out undoes it. `int8pv`: the block was marked for the
     int8 P.V kernel (mark_int8pv), which serves where the self-check accepted it; the fp16 P.V kernel otherwise."""
+    if getattr(_EXACT, "depth", 0):        # a flow PIXAL3D_SAGE_FLOWS leaves out (mark_int8pv)
+        return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
+                                              v.transpose(1, 2)).transpose(1, 2).contiguous()
     kernel = _kernel_int8pv if int8pv and _kernel_int8pv is not None else _kernel
     if scaled:
         return kernel(q, k, v)
@@ -253,18 +308,45 @@ def mark_int8pv(model: torch.nn.Module, kind: str) -> int:
     """Mark the full self-attention modules of a flow network of `kind` (ss, lr, hr, tex) that may run the int8 P.V
     kernel: every block's of the flows INT8PV_FLOWS names, except the blocks INT8PV_SKIP lists for that kind.
     Done once per loaded network by the engine; harmless without the kernel (attention() then runs the fp16 P.V
-    kernel for every block). Returns how many modules were marked."""
+    kernel for every block). The self-attention modules of a flow PIXAL3D_SAGE_FLOWS leaves out (`sage_flows`; the
+    dense ss flow's too) get `_exact_forward` instead: attention() answers them exactly. Returns how many modules
+    were marked for the int8 P.V kernel."""
     count = 0
     skip = set(INT8PV_SKIP.get(kind, ()))
     allowed = kind in INT8PV_FLOWS
+    flows = sage_flows()
+    exact = flows is not None and kind not in flows
     for index, block in enumerate(getattr(model, "blocks", ())):
         for module in block.modules():
             if (type(module).__name__ not in ("SparseMultiHeadAttention", "MultiHeadAttention")
                     or getattr(module, "_type", None) != "self" or getattr(module, "attn_mode", None) != "full"):
                 continue
-            module.sage_int8pv = allowed and index not in skip
+            module.sage_int8pv = allowed and index not in skip and not exact
             count += int(module.sage_int8pv)
+            if exact:
+                _exact_forward(module)
+    if exact and kind:
+        print(f"[SAGE] {kind}: exact attention (PIXAL3D_SAGE_FLOWS={os.environ.get('PIXAL3D_SAGE_FLOWS', '')})",
+              flush=True)
     return count
+
+
+def _exact_forward(module: torch.nn.Module) -> None:
+    """The module's forward wrapped so that the SageAttention calls made inside it run exactly (PIXAL3D_SAGE_FLOWS);
+    once per module (its `sage_exact` says so)."""
+    if getattr(module, "sage_exact", False):
+        return
+    real = module.forward
+
+    def forward(*args, **kwargs):
+        _EXACT.depth = getattr(_EXACT, "depth", 0) + 1
+        try:
+            return real(*args, **kwargs)
+        finally:
+            _EXACT.depth -= 1
+
+    module.forward = forward
+    module.sage_exact = True
 
 
 def fold(model: torch.nn.Module) -> int:
@@ -461,6 +543,9 @@ def _old_card_trial_run(device: torch.device, major: int, call: Callable, label:
         if progress is not None:        # a twin that takes the process down leaves the races above standing
             progress(dict(found))
         found["pascal_twins"] = _pascal_twins_trial(device, q, k, vs)
+        if progress is not None:        # the precise op taking the process down leaves the twins' race standing
+            progress(dict(found))
+        found["pascal_precise"] = _pascal_precise_trial(device, q, k, vs, want_out, found["pascal_twins"])
     return found
 
 
@@ -556,6 +641,12 @@ def _old_card_trial_in_child(major: int, minor: int) -> dict:
             twins["error"] = "; ".join(filter(None, (twins.get("error"), f"{ended} after the twins ran"
                                                      + (f" (the race chose {chose}: left out)" if chose else "")
                                                      + f": {tail[:300]}")))
+        if major == 6:                  # the precise op promotes nothing from a process that ended so
+            precise = found.get("pascal_precise")
+            precise = dict(precise) if isinstance(precise, dict) else {"present": None}
+            precise["ok"] = False
+            precise["error"] = f"{ended} after the twins ran: {tail[:300]}"
+            found["pascal_precise"] = precise
         return found
     if found is not None and found.get("candidate_ok") and "int8pv" not in found:
         found.setdefault("summary", found.get("why", ""))
@@ -658,6 +749,8 @@ def _pascal_call(op: Callable, int8pv: bool) -> Callable:
 
 
 def _pascal_name(twin: str) -> str:
+    if twin == PASCAL_PRECISE:
+        return f"{PASCAL_OP}_{twin} (the precise Q.K^T: per-token scales, q's mean exact; round P)"
     return PASCAL_OP if twin == "shipped" else f"{PASCAL_OP}_{twin} (the shipped kernel's twin {twin}, its bits)"
 
 
@@ -699,14 +792,21 @@ def _pascal_twin_wanted(device: torch.device, mode: str) -> tuple[str, str]:
 
 
 def _pascal_twin(device: torch.device, int8pv: bool) -> tuple[Optional[Callable], str]:
-    """The Pascal op for the P.V mode (`int8pv`) in this process: the twin `_pascal_twin_wanted` names, once it gave
-    the shipped op's bits on the self-check's table (torch.equal; on a card or wheel where it does not, one line
-    says so and the shipped op serves), else the shipped op. (op, the twin's name or "shipped"); cached."""
+    """The Pascal op for the P.V mode (`int8pv`) in this process: the precise op where it serves (`_pascal_precise`,
+    both P.V modes), else the twin `_pascal_twin_wanted` names, once it gave the shipped op's bits on the
+    self-check's table and the tail table (`_twin_tables`, torch.equal; on a card or wheel where it does not, one
+    line says so and the shipped op serves), else the shipped op. (op, the twin's name or "shipped"); cached."""
     key = (str(device), bool(int8pv))
     if key in _pascal_twins:
         return _pascal_twins[key]
     shipped = _pascal_op()
     mode = "int8" if int8pv else "fp32"
+    precise = _pascal_precise(device) if shipped is not None else None
+    if precise is not None:
+        _pascal_twins[key] = (precise, PASCAL_PRECISE)
+        print(f"[SAGE] the precise Pascal kernel ({PASCAL_OP}_{PASCAL_PRECISE}) serves the {mode} P.V calls "
+              f"({_precise_note})", flush=True)
+        return _pascal_twins[key]
     name, why = _pascal_twin_wanted(device, mode)
     chosen = (shipped, "shipped")
     if name != "shipped" and shipped is not None:
@@ -716,9 +816,11 @@ def _pascal_twin(device: torch.device, int8pv: bool) -> tuple[Optional[Callable]
                   f"the {mode} P.V calls", flush=True)
         else:
             try:
-                q, k, vs, _want = _check_table(device)
-                same = torch.equal(_pascal_call(shipped, int8pv)(q, k, vs), _pascal_call(twin, int8pv)(q, k, vs))
-                del q, k, vs, _want
+                same = True
+                for q, k, vs, _want in _twin_tables(device):
+                    same = same and torch.equal(_pascal_call(shipped, int8pv)(q, k, vs),
+                                                _pascal_call(twin, int8pv)(q, k, vs))
+                    del q, k, vs, _want
             except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the shipped op
                 same, why = False, f"{type(exc).__name__}: {str(exc)[:200]}"
             if same:
@@ -731,10 +833,167 @@ def _pascal_twin(device: torch.device, int8pv: bool) -> tuple[Optional[Callable]
     return chosen
 
 
+def precise_switch() -> str:
+    """PIXAL3D_PASCAL_PRECISE: "auto" ("on": the calibration record decides), "off", or "force" (without a record);
+    unset or anything else: PRECISE_DEFAULT's meaning ("auto" where it is True, else "off")."""
+    text = os.environ.get("PIXAL3D_PASCAL_PRECISE", "").strip().lower()
+    if text in _OFF:
+        return "off"
+    if text == "force":
+        return "force"
+    if text in _ON:
+        return "auto"
+    return "auto" if PRECISE_DEFAULT else "off"
+
+
+_precise_state: dict = {}           # str(device) -> the precise op or None: this process's verdict (`_pascal_precise`)
+_precise_note = ""
+
+
+def _precise_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The self-check's table with the flows' kind of q and k (an offset of q shared by the tokens, a few dominant
+    channels in q, a constant shift of two channels of k): where the shipped scheme's shared scales lose the most."""
+    q, k, vs, _want = _check_table(device)
+    g = torch.Generator(device=device).manual_seed(1)
+    off = torch.randn((1, 1, q.shape[2], HEAD_DIM), device=device, dtype=q.dtype, generator=g)
+    q = (q + 1.5 * off).contiguous()
+    q[..., :4] *= 6.0
+    k = k.clone()
+    k[..., 5:7] += 4.0
+    want_out = F.scaled_dot_product_attention(q.float().transpose(1, 2), k.float().transpose(1, 2),
+                                              (vs.float() * 2.0 ** V_SHIFT).transpose(1, 2)).transpose(1, 2)
+    return q, k, vs, want_out
+
+
+def _precise_errors(device: torch.device, ops: dict, tables: list) -> dict:
+    """Relative L2 errors against fp32 attention of each op in `ops` (name -> op), per P.V mode, over the tables
+    [(q, k, vs, want_out)] together: {"<mode>_<name>": error}; raises where an answer is not finite or misshapen."""
+    rel: dict = {}
+    for mode, int8pv in (("fp32", False), ("int8", True)):
+        for name, op in ops.items():
+            num = den = 0.0
+            for q, k, vs, want in tables:
+                got = _pascal_call(op, int8pv)(q, k, vs)
+                torch.cuda.synchronize(device)
+                if got.shape != want.shape or not bool(torch.isfinite(got).all()):
+                    raise RuntimeError(f"{name} ({mode} P.V) gave a misshapen or non-finite answer")
+                num += float((got.float() * 2.0 ** V_SHIFT - want).pow(2).sum())
+                den += float(want.pow(2).sum())
+                del got
+            rel[f"{mode}_{name}"] = (num / den) ** 0.5
+    return rel
+
+
+def _precise_accurate(rel: dict) -> Optional[str]:
+    """None where the precise op's errors are within the self-check's 3 % bar and no larger than the shipped op's in
+    both P.V modes (it measures ~0.7 of the shipped op's on the flows' operands); else why not."""
+    for mode in ("fp32", "int8"):
+        mine, theirs = rel[f"{mode}_{PASCAL_PRECISE}"], rel[f"{mode}_shipped"]
+        if not mine <= 0.03 or not mine <= theirs:
+            return f"its {mode} P.V error {mine:.4g} against the shipped op's {theirs:.4g}"
+    return None
+
+
+def _pascal_precise(device: torch.device) -> Optional[Callable]:
+    """The precise op (PASCAL_PRECISE) where it serves in this process, else None: PIXAL3D_PASCAL_PRECISE not off,
+    the op in the wheel, the calibration record's "pascal_precise" ok (or the switch "force"), and its answers on the
+    self-check's tables within the 3 % bar and no worse than the shipped op's on this card (`_precise_accurate`,
+    once a process). A record whose precise op was not ok, an older wheel, a failure: None (the shipped op or its
+    twin serves, as before)."""
+    global _precise_note
+    key = str(device)
+    if key in _precise_state:
+        return _precise_state[key]
+    found = None
+    switch = precise_switch()
+    op = _pascal_twin_op(PASCAL_PRECISE) if switch != "off" else None
+    if op is not None:
+        if switch == "force":
+            why = "PIXAL3D_PASCAL_PRECISE=force"
+        else:
+            stored = _stored(device)
+            record = stored.get("pascal_precise") if stored is not None else None
+            why = (f"checked on this card when Spellcast3D was installed: {record.get('summary', 'record')}"
+                   if isinstance(record, dict) and record.get("ok") else None)
+        if why is not None:
+            try:
+                rel = _precise_errors(device, {"shipped": _pascal_op(), PASCAL_PRECISE: op},
+                                      [*_twin_tables(device), _precise_table(device)])
+                bad = _precise_accurate(rel)
+            except Exception as exc:        # noqa: BLE001 - whatever the wheel or the card raises: the shipped op
+                bad = f"{type(exc).__name__}: {str(exc)[:200]}"
+            if bad is None:
+                found, _precise_note = op, why
+            else:
+                print(f"[SAGE] the precise Pascal kernel is left out on this card ({bad}): the shipped kernel serves",
+                      flush=True)
+    _precise_state[key] = found
+    return found
+
+
+def _pascal_precise_trial(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor,
+                          want_out: torch.Tensor, twins: Optional[dict] = None) -> dict:
+    """The calibration trial of the precise op (PASCAL_PRECISE), after the twins' race: its errors and the shipped
+    op's against fp32 attention on the self-check's table and on `_precise_table`, per P.V mode
+    (`_precise_accurate`), then whole calls against the op it would replace (per P.V mode the twin the race chose,
+    `twins`, else the shipped op) at CALIBRATION_RACE's sizes, interleaved, CUDA events, medians: it serves ("ok")
+    where it is accurate and at most PRECISE_MAX_SLOWDOWN slower at every size. Returns the record's
+    "pascal_precise": {"present", "ok", "why", "rel", "timings", "summary"}. Never raises."""
+    found: dict = {"present": False, "ok": False}
+    try:
+        op = _pascal_twin_op(PASCAL_PRECISE)
+        if op is None:
+            found["why"] = "no precise op in the installed wheel"
+            return found
+        found["present"] = True
+        shipped = _pascal_op()
+        rel = _precise_errors(device, {"shipped": shipped, PASCAL_PRECISE: op},
+                              [(q, k, vs, want_out), _tail_table(device), _precise_table(device)])
+        found["rel"] = {key: round(value, 6) for key, value in rel.items()}
+        bad = _precise_accurate(rel)
+        if bad is not None:
+            found["why"] = f"not more exact than the shipped op on this card: {bad}"
+            found["summary"] = "left out (accuracy)"
+            return found
+        rows, worst = [], 0.0
+        for mode, int8pv in (("fp32", False), ("int8", True)):
+            if int8pv and int8pv_switch() == "off":
+                continue
+            twin = (twins or {}).get(mode, "shipped")
+            base = _pascal_twin_op(twin) if twin not in (None, "shipped") else None
+            calls = {"shipped": _pascal_call(base if base is not None else shipped, int8pv),
+                     PASCAL_PRECISE: _pascal_call(op, int8pv)}
+            _winner, _line, timed = _race_pascal_twins(device, calls, CALIBRATION_RACE, same_bits=False)
+            for row in timed:
+                ratio = row["ms"][PASCAL_PRECISE] / row["ms"]["shipped"]
+                worst = max(worst, ratio - 1.0)
+                rows.append({"mode": mode, "against": twin if base is not None else "shipped",
+                             "tokens": row["tokens"], "ms": row["ms"][PASCAL_PRECISE],
+                             "against_ms": row["ms"]["shipped"]})
+        found["timings"] = rows
+        errors = ", ".join(f"{m} {rel[f'{m}_{PASCAL_PRECISE}']:.4f} (shipped {rel[f'{m}_shipped']:.4f})"
+                           for m in ("fp32", "int8"))
+        times = ", ".join(f"{r['mode']} {r['tokens']:,} tokens {100 * (r['ms'] / r['against_ms'] - 1):+.1f} %"
+                          for r in rows)
+        found["summary"] = f"error {errors}; time {times or 'not timed'}"
+        if not rows:
+            found["why"] = "not timed (no room for the race's tables)"
+        elif worst > PRECISE_MAX_SLOWDOWN:
+            found["why"] = (f"more exact, but {100 * worst:.1f} % slower at its worst size (the guard: "
+                            f"{100 * PRECISE_MAX_SLOWDOWN:.0f} %)")
+        else:
+            found.update(ok=True, why=f"more exact than the shipped op on this card, {100 * worst:+.1f} % at its "
+                                      f"worst size")
+    except Exception as exc:        # noqa: BLE001 - the precise op never costs the shipped op its place
+        found.update(ok=False, error=f"{type(exc).__name__}: {(str(exc).strip().splitlines() or [''])[0][:200]}")
+    return found
+
+
 def _pascal_twins_trial(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: torch.Tensor) -> dict:
     """The calibration trial's race of the Pascal op's twins (PASCAL_TWINS in the wheel) against the shipped op, per
     P.V mode (fp32: PASCAL_TWINS_FP32; int8 unless PIXAL3D_INT8PV is off): each twin's answer on the self-check's
-    table (q, k, vs) and on the race's tables must be the shipped op's bits (torch.equal), then whole calls at
+    table (q, k, vs), on the tail table (`_tail_table`: k64's last step without its second block) and on the race's
+    tables must be the shipped op's bits (torch.equal), then whole calls at
     CALIBRATION_RACE's sizes, interleaved in a rotating order, CUDA events, medians (`_race_pascal_twins`); the twin
     with the best worst-size ratio serves where it is PASCAL_TWIN_MARGIN faster at every size. Returns the record's
     "pascal_twins": {"present", "fp32", "int8" (a twin or "shipped"), "<mode>_timings", "<mode>_summary",
@@ -752,15 +1011,16 @@ def _pascal_twins_trial(device: torch.device, q: torch.Tensor, k: torch.Tensor, 
                 found[f"{mode}_why"] = "PIXAL3D_INT8PV is off"
                 continue
             calls = {"shipped": _pascal_call(shipped, int8pv)}
-            want = calls["shipped"](q, k, vs)
+            tables = [(q, k, vs), _tail_table(device)[:3]]
+            wants = [calls["shipped"](*table) for table in tables]
             differ = []
             for t in names:
                 call = _pascal_call(_pascal_twin_op(t), int8pv)
-                if torch.equal(call(q, k, vs), want):
+                if all(torch.equal(call(*table), want) for table, want in zip(tables, wants)):
                     calls[t] = call
                 else:
                     differ.append(t)
-            del want
+            del wants, tables
             winner, line, rows = _race_pascal_twins(device, calls, CALIBRATION_RACE)
             found[mode] = winner
             found[f"{mode}_why"] = line + (f"; left out (other bits on the self-check's table): "
@@ -776,7 +1036,8 @@ def _pascal_twins_trial(device: torch.device, q: torch.Tensor, k: torch.Tensor, 
     return found
 
 
-def _race_pascal_twins(device: torch.device, calls: dict, plan: tuple) -> tuple[str, str, list]:
+def _race_pascal_twins(device: torch.device, calls: dict, plan: tuple,
+                       same_bits: bool = True) -> tuple[str, str, list]:
     """The shipped call and its twins (`calls`: name -> call, "shipped" first) timed on this card at each of `plan`'s
     sizes on the same random q, k, v (12 heads x 128, the torso's dtype), the calls in a rotating order, CUDA events,
     the medians; a twin whose answer at a size differs from the shipped op's is left out. Returns (the winner or
@@ -796,7 +1057,8 @@ def _race_pascal_twins(device: torch.device, calls: dict, plan: tuple) -> tuple[
         dt = precision.torso()
         q, k, v = (torch.randn((1, n, heads, HEAD_DIM), dtype=dt, device=device, generator=g) for _ in range(3))
         want = calls["shipped"](q, k, v)
-        differ = [t for t in names[1:] if t not in out and not torch.equal(calls[t](q, k, v), want)]
+        differ = ([t for t in names[1:] if t not in out and not torch.equal(calls[t](q, k, v), want)]
+                  if same_bits else [])     # same_bits False: the precise op's timing (its answer differs by design)
         out.update(differ)
         del want
         live = [t for t in names if t not in out]
@@ -1195,16 +1457,33 @@ def _setup_int8pv(device: torch.device, q: torch.Tensor, k: torch.Tensor, vs: to
               f"kernel serves every block", flush=True)
 
 
-def _check_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """The self-check's table (see _check): q, k, v * 2^-V_SHIFT [1, 1000, 12, 128] bf16 and the fp32 answer."""
-    g = torch.Generator(device=device).manual_seed(0)
-    n, heads = 1000, 12
+def _check_table(device: torch.device, n: int = 1000,
+                 seed: int = 0) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The self-check's table (see _check): q, k, v * 2^-V_SHIFT [1, n, 12, 128] in the torso's dtype and the fp32
+    answer (n 1000: 1000 mod 64 = 40, a last 64-key step with both of its 32-key blocks)."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    heads = 12
     qkv = torch.randn((1, n, 3, heads, HEAD_DIM), device=device, dtype=precision.torso(), generator=g)
     qkv[:, :, 2] *= 1000
     q, k, v = qkv[:, :, 0].contiguous(), qkv[:, :, 1].contiguous(), qkv[:, :, 2]
     want_out = F.scaled_dot_product_attention(q.float().transpose(1, 2), k.float().transpose(1, 2),
                                               v.float().transpose(1, 2)).transpose(1, 2)
     return q, k, v * 2.0 ** -V_SHIFT, want_out
+
+
+TAIL_TOKENS = 990   # 990 mod 64 = 30: a last 64-key step whose second 32-key block is absent (k64's "block B absent"
+#                     tail, which the 1000-token table and the races' multiples of 64 never reach)
+
+
+def _tail_table(device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """The self-check's table at TAIL_TOKENS tokens (another seed)."""
+    return _check_table(device, TAIL_TOKENS, seed=990)
+
+
+def _twin_tables(device: torch.device) -> list:
+    """The tables a Pascal twin must give the shipped op's bits on (torch.equal) before it serves: the self-check's
+    and the tail one."""
+    return [_check_table(device), _tail_table(device)]
 
 
 def _check(device: torch.device) -> bool:

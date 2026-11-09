@@ -235,12 +235,15 @@ quantiser, wired the same way (the self-check, the marked blocks, the race - the
 "sage" section, `_turing_int8pv_trial`), but on sm_7x an unset switch keeps the fp16 kernel
 (`sage.INT8PV_TURING_DEFAULT = False`): it serves only under `PIXAL3D_INT8PV=on` (where the race found it 5 %
 faster) or `force`, until the user decides on its end-to-end judgement on an RTX 2070.
-The wheel's Pascal extension (post8, `_qattn_sm61`) and pixal3d_kernels 0.2.1 carry twins of the Pascal attention
-kernel (`sage.PASCAL_TWINS`) and of the dp4a GEMM (`int8mm.DP4A_TWINS`, raced in the calibration's `old_cards` step):
-the shipped kernels' bits with other code shapes (main loops under Pascal's ~8 KB instruction cache), timed once at
-install on the card itself and kept only where 5 % faster at every size, after a bit check at first use in each
-process; without a record the shipped kernels serve (`PIXAL3D_PASCAL_TWIN`, `PIXAL3D_DP4A_TWIN` for developers). No
-GTX 10xx has timed them yet.
+The wheel's Pascal extension (`_qattn_sm61`: round O's twins from post8, round P's k64 from post9) and
+pixal3d_kernels 0.2.1 carry twins of the Pascal attention kernel (`sage.PASCAL_TWINS`) and of the dp4a GEMM
+(`int8mm.DP4A_TWINS`, raced in the calibration's `old_cards` step): the shipped kernels' bits with other code shapes
+(main loops under Pascal's ~8 KB instruction cache; k64: 64 keys an iteration, one score loop for two 32-key
+blocks), timed once at install on the card itself and kept only where 5 % faster at every size, after a bit check at
+first use in each process (on the self-check's table and a 990-token one, whose last 64-key step lacks its second
+block); without a record the shipped kernels serve (`PIXAL3D_PASCAL_TWIN`, `PIXAL3D_DP4A_TWIN` for developers). A
+real GTX 1070 Ti timed them: round O's attention twins 0.4-2.8 % faster (under the margin: the shipped op stays),
+k64 about 11 % faster a call for the int8 P.V (it serves there).
 
 Two savings around the attention change no bit. A guided sampling runs the flow once on the prop's conditioning
 and once on an all-zero conditioning per step inside the guidance interval (hr and lr: 9 of 21 passes, ss: 10 of
@@ -412,7 +415,21 @@ figures at the top of `parts.py`, measured on an RTX 3060):
   (`conv_spconv.py`), a box's, a slab's and a row subset's GEMM calls padded to at least the install's floor (the
   calibration's `decode_products`, `modules/sparse/conv/products_floor.py`; no boxes on spconv without a section that
   passed), a whole level's calls the whole-table decode's own - the same meshes bit for bit on the RTX 3060 under
-  both forced profiles, unproven on real old cards. `parts.decode_figures()` gives each backend's measured figures.
+  both forced profiles. Where the install's sweep finds a shape whose whole-level calls no box call can stand in for
+  (round P: `products_floor.plan`, "whole-only" - on a real GTX 1080 Ti / 1070 Ti the 128 -> 128 product, whose one
+  disagreeing call above 6 Ki rows is the one of 2^20 rows), the boxes start one level later: level 3 is decoded whole
+  (its convolutions and subdivision head the whole level's own calls, its MLP in the boxes' 64 Ki-row calls where the
+  sweep found them equal) and only the up-block to the finest level and the output layer run in boxes; above the
+  output layer's verified reach (6 M fine rows on sm_61, where 12 M-row calls take another kernel) its one whole call
+  is made on the gathered fine rows (level 3's table meanwhile in pageable RAM, the shape decoder's mesh parked in RAM
+  beside the texture decode; the finish's RAM test counts both). The boxes also start at level 4 where the output
+  layer's windows have such a reach, and where a level-3 shape round O's boxes stand in for has a launch-boundary band
+  (a recorded boundary, or a sweep failure from 64 Ki rows on); a band the level-4 form meets (the up-block's 128 -> 512
+  offsets or centre, level 3's MLP) is taken from the whole level's own call where that call fits the card's room
+  (a band's product waits in RAM), else the boxes' own calls with a warning. A decode that fits whole makes today's
+  unwindowed calls. Round O's
+  windows-everywhere mode (every call in 64 Ki rows, twice the decode's time on a GTX 10xx) is a forced check only
+  (`PIXAL3D_DECODE_WINDOW`). `parts.decode_figures()` gives each backend's and form's measured figures.
   `PIXAL3D_SPCONV_BOXES=off` turns spconv's boxes off.
 - **The resolution of a 1536 prop follows the memory as well as the token cap.** `upsample` walks the resolutions
   down as the reference does (1536, 1408, ..., 1024) and stops at the first whose token count is under the cap
@@ -626,6 +643,14 @@ one wins, as it would have); and while any load runs the read-ahead waits betwee
 the read the card waits for has the drive to itself. Spellcast3D's launcher holds its own read-ahead of libraries and
 first networks the same way, from the engine's `net_load` to its `net_ready` (pixal3d_server.py `ReadAheadGate`).
 
+In the paired texture and finish the finish's decoders are read ahead first, then the next group's networks
+(`runner._read_ahead`'s `before`: the decoders not on the card, as the texture group begins and after its last
+pair). Every prop of the group loads the decoders at its finish, before the next kind's texture network is needed;
+reading that network first, as the runner did until round P, left a batch with single-view props after multi-view
+ones to read the decoders from the disk at its first finish (round N's six props: 1.77 + 1.74 s with the card idle,
+their pages from `upsample`'s read long gone). With the decoders first the next kind's texture network is still
+read ahead long before its turn (a whole texture sampling and finish later).
+
 ## Cards below sm_80: the precision profile
 
 The engine was made for Ampere and newer (bf16 flows, Triton kernels, natten, flash_attn, SageAttention: all
@@ -660,7 +685,7 @@ calibration took 25-95 minutes a shape there (13 shapes), so they are tried only
 `PIXAL3D_TURING_FLEX_GEMM=on` at the calibration runs `modules/sparse/conv/backend_check.py` and records the
 `conv_backend` section the profile reads (Triton's Windows builds are untested on Turing besides).
 Where the decoders cannot decode in boxes (`chunked.boxes_supported()` false: spconv's boxes off, no
-`decode_products` section that passed, or one that found them inexact) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
+`decode_products` section that passed, or one whose box shapes are whole-only at levels 3 and 4) a card under 10 GiB makes a 1536 prop at 1024 (`parts.py`
 `WHOLE_LEVEL_1536_MIB`: the knight's texture decode ran an RTX 2060 Super out of memory at 1536). The int8 GEMMs
 are pixal3d_kernels' (`int8mm.cuda_linear`: the fork's W8A8 kernel with the scaling, bias and GELU in its epilogue,
 per-row and group scales alike, so the whole int8 policy applies; self-checked at first use against the fp64

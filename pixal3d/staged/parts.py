@@ -328,7 +328,8 @@ SPCONV_UNLEAN_WHOLE = {"spconv": 2.0, "spconv_torch": 2.1}
 # flex_gemm (Ampere) is not affected: it boxes above CHUNK_ABOVE_MIB as it always did.
 SPCONV_BOXES_WHERE_NEEDED = True
 # The hold mode (chunked.py, round O's review): where this card's decode_products record lists an output-layer
-# boundary band (products_floor.has_boundary: this PC's pascal record does, its turing one does not), the shape
+# boundary band or a limit to the windows' reach (products_floor.output_may_be_whole, round P: this PC's pascal record
+# has a band, its turing one neither), the shape
 # decoder keeps the boxes' rows before the output layer (fp16 [n, 64] and their coords) and runs that layer at the
 # end, so its box peak grows with the prop again: above the decoders, the boy (3.55 M voxels) 809 -> 1,082 MiB at
 # 2 M boxes, the ork (10.56 M) 2,131 -> 3,077 (boxes-REPORT section 11.5); without it the shape decode peaked at 807 /
@@ -339,16 +340,65 @@ SPCONV_BOXES_WHERE_NEEDED = True
 # Measured with the boxes agent's pascal record (runs/hold-pas, 2 M boxes, lean): the ork's shape decode 3,102 MiB
 # above both decoders (3,375 counted, 9 % over), the tree's 3,594 (3,894, 8 %), the boy's 1,082 (1,201); under the
 # pessimistic 8 GB cap the ork then decodes one decoder at a time, 4,001 / 5,550 MiB allocated / reserved under 5,761,
-# the same mesh. The band's own sizes (a fine level
-# within 1,024 rows above a multiple of 2,097,088 rows: about one prop in 2,000) also make the output layer's whole
-# call once, fp32 [n, 64] beside the held rows (the boy 1,082 -> ~1,660-1,760 MiB, forced): not counted here, as no
-# plan can tell those sizes before the decode (the residual risk named in the memory report).
+# the same mesh. A recorded band's own sizes (a fine level within 1,024 rows above a power-of-two multiple of
+# 2,097,088 rows: about one prop in 2,000) also make the output layer's whole call once, fp32 [n, 64] beside the held
+# rows (the boy 1,082 -> ~1,660-1,760 MiB, forced): not counted, as no plan can tell those sizes before the decode
+# (the residual risk named in the memory report). A limit to the windows' reach (round P: output_windows_to, 6 M fine
+# rows on the real sm_61 cards) is another matter: there every prop above it makes that call, so products_floor.plan
+# starts such a card's boxes at level 4 (the measured SPCONV_L4_* figures, level 3's table in RAM, park_mesh); where
+# a record still pairs this form with a reach (one of this round's form written by hand), decode_figures counts the
+# call as SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL a thousand voxels above the reach with SPCONV_L4_BASE_MIB (inferred,
+# round P's review: the held fp16 rows 128 bytes a voxel, their coords 16, cast_norm_rows' fp32 copy 256, the layer's
+# output and the tail's table 2 x 28 - 456 bytes, 0.435 MiB a thousand) and parks the mesh as the level-4 form does.
 SPCONV_HOLD_MIB_PER_KVOXEL = 0.31
 SPCONV_HOLD_BASE_MIB = 100
+SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL = 0.45
 SPCONV_CHUNKED_MIB_PER_KVOXEL = {"spconv": 0.22, "spconv_torch": 0.22}
 SPCONV_CHUNK_MIB_PER_KVOXEL = {"spconv": 0.33, "spconv_torch": 0.42}
 SPCONV_UNLEAN_BOXES = {"spconv": 1.8, "spconv_torch": 1.8}
 SPCONV_CHUNK_ABOVE_MIB = {"spconv": 3_000, "spconv_torch": 3_000}     # with SPCONV_BOXES_WHERE_NEEDED off only
+# The level-4 form (chunked.py, round P: where this card's decode_products record makes a level-3 shape whole-only -
+# the real GTX 1080 Ti / 1070 Ti's 128 -> 128 product - level 3 is decoded whole and only the up-block to the finest
+# level and the output layer run in boxes; products_floor.box_level). Its peak grows with the prop again, at the
+# widest of three moments, above the decoders' weights:
+#   the whole level 3 (its 128 -> 128 convolutions' whole calls: the level's table, the output, an offset's gathered
+#     rows and product)                                              SPCONV_L4_LEVEL3_MIB_PER_KVOXEL a thousand voxels
+#   the boxes beside level 3's table and the kept fields              SPCONV_L4_KEPT_MIB_PER_KVOXEL + the box's
+#                                                                     SPCONV_L4_CHUNK_MIB_PER_KVOXEL a thousand of its voxels
+#   above the output layer's reach on the card (products_floor.output_windows_to: 6 M fine rows on sm_61) the whole fine
+#     level's normalised fp32 input for its one call (256 bytes a voxel, its output 28 more, level 3's table in RAM
+#     meanwhile)                                                      SPCONV_L4_WHOLE_OUT_MIB_PER_KVOXEL + the box's
+# The texture decode holds no mesh beside it there (park_mesh). Measured on the real GTX 1080 Ti (round P decode-v2,
+# code/logs/profiling/pixal3d-lowmem/round-p/decode-v2/pod: gA-new-r1, gA-tree), both decoders, lean, PyTorch's
+# allocated peak above the decode's start (MiB; shape / texture):
+#   the boy 3.55 M voxels     level 3 1,005 / 1,001 (0.283 a thousand); boxes of 500 k 655 / 658, of 2 M 1,493 / 1,520
+#   the ork 10.56 M           level 3 2,865 / 2,848 (0.271); with the whole output call: boxes of 500 k 3,129 / 3,066,
+#                             of 2 M 3,765 / 3,700; its call 3,005 / 2,903 (0.284)
+#   the tree 12.24 M          level 3 3,429 / 3,402 (0.280); with the whole output call: boxes of 500 k 3,596 / 3,523,
+#                             of 2 M 4,331 / 4,247; its call 3,497 / 3,367 (0.286)
+# 0.29 a thousand voxels for level 3 (2-7 % over), 0.10 + 0.65 a thousand box voxels beside the boxes (the boy: 4 % /
+# 9 % over), 0.29 + the box's for the whole output call (500 k boxes: the ork 8 %, the tree 8 % over; 2 M: 10 % / 12 %;
+# its call with the base: 5 % / 4 %).
+SPCONV_L4_LEVEL3_MIB_PER_KVOXEL = {"spconv": 0.29, "spconv_torch": 0.29}
+SPCONV_L4_KEPT_MIB_PER_KVOXEL = {"spconv": 0.10, "spconv_torch": 0.10}
+SPCONV_L4_CHUNK_MIB_PER_KVOXEL = {"spconv": 0.65, "spconv_torch": 0.65}
+SPCONV_L4_WHOLE_OUT_MIB_PER_KVOXEL = 0.29
+SPCONV_L4_BASE_MIB = 100
+# Beside the whole fine level's fp32 table a box's own tables are what is left to cut: the level-4 form's boxes are
+# SPCONV_L4_WHOLE_OUT_CHUNK_VOXELS fine voxels there (the ork: 3,129 MiB at 500 k against 3,765 at 2 M, the decode
+# 24.7 s against 24.9 on the GTX 1080 Ti: smaller boxes cost nothing measurable in this form)
+SPCONV_L4_WHOLE_OUT_CHUNK_VOXELS = 500_000
+# Where the record makes a layer of level 3's MLP whole-only (not on any card measured: the real sm_61 cards' MLP
+# layers are box-safe), the level-4 form's level 3 makes the MLP's whole-level calls (chunked._level_mlp_windows): a
+# hidden table of 4C beside the normalised rows, 1,280 bytes a level-3 row, 0.25 level-3 rows a fine voxel - 0.31 a
+# thousand voxels on top of level 3's figure (inferred, round P's review)
+SPCONV_L4_WHOLE_MLP_MIB_PER_KVOXEL = 0.31
+# The level-4 form's RAM (round P's review): level 3's table while the whole output call's input fills (HOST_LEVEL3:
+# 128 fp16 channels, 0.25 level-3 rows a fine voxel - 64 bytes a voxel; pageable, its exact size: the tree's 0.74 GB)
+# and the shape decoder's mesh parked beside the texture decode (park_mesh: 36 bytes a voxel, the tree's 0.44 GB),
+# counted with margin in the finish's RAM test beside the hook's own (resolution_fits: decode_ram_mib)
+SPCONV_L4_RAM_LEVEL3_MIB_PER_KVOXEL = 0.07
+SPCONV_L4_RAM_MESH_MIB_PER_KVOXEL = 0.04
 
 
 def hook_torch_mib(hooks: Any, req: Any) -> int:
@@ -508,24 +558,93 @@ def decode_figures() -> dict:
     """The decode's figures for this process's backend (decode_backend): "whole" (MiB a thousand voxels on whole
     tables), "chunked" / "chunk" (in boxes: a thousand voxels of the prop / of a box), "unlean_whole" /
     "unlean_boxes" (what a decode without decoder.lean reserves, times what it allocates), "chunk_above" (the
-    whole-table decode above which boxes are used). flex_gemm's are this module's constants, read at the call."""
+    whole-table decode above which boxes are used). flex_gemm's are this module's constants, read at the call. On
+    spconv also "hold" (round O's held rows), and where the output layer makes a whole call "form" (3 / 4), "whole_out"
+    (a thousand voxels of the prop above "whole_out_from" voxels), "whole_out_beside_box" (the level-4 form fills its
+    input box by box, so a box's tables are beside it); the level-4 form's "level3" (its whole level 3)."""
     backend = decode_backend()
     if backend == "flex_gemm":
         return {"whole": DECODE_MIB_PER_KVOXEL, "chunked": CHUNKED_MIB_PER_KVOXEL, "chunk": CHUNK_MIB_PER_KVOXEL,
                 "unlean_whole": UNLEAN_WHOLE, "unlean_boxes": UNLEAN_BOXES, "chunk_above": CHUNK_ABOVE_MIB}
-    return {"whole": SPCONV_DECODE_MIB_PER_KVOXEL[backend], "chunked": SPCONV_CHUNKED_MIB_PER_KVOXEL[backend],
-            "chunk": SPCONV_CHUNK_MIB_PER_KVOXEL[backend], "unlean_whole": SPCONV_UNLEAN_WHOLE[backend],
-            "unlean_boxes": SPCONV_UNLEAN_BOXES[backend], "chunk_above": SPCONV_CHUNK_ABOVE_MIB[backend],
-            "hold": SPCONV_HOLD_MIB_PER_KVOXEL if _holds_tail_rows() else 0.0}
+    if _box_form() == 4:        # level 3 whole, the finest level in boxes (SPCONV_L4_*)
+        reach = _output_reach()
+        level3 = SPCONV_L4_LEVEL3_MIB_PER_KVOXEL[backend]
+        if _level3_mlp_whole():     # its MLP's whole-level calls (SPCONV_L4_WHOLE_MLP_MIB_PER_KVOXEL)
+            level3 += SPCONV_L4_WHOLE_MLP_MIB_PER_KVOXEL
+        return {"whole": SPCONV_DECODE_MIB_PER_KVOXEL[backend], "chunked": SPCONV_L4_KEPT_MIB_PER_KVOXEL[backend],
+                "chunk": SPCONV_L4_CHUNK_MIB_PER_KVOXEL[backend], "unlean_whole": SPCONV_UNLEAN_WHOLE[backend],
+                "unlean_boxes": SPCONV_UNLEAN_BOXES[backend], "chunk_above": SPCONV_CHUNK_ABOVE_MIB[backend],
+                "hold": 0.0, "form": 4, "level3": level3,
+                "whole_out": SPCONV_L4_WHOLE_OUT_MIB_PER_KVOXEL if reach is not None else 0.0,
+                "whole_out_from": reach or 0, "whole_out_beside_box": True}
+    figures = {"whole": SPCONV_DECODE_MIB_PER_KVOXEL[backend], "chunked": SPCONV_CHUNKED_MIB_PER_KVOXEL[backend],
+               "chunk": SPCONV_CHUNK_MIB_PER_KVOXEL[backend], "unlean_whole": SPCONV_UNLEAN_WHOLE[backend],
+               "unlean_boxes": SPCONV_UNLEAN_BOXES[backend], "chunk_above": SPCONV_CHUNK_ABOVE_MIB[backend],
+               "hold": SPCONV_HOLD_MIB_PER_KVOXEL if _holds_tail_rows() else 0.0}
+    reach = _plan_reach()
+    if reach is not None:       # round O's form with a reach (a hand-made record: plan_of gives level 4 there): the
+        #                         held rows' whole output call above it (SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL)
+        figures.update(form=3, whole_out=SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL, whole_out_from=reach,
+                       whole_out_beside_box=False)
+    return figures
 
 
-def _holds_tail_rows() -> bool:
-    """Whether this card's decode_products record makes the shape decoder hold its boxes' rows before the output
-    layer (an output-layer boundary band: products_floor.has_boundary; SPCONV_HOLD_MIB_PER_KVOXEL)."""
+def _box_form() -> int:
+    """The decoder level spconv's boxes start at on this card (products_floor.box_level): 4 where its record makes a
+    level-3 shape whole-only, else 3 (round O's form, also where there are no boxes: their figures then decide
+    nothing)."""
     try:
         from ..modules.sparse.conv import products_floor
 
-        return bool(products_floor.has_boundary())
+        return 4 if products_floor.box_level() == 4 else 3
+    except Exception:       # noqa: BLE001 - no reader (an older checkout), no record
+        return 3
+
+
+def _output_reach() -> int | None:
+    """The fine level above which the output layer makes its whole call on this card (products_floor's
+    output_windows_to; 0 where a launch-boundary band makes any size a candidate), None where it never does."""
+    try:
+        from ..modules.sparse.conv import products_floor
+
+        reach = products_floor.plan()["output_windows_to"]
+        if reach is None and products_floor.output_may_be_whole():
+            return 0
+        return reach
+    except Exception:       # noqa: BLE001 - no reader, no record
+        return None
+
+
+def _plan_reach() -> int | None:
+    """The output layer's reach as this card's plan names it (products_floor's output_windows_to), None where it names
+    none or the windows-everywhere mode is forced (no whole call there)."""
+    try:
+        from ..modules.sparse.conv import products_floor
+
+        return None if products_floor.window() else products_floor.plan()["output_windows_to"]
+    except Exception:       # noqa: BLE001 - no reader, no record
+        return None
+
+
+def _level3_mlp_whole() -> bool:
+    """Whether the level-4 form's level 3 makes its MLP's whole-level calls whatever its size: a layer of it
+    whole-only in this card's record (products_floor.box_safe; chunked._level_mlp_windows)."""
+    try:
+        from ..modules.sparse.conv import products_floor
+
+        return not (products_floor.box_safe("mlp1", 128, 512) and products_floor.box_safe("mlp2", 512, 128))
+    except Exception:       # noqa: BLE001 - no reader, no record
+        return False
+
+
+def _holds_tail_rows() -> bool:
+    """Whether this card's decode_products record makes round O's boxes hold the shape decoder's rows before the
+    output layer (an output-layer boundary band, or a limit to the windows' reach: products_floor
+    .output_may_be_whole; SPCONV_HOLD_MIB_PER_KVOXEL)."""
+    try:
+        from ..modules.sparse.conv import products_floor
+
+        return bool(products_floor.output_may_be_whole())
     except Exception:       # noqa: BLE001 - no reader (an older checkout), no record: no hold
         return False
 
@@ -539,8 +658,31 @@ def decode_mib(voxels: int, decoders: int = 1, chunk: int = 0) -> float:
         boxes = figures["chunked"] * voxels / 1000 + figures["chunk"] * chunk / 1000
         if figures.get("hold"):         # spconv's hold mode: the shape decode's held rows (SPCONV_HOLD_MIB_PER_KVOXEL)
             boxes = max(boxes, figures["hold"] * voxels / 1000 + SPCONV_HOLD_BASE_MIB)
+        if figures.get("level3"):       # the level-4 form's whole level 3 (SPCONV_L4_LEVEL3_MIB_PER_KVOXEL)
+            boxes = max(boxes, figures["level3"] * voxels / 1000)
+        if figures.get("whole_out") and voxels > figures.get("whole_out_from", 0):
+            # the output layer as one whole call: the level-4 form's beside its boxes (SPCONV_L4_WHOLE_OUT_MIB_PER_KVOXEL),
+            # round O's form's after them on the held rows (SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL)
+            beside = figures["chunk"] * chunk / 1000 if figures.get("whole_out_beside_box", True) else 0
+            boxes = max(boxes, figures["whole_out"] * voxels / 1000 + max(SPCONV_L4_BASE_MIB, beside))
         return decoders * DECODER_MIB + boxes
     return decoders * DECODER_MIB + figures["whole"] * voxels / 1000
+
+
+def decode_ram_mib(voxels: int, chunk: int) -> float:
+    """MiB of RAM a decode in boxes of `chunk` fine voxels holds for a shape of `voxels` voxels beside the process (0
+    on whole tables, on flex_gemm and in round O's form): the level-4 form's level-3 table during the whole output
+    call's boxes (HOST_LEVEL3) and the shape decoder's mesh parked beside the texture decode (park_mesh;
+    SPCONV_L4_RAM_*)."""
+    if not chunk or decode_backend() == "flex_gemm":
+        return 0.0
+    figures = decode_figures()
+    ram = 0.0
+    if figures.get("whole_out") and voxels > figures.get("whole_out_from", 0) and figures.get("form") == 4:
+        ram += SPCONV_L4_RAM_LEVEL3_MIB_PER_KVOXEL * voxels / 1000
+    if PARK_MESH and _parks_mesh():
+        ram += SPCONV_L4_RAM_MESH_MIB_PER_KVOXEL * voxels / 1000
+    return ram
 
 
 def chunk_for(voxels: int, limit_mib: float | None = None) -> int:
@@ -558,7 +700,11 @@ def chunk_for(voxels: int, limit_mib: float | None = None) -> int:
         return CHUNK_VOXELS if decode_mib(voxels) > figures["chunk_above"] else 0
     if not limit_mib or limit_mib <= 0:
         return 0
-    return CHUNK_VOXELS if decode_mib(voxels) > limit_mib / 1.1 else 0
+    if decode_mib(voxels) <= limit_mib / 1.1:
+        return 0
+    if figures.get("whole_out") and figures.get("whole_out_beside_box") and voxels > figures.get("whole_out_from", 0):
+        return SPCONV_L4_WHOLE_OUT_CHUNK_VOXELS     # the level-4 form beside the output layer's whole input
+    return CHUNK_VOXELS
 
 
 def fill_mib(voxels: int) -> float:
@@ -799,7 +945,10 @@ def resolution_fits(ctx: PartContext, occupied: int, tokens: int, resolution: in
         if resolution > 1024 and not _decodes_in_boxes(voxels) and _card_total_mib(ctx) < WHOLE_LEVEL_1536_MIB:
             return "card"
     available = ram_available_mib()
-    if available is not None and hook_ram_mib(voxels) > available - RAM_FLOOR_MIB:
+    # the hook's RAM, and what the decode in boxes holds in RAM itself (decode_ram_mib: the level-4 form's level-3
+    # table and parked mesh; another prop's hook may still be at work on the worker thread then)
+    held = decode_ram_mib(voxels, chunk_for(voxels, limits[0])) if limits is not None else 0.0
+    if available is not None and hook_ram_mib(voxels) + held > available - RAM_FLOOR_MIB:
         return "ram"
     return None
 
@@ -1286,6 +1435,34 @@ def tex(ctx: PartContext, prop: PropState, mode: str) -> None:
         store.checkpoint(prop.id, request.request_hash, tensors, noted)
 
 
+# The level-4 form (chunked.py on spconv where level 3 is decoded whole, _box_form() 4) holds the whole fine level's
+# output-layer input once (SPCONV_L4_WHOLE_OUT_*): beside the texture decode the shape decoder's mesh (36 bytes a
+# voxel: the tree's 437 MiB at 1536) then waits in RAM, and comes back for the closing of the holes (a copy each way,
+# ~0.1 s; the same values). So does round O's form where a record pairs it with a reach of the output layer's windows
+# (its held rows' whole output call: SPCONV_HOLD_WHOLE_OUT_MIB_PER_KVOXEL, which leaves the mesh out). The finish's
+# RAM test counts the parked mesh (decode_ram_mib).
+PARK_MESH = True
+
+
+def _parks_mesh() -> bool:
+    """Whether a decode in boxes on this card parks the shape decoder's mesh beside the texture decode: the level-4
+    form, or round O's form with a reach of the output layer's windows (park_mesh)."""
+    return decode_backend() != "flex_gemm" and (_box_form() == 4 or _plan_reach() is not None)
+
+
+def park_mesh(mesh: Any, chunk: int) -> bool:
+    """Move the decoded mesh off the card for the texture decode where the decode runs in the level-4 form's boxes, or
+    in round O's with an output reach (PARK_MESH, _parks_mesh); True where it was moved (finish moves it back before
+    fill_holes)."""
+    if not (PARK_MESH and chunk and _parks_mesh()):
+        return False
+    if getattr(mesh, "vertices", None) is None or not mesh.vertices.is_cuda:
+        return False
+    mesh.vertices, mesh.faces = mesh.vertices.cpu(), mesh.faces.cpu()
+    torch.cuda.empty_cache()
+    return True
+
+
 def decoders_fit(voxels: int, limit_mib: int, chunk: int | None = None) -> bool:
     """May both decoders stay on the card while a shape of `voxels` voxels is decoded under a cap of `limit_mib`
     (decode_mib with two decoders, in the decode's boxes `chunk` - by default chunk_for's under `limit_mib`: whole
@@ -1347,6 +1524,7 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
     shape_feats = store.get_small(prop.id, "shape_slat")["feats"].to(device)
     mesh, subs = decode.decode_shape(loader.get("shape_dec"), shape_feats, coords, resolution)
     del shape_feats
+    parked = park_mesh(mesh, chunk)     # the level-4 form's texture decode without the mesh beside it (PARK_MESH)
     if together:
         loader.trim()
     else:
@@ -1363,6 +1541,8 @@ def finish(ctx: PartContext, prop: PropState, mode: str) -> "FinishSteps | None"
         loader.drop(*gone)                              # pair found room for them beside the holes: ctx.hold)
     else:
         loader.trim()
+    if parked:
+        mesh.vertices, mesh.faces = mesh.vertices.to(device), mesh.faces.to(device)
     ctx.emit(Event("step", "finish", prop.id, 2, 3))
     decode.fill_holes(mesh)
     ctx.emit(Event("step", "finish", prop.id, 3, 3))

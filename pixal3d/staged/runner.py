@@ -464,7 +464,11 @@ class StagedRunner:
                 for prop in group:
                     self._fail(prop, first, failure)
                 continue
-            self._read_ahead(index, first, kind)
+            # the decoders each prop's finish loads come first, then the next group's networks (the next kind's
+            # texture network): in a batch with single-view props after multi-view ones the first finish read them
+            # from the disk (round N's six props: 1.77 + 1.74 s), their pages from upsample's read long gone
+            lazy = tuple(self.plan.networks(last, kind))
+            self._read_ahead(index, first, kind, before=lazy)
             self._want(first, group[0])
             own = set(self.plan.networks(first, kind))
             for position, prop in enumerate(group):
@@ -482,7 +486,7 @@ class StagedRunner:
                 following = next((other for other in group[position + 1:] if not other.over), None)
                 self._set_aside(first, kind, more=position + 1 < len(group), prop=prop, following=following)
                 if not position + 1 < len(group):
-                    self._read_ahead(index, first, kind)
+                    self._read_ahead(index, first, kind, before=lazy)
                 run_last(prop)
                 kept = [name for name in ctx.hold if ctx.loader.get(name) is not None]
                 ctx.hold = frozenset()
@@ -626,14 +630,19 @@ class StagedRunner:
         ctx.keep = frozenset(later[0]) if later else frozenset()
         self.plan.leave(ctx, part, kind)
 
-    def _read_ahead(self, index: int, part: str, kind: str) -> None:
+    def _read_ahead(self, index: int, part: str, kind: str, before: tuple = ()) -> None:
         """While a group runs, the files of the next networks that will be loaded are read into the system's file
         cache: those of the first later group that needs any network neither on the card nor this group's own, all
-        of that group's in turn (they are loaded together: Hi3D's two picture encoders)."""
+        of that group's in turn (they are loaded together: Hi3D's two picture encoders). `before`: networks loaded
+        sooner than that group's, read first where they are not on the card (the paired finish's decoders, which
+        every prop of the texture group loads before the next kind's texture network)."""
         loader = self.ctx.loader
         skip = set(self.plan.networks(part, kind)) | set(loader.loaded()) | set(self.plan.LIGHT)
         ahead = next(([name for name in names if name not in skip] for names in self._later(index, part, kind)
                       if any(name not in skip for name in names)), [])
+        if before:
+            first = [name for name in before if name not in set(loader.loaded()) | set(self.plan.LIGHT)]
+            ahead = first + [name for name in ahead if name not in first]
         if ahead and ahead[0] != self._ahead:
             self._ahead = ahead[0]
             loader.prefetch(*ahead)
