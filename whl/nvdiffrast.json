@@ -48,6 +48,7 @@
   "cpu_instructions": "legacy SSE / VEX scalar code 198 / 0, BMI2 0, FMA 0, AVX2 12 (the C runtime's CPU-checked strlen / memchr); the replaced pyd: 0 / 221, BMI2 22",
   "checks": "rasterize (+db), interpolate (+da), texture linear and mipmapped, DepthPeeler 2 layers bit-equal to the replaced wheel on an RTX 3060; antialias within its own run-to-run noise (atomics: 431 of 1.57 M values by <= 1.2e-7 against the replaced wheel's 464 against itself); a 1536 tall_man through a fresh install decodes the same mesh; pip install --force-reinstall --no-deps and the RECORD check clean",
   "build_command": "code/logs/profiling/release-check-2026-11-19/windows/tools/build_nvdiffrast.bat (setup.py build_ext inside vcvars64, MAX_JOBS 16, CUDA_VISIBLE_DEVICES=-1), then the extension swapped into the shipped wheel",
+  "rebuild": "Spellcast3D's code/release/wheels/nvdiffrast/build_nvdiffrast_win.bat (https://github.com/IgorAherne/spellcast3d): the same source, compiler settings and GPU architectures, as a wheel built from the source; `prepare_release.py scan-cpu <wheel>` there tells whether a build runs on a CPU without AVX2",
   "runtime_requirements": {
     "install": "pip install <this wheel>  (Pixal3D's install.py installs every wheel in its whl folder)",
     "import_needs": [
