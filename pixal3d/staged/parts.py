@@ -36,7 +36,7 @@ from typing import Any, Callable
 
 import torch
 
-from ..modules import precision
+from ..modules import exact, precision
 from ..modules.sparse import SparseTensor
 from . import hi3d
 from .runner import PartContext, PropState
@@ -1175,7 +1175,8 @@ def _steps(ctx: PartContext, prop: PropState, part: str, mode: str) -> Callable[
 
 def cutout(ctx: PartContext, prop: PropState, mode: str) -> None:
     def matte(image: Any) -> Any:
-        return _network(ctx, "rembg")(image)
+        with exact.conditioning():
+            return _network(ctx, "rembg")(image)
 
     prepared = ctx.hooks.prepare(prop.req, matte)
     if not prepared.images:
@@ -1201,8 +1202,9 @@ def features(ctx: PartContext, prop: PropState, mode: str) -> None:
     proj_cond = _proj_cond()
     dino = _network(ctx, "dino")
     source, view = _source(ctx, prop)
-    z512 = proj_cond.encode(dino, proj_cond.image_tensor(source, 512, ctx.device))
-    z1024 = proj_cond.encode(dino, proj_cond.image_tensor(source, 1024, ctx.device))
+    with exact.conditioning():
+        z512 = proj_cond.encode(dino, proj_cond.image_tensor(source, 512, ctx.device))
+        z1024 = proj_cond.encode(dino, proj_cond.image_tensor(source, 1024, ctx.device))
     cond = _torso(proj_cond.cond_dense(proj_cond.SPECS["ss"], z512, view))
     if geometry(prop) != "hi3d":            # cond_lr's: a Hi3D prop has no cond_lr
         ctx.store.put_device(prop.id, "dino512", {"z": z512})

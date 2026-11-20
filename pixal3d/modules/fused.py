@@ -34,7 +34,8 @@ Chamfer distance 0.2-0.4 % of the bounding-box diagonal). A pass of the detail f
 shape flow 21 %, a batch 8-10 %. The memory peak of a pass is unchanged.
 
 The fused path is taken only where it applies: CUDA tensors in bf16, no autograd, no autocast, the shapes the flows
-use; anything else runs the eager code. Before the first fused call of a process the three kernels run once on small
+use, not inside modules/exact.py's scope (the coarse stages' flows on the ampere profile); anything else runs the
+eager code. Before the first fused call of a process the three kernels run once on small
 tables of the flows' widths, against the eager ops (`_check`): a card or a Triton that cannot compile or run them,
 or runs them wrong, turns the switch off with a warning, and the flows run their eager code. Triton compiles each
 kernel on its first call (about 0.1 s each, 1.5 s for all of them) and keeps it in its cache for the next
@@ -48,6 +49,8 @@ from typing import Optional
 
 import torch
 import torch.nn.functional as F
+
+from . import exact
 
 _MODES = {"0": "off", "off": "off", "false": "off", "no": "off",
           "": "rounded", "1": "rounded", "on": "rounded", "true": "rounded", "yes": "rounded", "rounded": "rounded",
@@ -80,11 +83,19 @@ _checked = False        # the kernels ran once on this process's card and agreed
 
 def active(feats: torch.Tensor) -> bool:
     """Whether the blocks take the fused path for these features (bf16 only: the flows' dtype, and the one the
-    rounded mode reproduces). The first time, the kernels are tried on the card (`_check`)."""
-    if (MODE == "off" or not feats.is_cuda or feats.dtype != torch.bfloat16 or torch.is_grad_enabled()
+    rounded mode reproduces), outside exact.scope, where `ready`."""
+    if (exact.active() or not feats.is_cuda or feats.dtype != torch.bfloat16 or torch.is_grad_enabled()
             or torch.is_autocast_enabled()):
         return False
-    return _checked or _check(feats.device)
+    return ready(feats.device)
+
+
+def ready(device: torch.device) -> bool:
+    """Whether the switch is on and the kernels passed their self-check on this card: the first time, they are tried
+    (`_check`). active() asks at the first call that may run them; the engine asks when it loads a flow that runs
+    exactly (modules/exact.py), whose passes never call active(), so that the check runs before the first flow's
+    first pass."""
+    return MODE != "off" and (_checked or _check(device))
 
 
 def _check(device: torch.device) -> bool:

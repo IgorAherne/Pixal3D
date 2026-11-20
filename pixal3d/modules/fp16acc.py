@@ -18,7 +18,8 @@ Converted, per block of the ss and lr flows: the self-attention's to_qkv and to_
 to_out, the MLP's first layer (its GELU done in the same pass), proj_linear. Not converted: fc2, the cross-attention's
 to_kv (five context tokens), the modulation and the input / output layers (a few rows each), the hr and tex flows
 (their int8 GEMMs, modules/int8.py). The switch is read when `convert` runs (the staged engine's convert hook, after
-SageAttention's fold); a network already converted stays as it is:
+SageAttention's fold; the engine converts no flow that runs exactly, modules/exact.py: on the ampere profile the
+switch takes effect with PIXAL3D_COARSE_EXACT=off); a network already converted stays as it is:
 
     "on", "1", "true", "yes"     the ss and lr flows on the ampere profile (modules/precision.py); on the turing and
                                  pascal profiles nothing is converted (one line says so)

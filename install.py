@@ -9,6 +9,7 @@
 #
 # Run it with the interpreter you want to install into, e.g.
 #     venv\Scripts\python.exe install.py
+import hashlib
 import subprocess
 import sys
 import os
@@ -60,6 +61,8 @@ DOWNLOAD_WHEELS = [
     {
         "name": "flash_attn",
         "filename": "flash_attn-2.8.3+cu128torch2.8-cp311-cp311-win_amd64.whl",
+        # the build Spellcast3D tested (sm_80 / 90 / 100 / 120 SASS): a "-latest" tag of a mirror may move
+        "sha256": "eaa83bf2ad7fa5fde79b3c506158774804b4595e0b0e4223c5ac7f43610d79f3",
         "min_cc": MIN_CC_FOR_FLASH_ATTN,
         "skip_reason": "never: the wheel is installed on every card (it imports without its kernels)",
         "urls": [
@@ -72,6 +75,7 @@ DOWNLOAD_WHEELS = [
         # is built on neighborhood attention, so NATTEN is not optional.
         "name": "natten",
         "filename": "natten-0.21.6+cu128torch2.8-cp311-cp311-win_amd64.whl",
+        "sha256": "8db5f35d4c44dd0e7b832025ea6484f96b810faeed508cfec3671e5b8191f18a",
         "min_cc": MIN_CC_FOR_NATTEN,
         "skip_reason": "never: the wheel is installed on every card (it imports without its kernels)",
         "urls": [
@@ -92,6 +96,8 @@ DOWNLOAD_WHEELS = [
 # only unzip the subpackage out of it, so that doesn't matter.
 FLEX_GEMM_COMPLETE = {
     "filename": "flex_gemm-1.0.0+cu128torch2.8-cp311-cp311-win_amd64.whl",
+    # the build whose Triton kernels Spellcast3D tested: their Python source goes into the venv from a "-latest" tag
+    "sha256": "19d4e67950d53bdb29ebd7adfdfd00aa300e9962338f913161bb7254959d7144",
     "urls": [
         f"{SPZ_WHEEL_MIRROR}/flex_gemm-1.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
         "https://github.com/PozzettiAndrea/cuda-wheels/releases/download/flex_gemm-latest/flex_gemm-1.0.0%2Bcu128torch2.8-cp311-cp311-win_amd64.whl",
@@ -227,6 +233,11 @@ def run_command_with_retry(cmd: str, desc: Optional[str] = None, max_retries: in
     if "pip install" in cmd and "--progress-bar" not in cmd:
         cmd += " --progress-bar=on"
 
+    # Spellcast3D's tested versions (its constraints file): pip runs --isolated here, deaf to PIP_CONSTRAINT
+    constraint = os.environ.get("SPELLCAST_PIP_CONSTRAINT", "")
+    if "pip install" in cmd and constraint and os.path.isfile(constraint):
+        cmd += f' -c "{constraint}"'
+
     for attempt in range(max_retries):
         try:
             if attempt > 0:
@@ -275,8 +286,32 @@ def _url_exists(url: str, timeout: int = 15) -> bool:
         return False
 
 
-def download_file(urls: List[str], dest: Path, label: str) -> None:
-    """Download to `dest`, walking the mirror list until one succeeds."""
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _replace_when_free(src: Path, dest: Path, tries: int = 10) -> None:
+    """os.replace, waiting out a virus scanner that still holds the file just written."""
+    for attempt in range(tries):
+        try:
+            os.replace(src, dest)
+            return
+        except PermissionError:
+            if attempt == tries - 1:
+                raise
+            time.sleep(1)
+
+
+def download_file(urls: List[str], dest: Path, label: str, sha256: Optional[str] = None) -> None:
+    """Download to `dest`, walking the mirror list until one succeeds; with `sha256`, only that file counts: another
+    file under the same name (a mirror's moved tag) is deleted and the next mirror tried. The bytes arrive under a
+    `.part` name, so a download cut short never leaves a broken file under the real one for the next run to install."""
+    part = dest.with_name(dest.name + ".part")
+
     def _reporthook(block_num, block_size, total_size):
         dl = block_num * block_size
         if total_size > 0:
@@ -301,13 +336,19 @@ def download_file(urls: List[str], dest: Path, label: str) -> None:
                 if attempt > 0:
                     print(f"  Retry attempt {attempt + 1}/{MAX_RETRIES}...")
                     time.sleep(RETRY_DELAY)
-                urllib.request.urlretrieve(url, str(dest), reporthook=_reporthook)
+                urllib.request.urlretrieve(url, str(part), reporthook=_reporthook)
                 print()  # newline after progress
+                if sha256 and _sha256(part) != sha256:
+                    part.unlink()
+                    print(f"  {label}: {mirror_label} serves another file under this name (its SHA-256 is not "
+                          f"{sha256}); trying the next mirror")
+                    break
+                _replace_when_free(part, dest)
                 return
             except Exception as e:
                 print(f"\n  Download failed: {e}")
-                if dest.exists():
-                    dest.unlink()
+                if part.exists():
+                    part.unlink()
                 if attempt == MAX_RETRIES - 1:
                     print(f"  All {MAX_RETRIES} attempts failed for {mirror_label}. Trying next mirror...")
 
@@ -475,7 +516,7 @@ def ensure_flex_gemm_triton():
     tmp_dir = Path(tempfile.mkdtemp(prefix="pixal3d_flexgemm_"))
     try:
         wheel = tmp_dir / FLEX_GEMM_COMPLETE["filename"]
-        download_file(FLEX_GEMM_COMPLETE["urls"], wheel, wheel.name)
+        download_file(FLEX_GEMM_COMPLETE["urls"], wheel, wheel.name, FLEX_GEMM_COMPLETE["sha256"])
 
         prefix = "flex_gemm/kernels/triton/"
         with zipfile.ZipFile(str(wheel)) as zf:
@@ -582,12 +623,8 @@ def install_dependencies(args):
         # inference.py doesn't need it.
         run_command_with_retry("pip install spaces", "Installing spaces", fatal=False)
 
-        # 2.1. xformers — fallback attention for pre-Ampere GPUs that can't run flash-attention
-        print("\n--- Installing xformers ---")
-        run_command_with_retry(
-            f"pip install xformers==0.0.32.post2 --index-url {TORCH_INDEX_URL}",
-            "Installing xformers"
-        )
+        # 2.1. No xformers: 0.0.32 refuses to import beside flash_attn 2.8.3 ("Requires Flash-Attention version
+        # <= 2.8.2"), and below sm_80 its kernel is torch SDPA's own memory-efficient one (precision.py: SDPA)
 
         # 2.2. utils3d — pinned wheel, pure python (no git executable needed)
         print("\n--- Installing utils3d ---")
@@ -627,7 +664,7 @@ def install_dependencies(args):
                     print(f"Skipping {spec['name']}: {spec['skip_reason']}")
                     continue
                 wheel = whl_dir / spec["filename"]
-                download_file(spec["urls"], wheel, spec["filename"])
+                download_file(spec["urls"], wheel, spec["filename"], spec.get("sha256"))
                 print(f"Installing: {wheel.name}")
 
             # --no-deps: these wheels declare loose torch pins that would otherwise
@@ -694,17 +731,12 @@ def verify_installation():
                       "during generation. Re-run install.py to replace the wheel.")
                 ok = False
 
-            # Attention: flash_attn on Ampere+, xformers everywhere else.
-            has_attn = False
-            for mod in ["flash_attn", "xformers"]:
-                try:
-                    __import__(mod)
-                    print(f"[OK] {mod} detected.")
-                    has_attn = True
-                except ImportError:
-                    print(f"[WARNING] {mod} not found.")
-            if not has_attn:
-                print("[ERROR] No attention backend available (need flash_attn or xformers).")
+            # Attention: flash_attn on Ampere+ (it imports on every card), torch SDPA below sm_80.
+            try:
+                __import__("flash_attn")
+                print("[OK] flash_attn detected.")
+            except ImportError:
+                print("[ERROR] No attention backend available (need flash_attn).")
                 ok = False
 
             # NATTEN drives the NAF upsampler; without libnatten the shape/tex

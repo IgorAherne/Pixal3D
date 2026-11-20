@@ -615,13 +615,16 @@ def main(argv: Optional[list[str]] = None) -> int:
         elif "triton" not in skip:
             say("the earlier calibration has no tile choice for the int8 GEMMs with this Triton: the Triton step "
                 "runs again")
-        if _sage_stands(earlier):   # the attention timings belong to the wheel they were made with
+        # the attention timings belong to the wheel they were made with; a step asked for by name runs all the same
+        # (the installer's retry of a trial cut short, whose section a complete record holds like any other)
+        if _sage_stands(earlier) and "sage" not in only:
             skip |= {"sage"}
             record["sage"] = earlier["sage"]
         say(f"the earlier calibration stands: {len(lacking)} new convolution shapes are measured"
             if lacking else "the earlier calibration stands: no new convolution shapes to measure")
         if "sage" not in skip:
-            say("the attention kernels are timed again (another SageAttention wheel, or a race the record lacks)")
+            say("the attention kernels are timed again (another SageAttention wheel, a race the record lacks, or a "
+                "trial asked for again)")
     began = time.monotonic()
     from pixal3d.modules import precision
 

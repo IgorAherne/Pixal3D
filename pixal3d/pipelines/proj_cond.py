@@ -29,7 +29,7 @@ import torch
 import torch.nn as nn
 from torchvision.transforms.functional import normalize
 
-from ..modules import naf_sliced
+from ..modules import exact, naf_sliced
 from ..trainers.flow_matching.mixins.image_conditioned_proj import (
     IMAGENET_MEAN,
     IMAGENET_STD,
@@ -178,8 +178,11 @@ FP16_FAST_FROM = (7, 5)
 
 
 def dino_fp16(device: torch.device) -> bool:
-    """Whether DINOv3 runs under float16 autocast on `device`, by the switch and the card."""
+    """Whether DINOv3 runs under float16 autocast on `device`: never inside exact.scope, else by the switch and
+    the card."""
     global _dino_fp16_on
+    if exact.active():
+        return False
     if _dino_fp16_on is None:
         if DINO_FP16 in ("1", "on", "true", "yes"):
             _dino_fp16_on = True

@@ -104,14 +104,16 @@ The wheel from post10 also carries a precise Pascal op (PASCAL_PRECISE, Spellcas
 scales and q's mean exact, ~30 % less error, other bits): the calibration's trial records its accuracy and timing on
 the card ("pascal_precise"), and where that record says ok it serves both P.V modes in place of the shipped op and its
 twins (PRECISE_DEFAULT; PIXAL3D_PASCAL_PRECISE=off keeps the shipped op, force skips the record). PIXAL3D_SAGE_FLOWS
-(developers) keeps the flows it leaves out on exact attention.
+(developers) keeps the flows it leaves out on their attention backend.
+
+Inside modules/exact.py's scope (the coarse stages' flows on the ampere profile) SageAttention is never used: there
+usable() says no, and the flows' attention backend answers, as with the switch off.
 """
 
 from __future__ import annotations
 
 import os
 import statistics
-import threading
 import time
 from pathlib import Path
 from typing import Callable, Optional
@@ -119,7 +121,7 @@ from typing import Callable, Optional
 import torch
 import torch.nn.functional as F
 
-from . import precision
+from . import exact, precision
 
 DEFAULT = True      # what an unset PIXAL3D_SAGE means: on, after the self-check (round G: the five test props at 1536
 #                     made with it are of the same quality as with flash_attn - Chamfer 0.17-0.24 % of the bounding-box
@@ -257,12 +259,9 @@ INT8PV_MARGIN = 0.05        # the int8 P.V kernel serves only where it is at lea
 #                             differently, so a card that gains nothing keeps the fp16 kernel's numbers)
 INT8PV_TURING_DEFAULT = False   # what an unset PIXAL3D_INT8PV means on sm_7x (RTX 20xx): the fp16 P.V kernel for every
 #                                 block; the user decides after the twin's end-to-end judgement on an RTX 2070
-# PIXAL3D_SAGE_FLOWS (developers; Spellcast3D round P's localisation of the GTX 10xx colour bias): the flows whose
-# full self-attention runs SageAttention, "ss,lr,hr,tex" or a part of it; unset, "" or "all": every flow. A flow left
-# out keeps exact attention: mark_int8pv wraps the forward of its self-attention modules (`_exact_forward`) and
-# attention() answers the calls made inside them with torch's SDPA in the torso's dtype (the fold's powers of two
-# scale it exactly, as they do every path).
-_EXACT = threading.local()      # .depth > 0: inside the forward of a module of a flow PIXAL3D_SAGE_FLOWS leaves out
+# PIXAL3D_SAGE_FLOWS (developers): the flows whose full self-attention runs SageAttention, "ss,lr,hr,tex" or a part
+# of it; unset, "" or "all": every flow. A flow left out is not folded, and mark_int8pv runs its self-attention
+# modules in exact.scope, where its attention backend answers.
 
 
 def sage_flows() -> Optional[frozenset]:
@@ -273,18 +272,32 @@ def sage_flows() -> Optional[frozenset]:
     return frozenset(part.strip() for part in text.split(",") if part.strip())
 
 
+def runs(kind: str) -> bool:
+    """Whether a flow of `kind` (ss, lr, hr, tex) may run SageAttention by PIXAL3D_SAGE_FLOWS."""
+    flows = sage_flows()
+    return flows is None or kind in flows
+
+
 def usable(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> bool:
     """Whether this self-attention may run SageAttention (the caller has checked the switch and that it is the full
-    self-attention of one sequence). The first time, the kernel is tried on the card (`_check`)."""
-    if (not q.is_cuda or q.dtype != precision.torso() or k.dtype != q.dtype or v.dtype != q.dtype
+    self-attention of one sequence): never inside exact.scope; elsewhere where `ready`."""
+    if (exact.active() or not q.is_cuda or q.dtype != precision.torso() or k.dtype != q.dtype or v.dtype != q.dtype
             or torch.is_grad_enabled() or torch.is_autocast_enabled()):
         return False
     if q.shape[-1] != HEAD_DIM or k.shape[-1] != HEAD_DIM or v.shape[-1] != HEAD_DIM:
         return False
     if q.shape[-3] < MIN_TOKENS or k.shape[-3] < MIN_TOKENS:
         return False
+    return ready(q.device)
+
+
+def ready(device: torch.device) -> bool:
+    """Whether SageAttention passed its self-check on this card: the first time, the kernels are tried (`_check`).
+    usable() asks at the first call that may run SageAttention; the engine asks when it loads a flow that runs
+    exactly (modules/exact.py), whose passes never call usable(), so that the check runs before the first flow's
+    first pass."""
     if _state is None:
-        _check(q.device)
+        _check(device)
     return bool(_state)
 
 
@@ -294,9 +307,6 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, scaled: bool = 
     q's dtype. Call only where usable() said True. `scaled`: v already carries the 2^-V_SHIFT (the weights were
     folded, `fold`): the answer keeps it, and the folded to_out undoes it. `int8pv`: the block was marked for the
     int8 P.V kernel (mark_int8pv), which serves where the self-check accepted it; the fp16 P.V kernel otherwise."""
-    if getattr(_EXACT, "depth", 0):        # a flow PIXAL3D_SAGE_FLOWS leaves out (mark_int8pv)
-        return F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2),
-                                              v.transpose(1, 2)).transpose(1, 2).contiguous()
     kernel = _kernel_int8pv if int8pv and _kernel_int8pv is not None else _kernel
     if scaled:
         return kernel(q, k, v)
@@ -308,45 +318,25 @@ def mark_int8pv(model: torch.nn.Module, kind: str) -> int:
     """Mark the full self-attention modules of a flow network of `kind` (ss, lr, hr, tex) that may run the int8 P.V
     kernel: every block's of the flows INT8PV_FLOWS names, except the blocks INT8PV_SKIP lists for that kind.
     Done once per loaded network by the engine; harmless without the kernel (attention() then runs the fp16 P.V
-    kernel for every block). The self-attention modules of a flow PIXAL3D_SAGE_FLOWS leaves out (`sage_flows`; the
-    dense ss flow's too) get `_exact_forward` instead: attention() answers them exactly. Returns how many modules
-    were marked for the int8 P.V kernel."""
+    kernel for every block). The self-attention modules of a flow PIXAL3D_SAGE_FLOWS leaves out (`runs`; the dense
+    ss flow's too) run in exact.scope instead. Returns how many modules were marked for the int8 P.V kernel."""
     count = 0
     skip = set(INT8PV_SKIP.get(kind, ()))
     allowed = kind in INT8PV_FLOWS
-    flows = sage_flows()
-    exact = flows is not None and kind not in flows
+    left_out = not runs(kind)
     for index, block in enumerate(getattr(model, "blocks", ())):
         for module in block.modules():
             if (type(module).__name__ not in ("SparseMultiHeadAttention", "MultiHeadAttention")
                     or getattr(module, "_type", None) != "self" or getattr(module, "attn_mode", None) != "full"):
                 continue
-            module.sage_int8pv = allowed and index not in skip and not exact
+            module.sage_int8pv = allowed and index not in skip and not left_out
             count += int(module.sage_int8pv)
-            if exact:
-                _exact_forward(module)
-    if exact and kind:
-        print(f"[SAGE] {kind}: exact attention (PIXAL3D_SAGE_FLOWS={os.environ.get('PIXAL3D_SAGE_FLOWS', '')})",
-              flush=True)
+            if left_out:
+                exact.wrap(module)
+    if left_out and kind:
+        print(f"[SAGE] {kind}: its attention backend (PIXAL3D_SAGE_FLOWS="
+              f"{os.environ.get('PIXAL3D_SAGE_FLOWS', '')})", flush=True)
     return count
-
-
-def _exact_forward(module: torch.nn.Module) -> None:
-    """The module's forward wrapped so that the SageAttention calls made inside it run exactly (PIXAL3D_SAGE_FLOWS);
-    once per module (its `sage_exact` says so)."""
-    if getattr(module, "sage_exact", False):
-        return
-    real = module.forward
-
-    def forward(*args, **kwargs):
-        _EXACT.depth = getattr(_EXACT, "depth", 0) + 1
-        try:
-            return real(*args, **kwargs)
-        finally:
-            _EXACT.depth -= 1
-
-    module.forward = forward
-    module.sage_exact = True
 
 
 def fold(model: torch.nn.Module) -> int:

@@ -172,6 +172,31 @@ The flow networks exist once per kind (`<name>.sv` from `pipeline.json`, `<name>
 inside every part the multi-view props go first, then the networks are exchanged and the single-view props follow.
 The decoders, DINOv3, NAF and background removal serve both kinds.
 
+The pictures' conditioning and the coarse stages compute exactly on the ampere profile (`pixal3d/modules/exact.py`): the
+cut-out, DINOv3's tokens and the ss and lr flows give the original code's numbers bit for bit, and the faster paths
+below serve the detail flows (hr, tex) and the decoders. The lr, hr and tex stages draw their starting noise from one
+generator, a row per occupied voxel in the voxels' order, so a rounding change in the coarse stages that moves a few
+voxels of the sparse structure re-deals all later noise: another model, not a nearby one (any of the faster paths does
+it there, an exact kernel swap too), while a rounding change in the detail flows moves only their own output. Measured
+on the RTX 3060 (the boy from his front picture at 1536, seeds 11-13, and from three pictures at 1024, seed 11): the ss
+and lr results, their conditioning, the hr token set and the hr / tex starting noise equal the original's bit for bit;
+the decoded meshes share 94.0-94.1 % of the original's voxels (89.3 % for the three pictures at 1024), their surfaces
+lie 0.087-0.091 voxel apart on average (99th percentile 0.67-0.73; 0.17 / 1.32 at 1024) and the texture's base colour
+0.45-0.86 of 255 levels (2.1), where the faster coarse stages made other models. The cost is the coarse parts' own:
+about 5.8 s a single-view prop at 1536 (the ss flow +4.0 s, lr +0.9, DINOv3 +0.7, the matte +0.2 a picture; the three
+boys' batch 174.0 -> 201.8 s), and over the six test props at 1536 (two batches) the coarse parts +41 s (cutout +2,
+DINOv3 +10, ss +18, lr +11), the props' seconds 878 -> 896 s (+2 %) and the batches 923 -> 926 s; the memory peaks stay
+where they were, and under an 8 GB budget (a 7.2 GiB card emulated) the props are made at the qualities as before (the
+boy at 1536, the tree at 1408). `PIXAL3D_COARSE_EXACT=off` gives the conditioning and the coarse flows the faster paths
+as well (for comparisons). How: the engine marks the two flows once they are loaded (`exact.mark` in `_prepare_flow`:
+they are not folded or converted, their passes run in `exact.scope`, and the self-checks of the fused kernels and of
+SageAttention, which those passes never ask for, are made there: before the first flow's first pass), and the parts
+`cutout` and `features` make the cut-out and DINOv3's tokens in that scope (`exact.conditioning`); inside it
+`sage.usable` and `fused.active` say no, so the attention backend (flash_attn) and the eager ops run, and
+`builders.matte_fp16` / `proj_cond.dino_fp16` keep float32. The turing and pascal profiles have no original arithmetic
+to match (their torsos are fp16 and fp32): nothing changes there. On the ampere profile the SageAttention, fused-kernel,
+DINOv3 and background-removal paragraphs below therefore concern the detail flows, or the switch off.
+
 The flows' transformer blocks run their elementwise chains (LayerNorm32 and the adaLN modulation, the gated
 residuals, the q / k RMS norm with the rotary embedding) as fused Triton kernels (`pixal3d/modules/fused.py`), on
 by default: `PIXAL3D_FUSED=off` in the environment gives the eager PyTorch ops, bit for bit the numbers of before.

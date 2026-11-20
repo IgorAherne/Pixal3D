@@ -32,6 +32,8 @@ import os
 import torch
 import torch.nn as nn
 
+from ..modules import exact
+
 NAMES = ("rembg", "moge", "dino", "naf")
 MOGE_REPO = "models--Ruicheng--moge-2-vitl"        # app.py MOGE_MODEL_NAME, as the Hugging Face cache names it
 
@@ -102,8 +104,11 @@ FP16_FAST_FROM = (7, 5)
 
 
 def matte_fp16(device: torch.device) -> bool:
-    """Whether the matte runs under float16 autocast on `device`, by the switch and the card."""
+    """Whether the matte runs under float16 autocast on `device`: never inside exact.scope, else by the switch and
+    the card."""
     global _matte_fp16_on
+    if exact.active():
+        return False
     if _matte_fp16_on is None:
         if MATTE_FP16 in ("1", "on", "true", "yes"):
             _matte_fp16_on = True

@@ -32,7 +32,7 @@ import torch
 
 from ..pipelines import samplers
 from . import parts
-from ..modules import fp16acc, int8, sage
+from ..modules import exact, fp16acc, int8, sage
 from .runner import PartContext, PipelineArgs, StagedRunner
 from .types import EngineOptions, Event, Hooks, PropRequest
 
@@ -50,16 +50,28 @@ KERNEL_LIBRARIES = ("triton", "flash_attn")
 
 def _prepare_flow(model: Any, kind: str = "", checkpoint: str = "") -> Any:
     """A flow network (`kind`: ss, lr, hr or tex; `checkpoint`: its file's name, which names its int8 calibration)
-    once its weights are on the card (the loader's convert hook): SageAttention's scaling of v folded into its
-    weights when the switch is on (modules/sage.py, exact), then its token-sized linears as int8 GEMMs where
-    PIXAL3D_INT8's policy says so for that kind (modules/int8.py; the fold comes first so that the int8 scales
-    carry it), and the ss / lr flows' linears in fp16 with fp16 accumulation where PIXAL3D_FP16ACC asks for it
-    (modules/fp16acc.py: off by default)."""
-    try:
-        from ..modules.sparse import config as sparse_config
+    once its weights are on the card (the loader's convert hook). A flow that runs exactly (modules/exact.py: the
+    coarse stages' ss and lr on the ampere profile) is only marked so, and the self-checks of the fused kernels and
+    of SageAttention, which its passes never ask for, are made then (fused.ready, sage.ready): before the first
+    flow's first pass. Any other flow: SageAttention's scaling of v folded into its weights where it runs
+    SageAttention (modules/sage.py, exact), then its token-sized linears as int8 GEMMs where PIXAL3D_INT8's policy
+    says so for that kind (modules/int8.py; the fold comes first so that the int8 scales carry it), and the ss / lr
+    flows' linears in fp16 with fp16 accumulation where PIXAL3D_FP16ACC asks for it (modules/fp16acc.py: off by
+    default)."""
+    from ..modules import fused
+    from ..modules.sparse import config as sparse_config
 
+    if exact.mark(model, kind):
+        weight = next(model.parameters(), None)
+        if weight is not None and weight.is_cuda:
+            fused.ready(weight.device)
+            if sparse_config.SAGE:
+                sage.ready(weight.device)
+        return model
+    try:
         if sparse_config.SAGE:
-            sage.fold(model)
+            if sage.runs(kind):
+                sage.fold(model)
             marked = sage.mark_int8pv(model, kind)
             if marked and sage._kernel_int8pv is not None:
                 print(f"[SAGE] {kind}: {marked} of {len(model.blocks)} blocks on the int8 P.V kernel", flush=True)
