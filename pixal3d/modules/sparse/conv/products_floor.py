@@ -109,7 +109,7 @@ The record's section (written by calibrate.py; a floor is None where its class w
                         "why_not_3": "...",
                         "verified": {"2": 1250000, "3": 4000000, "4": 17000000},
                         "boundary": [{"kind", "ci", "co", "M", "rows_differ", "first"}],
-                        "peak_alloc_mib": 5200, "budget_mib": 5632,
+                        "peak_alloc_mib": 5200, "budget_mib": 5632, "reach_budget_mib": 7716,
                         "shapes": [{"kind", "role", "level", "ci", "co", "dtype", "mmax", "tested", "failed",
                                     "floor", "big": [{"M", "rows_differ", "first"}], "reach": [the same],
                                     "verified", "window_ok", "boundary"}, ...], "seconds": 41.2, "summary": "..."}
@@ -855,7 +855,7 @@ def measure(device: Any, say: Callable[[str], None] = print, pause: Optional[Cal
         products = conv_spconv.path() == "products"
     base["card"] = torch.cuda.get_device_name(device)
     shapes: List[dict] = []
-    budget = _big_budget(device)
+    budget, reach_budget = _big_budget(device), _reach_budget(device)
     torch.cuda.reset_peak_memory_stats(device)
 
     def one(kind: str, ci: int, co: int, dtype: torch.dtype, fn_of: Callable[[torch.Tensor], Callable], seed: int,
@@ -970,10 +970,12 @@ def measure(device: Any, say: Callable[[str], None] = print, pause: Optional[Cal
     if verified_:
         summary += "; whole calls verified up to " + ", ".join(f"level {k} {v:,}" for k, v in sorted(verified_.items()))
     peak = round(torch.cuda.max_memory_allocated(device) / 2 ** 20)
-    summary += f"; at most {peak:,} MiB on the card (budget {budget / 2 ** 20:,.0f} MiB)"
+    summary += (f"; at most {peak:,} MiB on the card (the ladder's budget {budget / 2 ** 20:,.0f} MiB, past it "
+                f"{reach_budget / 2 ** 20:,.0f} MiB)")
     return {"ok": True, **base, "form": FORM, "products_floor": products_floor, "linear_floor": linear_floor,
             "exact": level is not None, "window": None, "box_level": level,
             "whole_only": found_plan["whole_only"], "output_windows_to": reach,
             "why_not_3": found_plan["why_not_3"], "verified": verified_,
             "boundary": boundary, "peak_alloc_mib": peak, "budget_mib": round(budget / 2 ** 20),
+            "reach_budget_mib": round(reach_budget / 2 ** 20),
             "shapes": shapes, "seconds": round(time.monotonic() - began, 1), "summary": summary}
