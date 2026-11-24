@@ -24,10 +24,13 @@ offset slice conv_spconv multiplies by):
   2 0.6-1.25 M rows, level 3 1.2-4 M, level 4 3-17 M), every row against the same rows in BOX_ROWS-row calls,
   compared window by window (the input and the whole call's output on the card, nothing else: at most BIG_BYTES
   (5.5 GiB) and BIG_FREE (70 %) of the free memory when the step starts - where a ladder size does not fit, the
-  largest size that fits is checked instead); the largest whole call that agreed (or the swept table's own, where
-  larger) is the shape's `verified` size, and a level's is the smallest of its stand-in shapes': a decode whose
-  level is larger is outside what this card was measured at (chunked says so; `covers_voxels` lets the planner keep
-  such props whole or at 1024);
+  largest size that fits is checked instead); then, where every ladder call agreed, the sizes past the ladder as
+  far as the card holds them (`reach_sizes`: the levels of props of REACH_VOXELS fine voxels, BIG_FREE of the free
+  memory with no fixed cap), up to the first that differs - which only ends the reach, it takes no boxes away;
+  the largest whole call that agreed (or the swept table's own, where larger) is the shape's `verified` size, and
+  a level's is the smallest of its stand-in shapes': a decode whose level is larger is outside what this card was
+  measured at (chunked says so; `covers_voxels` lets the planner keep such props whole or at 1024). So a card
+  with more memory is measured further and decodes bulkier props in boxes, by the one rule;
 - at cuBLAS's launch boundaries (BOUNDARY_SIZES: 2^20, 2^21, 2^22 rows) records which rows of a whole call differ
   from BOX_ROWS-row calls ("boundary": on an RTX 3060 under the pascal profile the fp32 output layer's last 64 / 128
   rows): a decode whose fine level lands in such a band (`boundary_band`) makes the output layer's whole call
@@ -108,8 +111,8 @@ The record's section (written by calibrate.py; a floor is None where its class w
                         "boundary": [{"kind", "ci", "co", "M", "rows_differ", "first"}],
                         "peak_alloc_mib": 5200, "budget_mib": 5632,
                         "shapes": [{"kind", "role", "level", "ci", "co", "dtype", "mmax", "tested", "failed",
-                                    "floor", "big": [{"M", "rows_differ", "first"}], "verified", "window_ok",
-                                    "boundary"}, ...], "seconds": 41.2, "summary": "..."}
+                                    "floor", "big": [{"M", "rows_differ", "first"}], "reach": [the same],
+                                    "verified", "window_ok", "boundary"}, ...], "seconds": 41.2, "summary": "..."}
 """
 
 from __future__ import annotations
@@ -122,8 +125,9 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import torch
 
 SECTION = "decode_products"
-FORM = 3                        # the section's format: round P's "box_level", "whole_only", "output_windows_to" (2);
-#                                 the launch-boundary check at 2^20 rows too and the plan's band and reach rules (3).
+FORM = 4                        # the section's format: round P's "box_level", "whole_only", "output_windows_to" (2);
+#                                 the launch-boundary check at 2^20 rows too and the plan's band and reach rules (3);
+#                                 the whole calls past the ladder, as far as the card holds them ("reach", 4).
 #                                 A section of an older form is read through `plan_of` (its shapes), and Spellcast3D's
 #                                 installer measures it once more (DECODE_PRODUCTS_FORM there)
 DEFAULT_FLOOR = 1 << 13         # measured on sm_86 (round O R2): every call from 8 Ki rows on agreed
@@ -136,9 +140,12 @@ MMAX_ROWS = 1_900_000           # the table a shape is swept on: a call of an or
 # test props at 1536 (level 0 12-50 k, level 1 52-200 k, level 2 0.2-0.75 M, level 3 0.87-3.1 M, level 4 2.4-16.5 M)
 LEVEL_LADDER = {0: (60_000,), 1: (250_000,), 2: (600_000, 1_000_000, 1_250_000),
                 3: (1_200_000, 2_500_000, 4_000_000), 4: (3_000_000, 6_000_000, 12_000_000, 17_000_000)}
-BIG_BYTES = int(5.5 * (1 << 30))  # the most a whole-call check holds (its input and the whole call's output), and at
+BIG_BYTES = int(5.5 * (1 << 30))  # the most a ladder check holds (its input and the whole call's output), and at
 BIG_FREE = 0.7                  # most this share of the card's free memory (the calibration runs alone at install:
 #                                 on an 8 GB card about 0.7 x 7.3 GiB = 5.1 GiB, the level-3 shapes to ~4.3 M rows)
+# How far past its ladder a level is checked where the card holds the calls: the level's rows (LEVEL_SHARE) of props
+# of this many fine voxels. The ladder ends at the test props' 16.5 M; a bulky prop at 1536 has 22 M.
+REACH_VOXELS = (20_000_000, 24_000_000, 32_000_000, 40_000_000)
 MAX_PRODUCTS_FLOOR = 1 << 14    # a products floor above this: not exact (windows). It bounds the boxes' padded calls
 #                                 and the whole level's own products of the offsets under the floor that the boxes
 #                                 take theirs from (conv_spconv.whole_offset_products: under 26 x floor x Co x 2 bytes,
@@ -748,6 +755,35 @@ def big_sizes(ladder: Iterable[int], ci: int, co: int, itemsize: int, budget: in
     return sizes
 
 
+def _reach_budget(device: Any) -> int:
+    """The bytes a check past the ladder may hold: BIG_FREE of the card's free memory (none without a card)."""
+    try:
+        free, _ = torch.cuda.mem_get_info(device)
+    except Exception:       # noqa: BLE001 - no card to ask (the CPU)
+        return 0
+    return int(BIG_FREE * free)
+
+
+def reach_sizes(level: int, ci: int, co: int, itemsize: int, budget: int, checked: int) -> List[int]:
+    """The whole calls past what a shape's ladder check reached (`checked` rows), in rising order, that fit `budget`
+    with the check's own working memory (the input, the whole call's output and two windows' outputs): the ladder
+    sizes the capped ladder budget left out, then the level's sizes of props of REACH_VOXELS fine voxels."""
+    fit = (budget - 2 * BOX_ROWS * itemsize * co) // (itemsize * (ci + co))
+    sizes = {*LEVEL_LADDER.get(level, ()), *(int(LEVEL_SHARE[level] * voxels) for voxels in REACH_VOXELS)}
+    return sorted(m for m in sizes if checked < m <= fit)
+
+
+def _reach_check(fn: Callable[[torch.Tensor], torch.Tensor], ci: int, co: int, dtype: torch.dtype, device: Any,
+                 seed: int, sizes: Iterable[int]) -> List[dict]:
+    """`_big_check` of `sizes` one after the other, up to and with the first that differs."""
+    found: List[dict] = []
+    for m in sizes:
+        found += _big_check(fn, ci, co, dtype, device, seed, [m])
+        if found[-1]["rows_differ"]:
+            break
+    return found
+
+
 def _big_check(fn: Callable[[torch.Tensor], torch.Tensor], ci: int, co: int, dtype: torch.dtype, device: Any,
                seed: int, sizes: Iterable[int]) -> List[dict]:
     """A whole call of each of `sizes` rows against the same rows computed in calls of BOX_ROWS rows (the last
@@ -841,24 +877,29 @@ def measure(device: Any, say: Callable[[str], None] = print, pause: Optional[Cal
         big = (_big_check(fn, ci, co, dtype, device, seed,
                           big_sizes(LEVEL_LADDER.get(level, ()), ci, co, itemsize, budget))
                if role == "stand-in" else [])
+        reach: List[dict] = []
         if any(check["rows_differ"] for check in big):
             found = None                    # a whole level's call would give rows no box call gives
             window_ok = False
-        checked = [mmax] + [c["M"] for c in big if not c["rows_differ"]]
+        elif big:
+            reach = _reach_check(fn, ci, co, dtype, device, seed, reach_sizes(
+                level, ci, co, itemsize, _reach_budget(device), max(check["M"] for check in big)))
+        checked = [mmax] + [c["M"] for c in big + reach if not c["rows_differ"]]
         boundary = (_big_check(fn, ci, co, dtype, device, seed,
                                [m for m in BOUNDARY_SIZES if m * itemsize * (ci + co) <= budget])
                     if role == "stand-in" else [])
         shapes.append({"kind": kind, "role": role, "level": level, "ci": ci, "co": co,
                        "dtype": str(dtype).replace("torch.", ""), "mmax": mmax, "tested": len(counts),
-                       "failed": failed, "floor": found, "big": big,
+                       "failed": failed, "floor": found, "big": big, "reach": reach,
                        "verified": max(checked) if found is not None or window_ok else None,
                        "window_ok": bool(window_ok), "boundary": boundary})
-        sizes = ", ".join(format(check["M"], ",") for check in big)
+        sizes = ", ".join(format(check["M"], ",") for check in big + reach if not check["rows_differ"] or check in big)
         same = "yes" if not any(check["rows_differ"] for check in big) else "NO"
         say(f"cuBLAS {kind} {ci} -> {co} ({str(dtype).replace('torch.', '')}, {role}): {len(counts)} row counts up to "
             f"{mmax:,}, " + (f"the same rows from {found:,} rows a call" if found is not None else "no floor")
             + (f"; differ at {failed[:6]}" if failed else "")
             + (f"; whole calls of {sizes} rows = {BOX_ROWS:,}-row calls: {same}" if big else "")
+            + "".join(f"; past the ladder {c['M']:,} rows differ" for c in reach if c["rows_differ"])
             + "".join(f"; at {c['M']:,} rows {c['rows_differ']} rows differ" for c in boundary if c["rows_differ"]))
         del fn
         torch.cuda.empty_cache()
