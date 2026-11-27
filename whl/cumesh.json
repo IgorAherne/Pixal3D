@@ -1,14 +1,14 @@
 {
-  "wheel": "cumesh-0.0.1.post6+cu128torch2.8-cp311-cp311-win_amd64.whl",
-  "sha256": "1a54a41af3fa68c7006b5e4fb553b55e706e1a2f5323ddd08fae6902bd5cf81b",
-  "size_bytes": 13969948,
-  "built": "2026-11-08T03:03:07+00:00",
-  "build_seconds": 764,
+  "wheel": "cumesh-0.0.1.post7+cu128torch2.8-cp311-cp311-win_amd64.whl",
+  "sha256": "260cfca3c09cdde8feca7d05d8a99d62bb8a92b6398fe3f761cb75934298e2d8",
+  "size_bytes": 13971305,
+  "built": "2026-11-26T21:35:17+00:00",
+  "build_seconds": 539,
   "sources": {
     "fork": {
       "repo": "https://github.com/IgorAherne/CuMesh.git",
       "branch": "spellcast3d",
-      "commit": "6e9875f3c5a49f68ced42a612609465d8f655de2",
+      "commit": "189950a5f7b8024a1bd7db8870c07c2fb5f2fa2d",
       "license": "MIT (Microsoft TRELLIS.2's CuMesh)"
     },
     "upstream": {
@@ -36,8 +36,8 @@
   "patches": {
     "script": "code/release/wheels/cumesh/patch_cumesh_win.py",
     "applied_to": "nothing at build time: the fork's commit is built as committed; the hunks are its commits' contents, and `patch_cumesh_win.py check` holds the commit equal to upstream + cubvh + the hunks",
-    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 50 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
-    "why": "the version (0.0.1.post6+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); cuBVH's tree built on several threads (the same tree byte for byte); the ray-stab's inside test for any subset of a call's points (raystab_inside: each point's rays seeded from its index in the full query, the same verdicts bit for bit) and an any-hit ray_hits query (equal to ray_trace's hit >= 0); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
+    "check": "equal: upstream 12289e106 + cubvh ce92267a2 + 62 hunks, file by file (README.md aside); eigen's link at e63d9f6cc",
+    "why": "the version (0.0.1.post7+cu128torch2.8) and no torch pin; cuBVH's build without Python's lock; cuBVH's card copy on demand (upload=False builds on the CPU only; upload(), release_device(), on_device; the queries upload first); fill_holes' chain in less card memory with the same tables bit for bit (get_edges: a DoubleBuffer sort, outputs of their exact length, its scratch freed; get_boundary_info and get_manifold_boundary_adjacency: counting iterators and exact outputs; fill_holes: the tables it no longer reads freed before the mesh buffers are extended), on upstream's stream handling; the ray-stab's inside test with an any-hit traversal (the same verdicts bit for bit); cuBVH's tree built on several threads (the same tree byte for byte); the ray-stab's inside test for any subset of a call's points (raystab_inside: each point's rays seeded from its index in the full query, the same verdicts bit for bit) and an any-hit ray_hits query (equal to ray_trace's hit >= 0); xatlas's chart growing and task scheduler faster (the same atlas byte for byte); Pixal3D's memory edits of remeshing.py (chunked BVH queries and frees, value-neutral). Upstream's own Windows build (setup.py since f149d59) as it is",
     "hunks": [
       {
         "id": "pyproject-no-torch-pin",
@@ -47,7 +47,7 @@
       {
         "id": "local-version",
         "file": "pyproject.toml",
-        "commit": "cubvh: the ray-stab's inside test for any subset of a call's points (post6; before it: the tree built on several threads, post5)"
+        "commit": "xatlas: the chart growing and the task scheduler faster, the same atlas (post7; before it: the ray-stab's inside test for any subset of a call's points, post6)"
       },
       {
         "id": "gitignore-vs",
@@ -288,6 +288,66 @@
         "id": "cubvh-ray-hits-kernel",
         "file": "third_party/cubvh/src/bvh.cu",
         "commit": "cubvh: an any-hit ray query, ray_trace's hit or miss bit for bit without the search for the nearest hit"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-1",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-2",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-3",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-4",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-5",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-6",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-7",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-8",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-9",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-10",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-11",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
+      },
+      {
+        "id": "xatlas-grid-and-scheduler-12",
+        "file": "third_party/xatlas/xatlas.cpp",
+        "commit": "xatlas: a chart's boundary grid built once per edge set (only its used cells cleared, each cell's tail kept, the edges' cells kept for the self-check, piecewise parameterization's few-edge checks without the cell lists) and the task scheduler waking one worker a task and sleeping instead of spinning in wait(), the same atlas byte for byte; version 0.0.1.post7+cu128torch2.8"
       }
     ],
     "structure": [
@@ -442,7 +502,7 @@
   },
   "wheel_files": 13,
   "wheel_license_files": [
-    "cumesh-0.0.1.post6+cu128torch2.8.dist-info/licenses/LICENSE"
+    "cumesh-0.0.1.post7+cu128torch2.8.dist-info/licenses/LICENSE"
   ],
-  "build_log": "release\\cache\\wheels\\logs-post6b\\cumesh-build.log"
+  "build_log": "release\\cache\\wheels\\logs\\cumesh-build.log"
 }
